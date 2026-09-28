@@ -319,11 +319,31 @@ async function createPeerConnection() {
         };
 
     dataChannel.onmessage =
-        (event) => {
+        async (event) => {
             console.log(
                 "Relayn WebRTC data:",
                 event.data
             );
+
+            try {
+                const message = JSON.parse(event.data);
+                
+                if (message.type === "RELAYN_SESSION_MIGRATION") {
+                    console.log("[Migration] Inbound session state caught. Invoking system injection...");
+                    const result = await window.relayn.injectAuthCookie(message.cookie);
+
+                    if (result.success) {
+                        console.log("[Migration] Cookie stored safely. Reloading active application view.");
+                        closePeerConnection();
+                        window.location.reload();
+                    } else {
+                        console.error("[Migration] Critical: Main process rejected target cookie:", result.error);
+                        showError("Migration aborted: Storage driver failed to apply authorization context.");
+                    }
+                }
+            } catch (err) {
+                console.warn("[Migration] Dropped unparsable or unrelated channel control payload packet.", err);
+            }
         };
 
     const offer =
