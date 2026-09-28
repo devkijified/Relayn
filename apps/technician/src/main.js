@@ -1,7 +1,8 @@
 const {
     app,
     BrowserWindow,
-    ipcMain
+    ipcMain,
+    session: electronSession // Aliased to prevent collision with project session variables
 } = require("electron");
 
 const path = require("path");
@@ -140,6 +141,35 @@ function connectWebSocket(
     });
 }
 
+// =========================================================================
+// 🔒 DEVICE B (TECHNICIAN): SECURE AUTH COOKIE INJECTION HANDLER
+// =========================================================================
+ipcMain.handle(
+    "session:cookie:inject",
+    async (_event, cookieData) => {
+        try {
+            // Reconstruct the cookie config matching the domain rules of SERVER_URL
+            const cookieConfig = {
+                url: SERVER_URL,
+                name: cookieData.name,
+                value: cookieData.value,
+                domain: cookieData.domain,
+                path: cookieData.path || "/",
+                secure: cookieData.secure,
+                httpOnly: cookieData.httpOnly,
+                // Default to a 30-day expiration window if none provided
+                expirationDate: cookieData.expirationDate || Math.floor(Date.now() / 1000) + 2592000
+            };
+
+            await electronSession.defaultSession.cookies.set(cookieConfig);
+            return { success: true };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+);
+// =========================================================================
+
 ipcMain.handle(
     "session:join",
     async (_event, code) => {
@@ -148,7 +178,7 @@ ipcMain.handle(
                 .trim();
 
         if (
-            !/^\d{6}$/.test(
+            !/^\d{6}\$/.test(
                 normalizedCode
             )
         ) {
