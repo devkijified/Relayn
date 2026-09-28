@@ -1,0 +1,14 @@
+<!doctype html><html><head><meta charset="UTF-8"><title>Relayn</title><style>body{font:16px system-ui;max-width:760px;margin:40px auto;padding:0 20px}button{padding:10px 16px;margin:5px}input{padding:10px;font-size:18px}.card{border:1px solid #ddd;border-radius:12px;padding:20px;margin:16px 0}.code{font-size:40px;font-weight:700;letter-spacing:8px}</style></head><body>
+<h1>Relayn Support</h1><p id="status">Connecting…</p>
+<div class="card"><h2>Customer</h2><button id="create">Create support session</button><div id="code" class="code"></div><p id="consent" hidden><label><input type="checkbox" id="terms"> I have read and accepted the support terms and authorize the technician to control this computer for this session.</label><br><button id="approve">Approve remote control</button></p></div>
+<div class="card"><h2>Technician</h2><input id="joinCode" placeholder="6-digit code" maxlength="6"><button id="join">Join session</button></div>
+<div class="card"><h2>Session</h2><button id="end">Request session end</button><div id="events"></div></div>
+<script>
+const $=id=>document.getElementById(id); function event(t){$('events').innerHTML='<p>'+t+'</p>'+$('events').innerHTML}
+window.support.onSocketStatus(s=>$('status').textContent='Socket: '+s);
+window.support.onMessage(m=>{event(m.type); if(m.type==='session_created'){$('code').textContent=m.code;$('consent').hidden=false} if(m.type==='end_confirmation_required'&&confirm('The other party requested to end the session. Confirm?'))window.support.send({type:'confirm_end'}); if(m.type==='session_ended'){alert('Session ended: '+m.reason);location.reload()}});
+$('create').onclick=()=>window.support.send({type:'create_session',role:'customer'});
+$('approve').onclick=()=>{if($('terms').checked)window.support.send({type:'consent_granted'});else alert('Accept the terms first.')};
+$('join').onclick=()=>window.support.send({type:'join_session',role:'technician',code:$('joinCode').value});
+$('end').onclick=()=>window.support.send({type:'request_end'});
+</script></body></html>

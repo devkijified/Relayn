@@ -1,0 +1,13 @@
+{
+  "name": "relayn",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Relayn remote support platform monorepo",
+  "packageManager": "pnpm@10.0.0",
+  "scripts": {
+    "dev:server": "pnpm --dir services/server dev",
+    "build:server": "pnpm --dir services/server build",
+    "start:customer": "pnpm --dir apps/customer start",
+    "start:technician": "pnpm --dir apps/technician start"
+  }
+}

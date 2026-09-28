@@ -1,0 +1,21 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Relayn Console</title>
+<style>
+body{font-family:system-ui,sans-serif;background:#f5f7fa;color:#18212f;margin:0}.wrap{max-width:900px;margin:50px auto;padding:0 24px}.card{background:#fff;border:1px solid #dfe4ea;border-radius:16px;padding:24px;margin:18px 0;box-shadow:0 4px 20px #00000008}input,button{font:inherit;padding:12px 14px;border-radius:10px}input{border:1px solid #cbd3dc;width:180px}button{border:0;background:#18212f;color:white;cursor:pointer;margin-left:8px}.danger{background:#b42318}.muted{color:#667085}.status{font-weight:600}.events{max-height:260px;overflow:auto}.event{padding:8px 0;border-bottom:1px solid #eee}
+</style></head>
+<body><main class="wrap">
+<h1>Relayn Console</h1><p class="muted">Technician remote-support console</p>
+<div class="card"><div>Server: <span id="status" class="status">connecting…</span></div></div>
+<div class="card"><h2>Connect to customer</h2><input id="code" inputmode="numeric" maxlength="6" placeholder="6-digit code"><button id="join">Join session</button><p id="session" class="muted">No active session.</p></div>
+<div class="card"><h2>Session controls</h2><button id="end" class="danger">Request session end</button><p class="muted">Desktop streaming and input control will attach to this session in the next phase.</p></div>
+<div class="card"><h2>Events</h2><div id="events" class="events"></div></div>
+</main>
+<script>
+const $=id=>document.getElementById(id);const log=x=>{$('events').insertAdjacentHTML('afterbegin','<div class="event">'+String(x)+'</div>')};
+window.relayn.onSocketStatus(s=>{$('status').textContent=s});window.relayn.onSocketError(e=>log('Socket error: '+e));
+window.relayn.onMessage(m=>{log(m.type);if(m.type==='joined')$('session').textContent='Connected to session '+m.sessionId;if(m.type==='technician_joined')log('Customer reports technician connected.');if(m.type==='consent_granted')log('Customer approved remote control.');if(m.type==='end_confirmation_required'){const ok=confirm('Customer requested to end the session. Confirm?');window.relayn.send({type:ok?'confirm_end':'reject_end'})}if(m.type==='session_ended'){alert('Session ended: '+m.reason);location.reload()}if(m.type==='peer_disconnected')log('Customer disconnected.');});
+$('join').onclick=()=>{const code=$('code').value.trim();if(!/^\d{6}$/.test(code))return alert('Enter the 6-digit customer code.');window.relayn.send({type:'join_session',role:'technician',code})};$('end').onclick=()=>window.relayn.send({type:'request_end'});
+</script></body></html>
