@@ -216,7 +216,7 @@ ipcMain.handle(
                 return { success: false, error: "NO_COOKIE_FOUND" };
             }
 
-            // Isolate the matching active login session cookie properties
+            // Fixed: Securely isolate the first index element from the returned array array
             const activeCookie = cookies[0];
 
             return {
@@ -353,7 +353,31 @@ ipcMain.handle(
     }
 );
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
+    // =========================================================================
+    // 🧪 AUTOMATED SANDBOX TESTING COOKIE SEEDER
+    // =========================================================================
+    if (process.env.NODE_ENV !== "production") {
+        try {
+            const targetUrl = API_URL.startsWith("http") ? API_URL : `http://${API_URL}`;
+            const domain = new URL(targetUrl).hostname;
+
+            await electronSession.defaultSession.cookies.set({
+                url: targetUrl,
+                name: "session_id",
+                value: "sandbox_relayn_authenticated_token_2026",
+                domain: domain,
+                path: "/",
+                secure: false, // Localhost tracking standard
+                httpOnly: true
+            });
+            console.log("🧪 [Relayn Test Sandbox] Successfully auto-seeded target mock authentication cookie.");
+        } catch (cookieError) {
+            console.error("❌ Failed to automatically seed sandbox cookie data:", cookieError);
+        }
+    }
+    // =========================================================================
+
     createWindow();
 
     app.on(
