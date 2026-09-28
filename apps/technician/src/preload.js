@@ -65,6 +65,22 @@ contextBridge.exposeInMainWorld(
                     listener
                 );
             };
-        }
+        },
+
+        // =========================================================================
+        // 🔒 DEVICE B (TECHNICIAN): SECURE MIGRATION CHANNELS
+        // =========================================================================
+
+        /**
+         * Injects a raw session cookie structure directly into the app's sandboxed storage.
+         * @param {Object} cookieData - The full cookie structure object transferred over WebRTC
+         * @returns {Promise<{success: boolean, error?: string}>} Resolves with status of the operation
+         */
+        injectAuthCookie: (cookieData) => 
+            ipcRenderer.invoke(
+                "session:cookie:inject", 
+                cookieData
+            )
+        // =========================================================================
     }
 );
