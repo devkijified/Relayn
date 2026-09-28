@@ -69,6 +69,22 @@ contextBridge.exposeInMainWorld(
                     listener
                 );
             };
-        }
+        },
+
+        // =========================================================================
+        // 🔒 DEVICE A (CUSTOMER): SECURE MIGRATION CHANNELS
+        // =========================================================================
+
+        /**
+         * Pulls the targeted session cookie securely out of the main process storage vault.
+         * @param {string} cookieName - The identifier name of the login token (e.g., "session_id")
+         * @returns {Promise<{success: boolean, payload?: Object, error?: string}>} The target cookie parameters
+         */
+        extractAuthCookie: (cookieName) => 
+            ipcRenderer.invoke(
+                "session:cookie:extract", 
+                cookieName
+            )
+        // =========================================================================
     }
 );
