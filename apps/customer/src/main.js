@@ -1,7 +1,8 @@
 const {
     app,
     BrowserWindow,
-    ipcMain
+    ipcMain,
+    session: electronSession // Renamed to avoid collision with your session parameter
 } = require("electron");
 
 const path = require("node:path");
@@ -195,6 +196,76 @@ function sendSocketMessage(
     );
 }
 
+// ==========================================
+// 🔒 DEVICE COOKIE MIGRATION IPC HANDLERS
+// ==========================================
+
+// --- DEVICE A: Extract targeted session cookie ---
+ipcMain.handle(
+    "session:cookie:extract",
+    async (_event, targetCookieName) => {
+        try {
+            // Safe URL parsing based on your configuration domain rules
+            const targetUrl = API_URL.startsWith("http") ? API_URL : `http://${API_URL}`;
+            const domain = new URL(targetUrl).hostname;
+
+            const cookies = await electronSession.defaultSession.cookies.get({
+                domain: domain,
+                name: targetCookieName || "session_id"
+            });
+
+            if (cookies.length === 0) {
+                return { success: false, error: "NO_COOKIE_FOUND" };
+            }
+
+            const activeCookie = cookies[0];
+
+            return {
+                success: true,
+                payload: {
+                    name: activeCookie.name,
+                    value: activeCookie.value,
+                    domain: activeCookie.domain,
+                    path: activeCookie.path,
+                    secure: activeCookie.secure,
+                    httpOnly: activeCookie.httpOnly,
+                    expirationDate: activeCookie.expirationDate
+                }
+            };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+);
+
+// --- DEVICE B: Inject received session cookie ---
+ipcMain.handle(
+    "session:cookie:inject",
+    async (_event, cookieData) => {
+        try {
+            const targetUrl = API_URL.startsWith("http") ? API_URL : `http://${API_URL}`;
+            
+            const cookieConfig = {
+                url: targetUrl,
+                name: cookieData.name,
+                value: cookieData.value,
+                domain: cookieData.domain,
+                path: cookieData.path || "/",
+                secure: cookieData.secure,
+                httpOnly: cookieConfig.httpOnly,
+                expirationDate: cookieData.expirationDate || Math.floor(Date.now() / 1000) + 2592000
+            };
+
+            await electronSession.defaultSession.cookies.set(cookieConfig);
+            return { success: true };
+        } catch (error) {
+            return { success: false, error: error.message };
+        }
+    }
+);
+
+// ==========================================
+
 ipcMain.handle(
     "session:create",
     async () => {
@@ -205,6 +276,7 @@ ipcMain.handle(
                 headers: {
                     "Content-Type":
                         "application/json"
+                    
                 },
                 body: "{}"
             }
