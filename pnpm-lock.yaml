@@ -12,7 +12,7 @@ importers:
     dependencies:
       electron:
         specifier: latest
-        version: 44.4.5
+        version: 44.5.1
       ws:
         specifier: latest
         version: 8.22.0
@@ -21,7 +21,7 @@ importers:
     dependencies:
       electron:
         specifier: latest
-        version: 44.4.5
+        version: 44.5.1
       ws:
         specifier: latest
         version: 8.22.0
@@ -31,6 +31,9 @@ importers:
       '@fastify/cors':
         specifier: ^10.0.0
         version: 10.1.0
+      dotenv:
+        specifier: ^18.0.5
+        version: 18.0.5
       fastify:
         specifier: ^5.0.0
         version: 5.12.5
@@ -291,8 +294,13 @@ packages:
     resolution: {integrity: sha512-0je+qPKHEMohvfRTCEo3CrPG6cAzAYgmzKyxRiYSSDkS6eGJdyVJm7WaYA5ECaAD9wLB2T4EEeymA5aFVcYXCA==}
     engines: {node: '>=6'}
 
-  electron@44.4.5:
-    resolution: {integrity: sha512-SjgoaeYsSWZfJzubgQU7juvuXMTvn6/e1gAHdGFA/yuMbpF+I+skYqIJ6DdXBXHeWbkbpNpmwZCTpiivtlWZSw==}
+  dotenv@18.0.5:
+    resolution: {integrity: sha512-aBrGvt6KhjxbEnatqMWOMidftwsrCiCvqh1yNIGB9QyF0J+VcWkKDMsvYOEm7ZS82oiV+BT1sTOtIlAmUlTpwQ==}
+    engines: {node: '>=12'}
+    hasBin: true
+
+  electron@44.5.1:
+    resolution: {integrity: sha512-lx7AYoFIiyvEvgvpyWO9kOC60xtNPpiPZAth6Fmg9NutzpCAMLwpUlaBY2EXfZyIgUdzEmLMj9KvK0Vrokl1yQ==}
     engines: {node: '>= 22.12.0'}
     hasBin: true
 
@@ -653,7 +661,9 @@ snapshots:
 
   dequal@2.0.3: {}
 
-  electron@44.4.5:
+  dotenv@18.0.5: {}
+
+  electron@44.5.1:
     dependencies:
       '@electron-internal/extract-zip': 1.0.5
       '@electron/get': 5.1.0

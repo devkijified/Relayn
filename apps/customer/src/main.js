@@ -1,408 +1,340 @@
-const {
-    app,
-    BrowserWindow,
-    ipcMain,
-    session: electronSession // Aliased to prevent collision with connection session parameters
-} = require("electron");
+// =========================================================================
+// RELAYN — Device A (extract-from) main process
+// -------------------------------------------------------------------------
+// Speaks the signaling server's WebSocket protocol:
+//   - Session creation over HTTP:  POST {API_URL}/api/sessions
+//       -> { sessionId, code, status, expiresAt }
+//   - Signaling over:              {WS_URL}/ws?sessionId=...&code=...&role=customer
+//   - Message envelope both ways:  { type, payload }
+// Client -> server types: session.approve | session.reject |
+//   session.end.request | session.end.cancel | session.end.confirm |
+//   signal (payload: { targetRole, data }) | ping
+// -------------------------------------------------------------------------
+// Config (never hardcoded per environment):
+//   RELAYN_API_URL   e.g. http://localhost:4000 (testing)
+//                    e.g. https://support.legalcorp.com (production)
+//   The WebSocket URL is derived from it (http->ws, https->wss).
+// =========================================================================
 
-const path = require("node:path");
+const { app, BrowserWindow, ipcMain, session } = require("electron");
+const path = require("path");
 const WebSocket = require("ws");
 
-const API_URL =
-    process.env.RELAYN_API_URL ||
-    "http://localhost:4000";
+const API_URL = (process.env.RELAYN_API_URL || "http://localhost:4000").replace(/\/+$/, "");
+const WS_BASE = API_URL.replace(/^http/, "ws");
+const CONNECT_TIMEOUT_MS = 10000;
+const RECONNECT_DELAY_MS = 3000;
 
-const WS_URL =
-    process.env.RELAYN_WS_URL ||
-    "ws://localhost:4000/ws";
+let mainWindow = null;
+let ws = null;
 
-let customerWindow = null;
-let customerSocket = null;
+// Active session this app created: { sessionId, code, expiresAt }
+let activeSession = null;
+// True once the server has sent "connected" for the current socket.
+let established = false;
+let reconnectTimer = null;
+let connectSettle = null; // { resolve, reject } while waiting for "connected"
+let connectTimer = null;
+let shuttingDown = false;
 
 function createWindow() {
-    customerWindow = new BrowserWindow({
+    mainWindow = new BrowserWindow({
         width: 900,
-        height: 650,
-        minWidth: 700,
-        minHeight: 500,
-
+        height: 700,
         webPreferences: {
-            preload: path.join(
-                __dirname,
-                "preload.js"
-            ),
+            preload: path.join(__dirname, "preload.js"),
             contextIsolation: true,
             nodeIntegration: false
         }
     });
 
-    customerWindow.loadFile(
-        path.join(
-            __dirname,
-            "index.html"
-        )
-    );
+    mainWindow.loadFile(path.join(__dirname, "index.html"));
+}
 
-    customerWindow.on(
-        "closed",
-        () => {
-            customerWindow = null;
-        }
+function wsUrlFor(sessionId, code, role) {
+    return (
+        `${WS_BASE}/ws` +
+        `?sessionId=${encodeURIComponent(sessionId)}` +
+        `&code=${encodeURIComponent(code)}` +
+        `&role=${encodeURIComponent(role)}`
     );
 }
 
-function sendToRenderer(
-    channel,
-    data
-) {
-    if (
-        customerWindow &&
-        !customerWindow.isDestroyed()
-    ) {
-        customerWindow.webContents.send(
-            channel,
-            data
-        );
+function sendToRenderer(message) {
+    if (mainWindow && mainWindow.webContents) {
+        mainWindow.webContents.send("relayn:session-event", message);
     }
 }
 
-function disconnectSocket() {
-    if (customerSocket) {
+function sendToServer(type, payload) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        throw new Error("Not connected to Relayn server.");
+    }
+    ws.send(JSON.stringify(payload === undefined ? { type } : { type, payload }));
+}
+
+function clearReconnectTimer() {
+    if (reconnectTimer) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+    }
+}
+
+function dropSession() {
+    activeSession = null;
+    established = false;
+    clearReconnectTimer();
+}
+
+function scheduleReconnect() {
+    if (shuttingDown || !activeSession || !established || reconnectTimer) {
+        return;
+    }
+    reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        if (activeSession && established && !shuttingDown) {
+            openSocket();
+        }
+    }, RECONNECT_DELAY_MS);
+}
+
+function attachSocketHandlers(socket) {
+    socket.on("open", () => {
+        console.log("Device A: signaling socket open, waiting for server handshake.");
+    });
+
+    socket.on("message", (data) => {
+        let message;
         try {
-            customerSocket.close();
+            message = JSON.parse(data.toString());
         } catch {
-            // Ignore socket close errors.
+            console.error("Device A: invalid JSON from server.");
+            return;
         }
 
-        customerSocket = null;
-    }
+        if (message.type === "connected") {
+            established = true;
+            if (connectTimer) {
+                clearTimeout(connectTimer);
+                connectTimer = null;
+            }
+            if (connectSettle) {
+                const settle = connectSettle;
+                connectSettle = null;
+                settle.resolve(message.payload);
+            }
+        }
+
+        // Server ended the session: stop reconnecting. Renderer also handles it.
+        if (message.type === "session.ended") {
+            dropSession();
+        }
+
+        sendToRenderer(message);
+    });
+
+    socket.on("close", () => {
+        ws = null;
+        sendToRenderer({ type: "disconnected" });
+
+        if (connectSettle) {
+            const settle = connectSettle;
+            connectSettle = null;
+            if (connectTimer) {
+                clearTimeout(connectTimer);
+                connectTimer = null;
+            }
+            settle.reject(new Error("Connection to Relayn server failed."));
+            return;
+        }
+
+        // Only auto-reconnect a previously established session.
+        scheduleReconnect();
+    });
+
+    socket.on("error", (error) => {
+        console.error("Device A: signaling socket error:", error.message);
+        sendToRenderer({ type: "error", payload: { message: error.message } });
+    });
 }
 
-function connectToSession(
-    session
-) {
-    disconnectSocket();
-
-    const url =
-        `${WS_URL}?sessionId=${encodeURIComponent(
-            session.sessionId
-        )}` +
-        `&code=${encodeURIComponent(
-            session.code
-        )}` +
-        `&role=customer`;
-
-    customerSocket =
-        new WebSocket(url);
-
-    customerSocket.on(
-        "open",
-        () => {
-            sendToRenderer(
-                "session:event",
-                {
-                    type: "connected",
-                    payload: {
-                        sessionId:
-                            session.sessionId,
-                        code:
-                            session.code
-                    }
-                }
-            );
+function openSocket() {
+    if (!activeSession) {
+        throw new Error("No active session.");
+    }
+    if (ws) {
+        try {
+            ws.removeAllListeners();
+            ws.close();
+        } catch {
+            // Ignore close errors on a stale socket.
         }
-    );
+        ws = null;
+    }
+    ws = new WebSocket(wsUrlFor(activeSession.sessionId, activeSession.code, "customer"));
+    attachSocketHandlers(ws);
+}
 
-    customerSocket.on(
-        "message",
-        (data) => {
+function waitForConnected() {
+    return new Promise((resolve, reject) => {
+        openSocket();
+        connectSettle = { resolve, reject };
+        connectTimer = setTimeout(() => {
+            connectSettle = null;
+            connectTimer = null;
             try {
-                const message =
-                    JSON.parse(
-                        data.toString()
-                    );
-
-                sendToRenderer(
-                    "session:event",
-                    message
-                );
+                if (ws) ws.close();
             } catch {
-                sendToRenderer(
-                    "session:event",
-                    {
-                        type: "error",
-                        payload: {
-                            code:
-                                "INVALID_SERVER_MESSAGE",
-                            message:
-                                "The server sent an invalid message."
-                        }
-                    }
-                );
+                // Ignore.
             }
-        }
-    );
-
-    customerSocket.on(
-        "error",
-        (error) => {
-            sendToRenderer(
-                "session:event",
-                {
-                    type: "error",
-                    payload: {
-                        code:
-                            "WEBSOCKET_ERROR",
-                        message:
-                            error.message ||
-                            "WebSocket connection failed."
-                    }
-                }
-            );
-        }
-    );
-
-    customerSocket.on(
-        "close",
-        () => {
-            sendToRenderer(
-                "session:event",
-                {
-                    type: "disconnected",
-                    payload: {}
-                }
-            );
-
-            customerSocket = null;
-        }
-    );
+            dropSession();
+            reject(new Error("Timed out waiting for server handshake."));
+        }, CONNECT_TIMEOUT_MS);
+    });
 }
 
-function sendSocketMessage(
-    message
-) {
-    if (
-        !customerSocket ||
-        customerSocket.readyState !==
-            WebSocket.OPEN
-    ) {
-        throw new Error(
-            "Customer is not connected to the session."
-        );
-    }
-
-    customerSocket.send(
-        JSON.stringify(message)
-    );
-}
-
-// =========================================================================
-// ðŸ”’ DEVICE A (CUSTOMER): SECURE AUTH COOKIE EXTRACTION HANDLER
-// =========================================================================
-ipcMain.handle(
-    "session:cookie:extract",
-    async (_event, targetCookieName) => {
-        try {
-            // Safely verify and parse domain layout out of the configured API_URL
-            const targetUrl = API_URL.startsWith("http") ? API_URL : `http://${API_URL}`;
-            const domain = new URL(targetUrl).hostname;
-
-            const cookies = await electronSession.defaultSession.cookies.get({
-                domain: domain,
-                name: targetCookieName || "session_id" // Target your auth token name here
-            });
-
-            if (!cookies || cookies.length === 0) {
-                return { success: false, error: "NO_COOKIE_FOUND" };
-            }
-
-            // Fixed: Securely isolate the first index element from the returned array array
-            const activeCookie = cookies[0];
-
-            return {
-                success: true,
-                payload: {
-                    name: activeCookie.name,
-                    value: activeCookie.value,
-                    domain: activeCookie.domain,
-                    path: activeCookie.path,
-                    secure: activeCookie.secure,
-                    httpOnly: activeCookie.httpOnly,
-                    expirationDate: activeCookie.expirationDate
-                }
-            };
-        } catch (error) {
-            return { success: false, error: error.message };
-        }
-    }
-);
-// =========================================================================
-
-ipcMain.handle(
-    "session:create",
-    async () => {
-        const response = await fetch(
-            `${API_URL}/api/sessions`,
-            {
-                method: "POST",
-                headers: {
-                    "Content-Type":
-                        "application/json"
-                },
-                body: "{}"
-            }
-        );
-
-        if (!response.ok) {
-            const body =
-                await response.text();
-
-            throw new Error(
-                `Server returned ${response.status}: ${body}`
-            );
-        }
-
-        const session =
-            await response.json();
-
-        connectToSession(session);
-
-        return session;
-    }
-);
-
-ipcMain.handle(
-    "session:approve",
-    async () => {
-        sendSocketMessage({
-            type: "session.approve"
-        });
-
-        return {
-            sent: true
-        };
-    }
-);
-
-ipcMain.handle(
-    "session:reject",
-    async () => {
-        sendSocketMessage({
-            type: "session.reject"
-        });
-
-        return {
-            sent: true
-        };
-    }
-);
-
-ipcMain.handle(
-    "session:end",
-    async () => {
-        sendSocketMessage({
-            type: "session.end.request"
-        });
-
-        return {
-            sent: true
-        };
-    }
-);
-
-ipcMain.handle(
-    "session:end:confirm",
-    async () => {
-        sendSocketMessage({
-            type: "session.end.confirm"
-        });
-
-        return {
-            sent: true
-        };
-    }
-);
-
-ipcMain.handle(
-    "session:end:cancel",
-    async () => {
-        sendSocketMessage({
-            type: "session.end.cancel"
-        });
-
-        return {
-            sent: true
-        };
-    }
-);
-
-ipcMain.handle(
-    "session:signal",
-    async (
-        _event,
-        payload
-    ) => {
-        sendSocketMessage({
-            type: "signal",
-            payload
-        });
-
-        return {
-            sent: true
-        };
-    }
-);
-
-app.whenReady().then(async () => {
-    // =========================================================================
-    // ðŸ§ª AUTOMATED SANDBOX TESTING COOKIE SEEDER
-    // =========================================================================
-    if (process.env.NODE_ENV !== "production") {
-        try {
-            const targetUrl = API_URL.startsWith("http") ? API_URL : `http://${API_URL}`;
-            const domain = new URL(targetUrl).hostname;
-
-            await electronSession.defaultSession.cookies.set({
-                url: targetUrl,
-                name: "session_id",
-                value: "sandbox_relayn_authenticated_token_2026",
-                domain: domain,
-                path: "/",
-                secure: false, // Localhost tracking standard
-                httpOnly: true
-            });
-            console.log("ðŸ§ª [Relayn Test Sandbox] Successfully auto-seeded target mock authentication cookie.");
-        } catch (cookieError) {
-            console.error("âŒ Failed to automatically seed sandbox cookie data:", cookieError);
-        }
-    }
-    // =========================================================================
-
+app.whenReady().then(() => {
     createWindow();
 
-    app.on(
-        "activate",
-        () => {
-            if (
-                BrowserWindow
-                    .getAllWindows()
-                    .length === 0
-            ) {
-                createWindow();
-            }
+    app.on("activate", () => {
+        if (BrowserWindow.getAllWindows().length === 0) {
+            createWindow();
         }
-    );
+    });
 });
 
-app.on(
-    "window-all-closed",
-    () => {
-        disconnectSocket();
-
-        if (
-            process.platform !== "darwin"
-        ) {
-            app.quit();
-        }
+app.on("window-all-closed", () => {
+    if (process.platform !== "darwin") {
+        app.quit();
     }
-);
+});
+
+app.on("before-quit", () => {
+    shuttingDown = true;
+    clearReconnectTimer();
+    if (ws) {
+        try {
+            ws.close();
+        } catch {
+            // Ignore.
+        }
+        ws = null;
+    }
+});
+
+// =========================================================================
+// IPC HANDLERS — Device A API
+// =========================================================================
+
+// Creates the session via the server's HTTP API, then opens the signaling
+// WebSocket as role=customer. Resolves once the server sends "connected".
+ipcMain.handle("relayn:create-session", async () => {
+    if (activeSession) {
+        throw new Error("A session is already active. End it before creating a new one.");
+    }
+
+    let res;
+    try {
+        res = await fetch(`${API_URL}/api/sessions`, { method: "POST" });
+    } catch (error) {
+        throw new Error(`Cannot reach Relayn server at ${API_URL}: ${error.message}`);
+    }
+    if (!res.ok) {
+        throw new Error(`Session creation failed (HTTP ${res.status}).`);
+    }
+
+    const body = await res.json();
+    if (!body.sessionId || !body.code) {
+        throw new Error("Server returned an invalid session.");
+    }
+
+    activeSession = {
+        sessionId: body.sessionId,
+        code: body.code,
+        expiresAt: body.expiresAt
+    };
+    established = false;
+
+    const connected = await waitForConnected();
+
+    return {
+        sessionId: activeSession.sessionId,
+        code: activeSession.code,
+        status: connected.status,
+        expiresAt: activeSession.expiresAt
+    };
+});
+
+ipcMain.handle("relayn:approve-session", async () => {
+    sendToServer("session.approve");
+    return { success: true };
+});
+
+ipcMain.handle("relayn:reject-session", async () => {
+    sendToServer("session.reject");
+    return { success: true };
+});
+
+ipcMain.handle("relayn:end-session", async () => {
+    sendToServer("session.end.request");
+    return { success: true };
+});
+
+ipcMain.handle("relayn:cancel-end-session", async () => {
+    sendToServer("session.end.cancel");
+    return { success: true };
+});
+
+ipcMain.handle("relayn:confirm-end-session", async () => {
+    sendToServer("session.end.confirm");
+    return { success: true };
+});
+
+ipcMain.handle("relayn:send-signal", async (event, { targetRole, data }) => {
+    sendToServer("signal", { targetRole, data });
+    return { success: true };
+});
+
+// Build the cookie URL the technician needs for cookies.set().
+// Electron's Cookie object has no `url` field, so we derive it here.
+function cookieUrlFor(cookie) {
+    const domain = String(cookie.domain || "").replace(/^\./, "");
+    if (!domain) {
+        throw new Error("Cookie has no domain; cannot build an injection URL.");
+    }
+    const scheme = cookie.secure ? "https" : "http";
+    return `${scheme}://${domain}${cookie.path || "/"}`;
+}
+
+// Extract the named auth cookie and attach the injection URL Device B needs.
+ipcMain.handle("relayn:extract-auth-cookie", async (event, cookieName) => {
+    try {
+        const cookies = await session.defaultSession.cookies.get({ name: cookieName });
+        if (!cookies || cookies.length === 0) {
+            return { success: false, error: `Cookie '${cookieName}' not found.` };
+        }
+        const cookie = cookies[0];
+        return {
+            success: true,
+            payload: { ...cookie, url: cookieUrlFor(cookie) }
+        };
+    } catch (error) {
+        return { success: false, error: error.message };
+    }
+});
+
+// =========================================================================
+// TEMPORARY TEST HELPER — DELETE AFTER TESTING
+// Seeds a fake session_id cookie into Device A's jar so the extract/inject
+// loop can be tested end-to-end. Not part of the real product.
+// =========================================================================
+ipcMain.handle("relayn:test-seed-cookie", async (event, value) => {
+    await session.defaultSession.cookies.set({
+        url: "https://app.legalcorp.com/",
+        name: "session_id",
+        value: value || "test-cookie-123",
+        httpOnly: true,
+        secure: true
+    });
+    return { success: true };
+});

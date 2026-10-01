@@ -1,322 +1,111 @@
+// =========================================================================
+// RELAYN — cloud share server (Fastify, TypeScript)
+// -------------------------------------------------------------------------
+// Pure HTTPS: no WebSocket, no sessions, no TURN. Device A uploads an
+// AES-GCM encrypted cookie jar (POST /api/share) and shows a QR pickup
+// ticket; Device B scans it and downloads the jar once (GET /api/share/:id).
+// The server only ever holds ciphertext — the encryption key travels in
+// the QR code and never touches the server.
+//
+// Also hosts the durable encrypted backups (POST/GET/DELETE /api/backups),
+// where the backup ID + passphrase is the authorization.
+//
+//   pnpm dev    — local development (tsx, watches src)
+//   pnpm build  — tsc -> dist/
+//   pnpm start  — node dist/index.js (what Docker / Render run)
+// =========================================================================
+
+// Load .env (PORT, TRUST_PROXY, ...) before config.ts reads process.env.
+// No-op if the file is absent — hosts like Render inject env vars directly.
+import "dotenv/config";
+
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 
-import { addAuditEvent } from "./audit.js";
+import { backupRoutes } from "./backup-routes.js";
+import { BackupStore } from "./backup-store.js";
 import { config } from "./config.js";
-import { SessionStore } from "./session-store.js";
-import {
-  closeAllWebSockets,
-  registerWebSocketServer
-} from "./websocket.js";
-import type {
-  CreateSessionResponse,
-  ParticipantRole
-} from "./types.js";
+import { shareRoutes } from "./share-routes.js";
+import { ShareStore } from "./share-store.js";
 
 const app = Fastify({
-  logger: true
+  logger: true,
+  // Share uploads carry megabytes of encrypted cookies — the 1 MB
+  // default would reject them with 413 before our own size check runs.
+  bodyLimit: config.SHARE_MAX_BYTES + 64 * 1024,
+  // Honor X-Forwarded-For from the reverse proxy (Render, Railway,
+  // Fly.io, nginx, ...) so request.ip — used by the rate limiter — is
+  // the real client IP. Leave TRUST_PROXY=false when exposed directly.
+  trustProxy: config.TRUST_PROXY
 });
 
-const sessionStore = new SessionStore();
+const shareStore = new ShareStore();
+const backupStore = new BackupStore();
+
+/*
+ * CORS policy: empty CORS_ORIGIN disables CORS. "*" is development-only.
+ * A comma-separated list sets specific allowed origins.
+ */
+function parseCorsOrigin(raw: string): boolean | string | string[] {
+  const value = raw.trim();
+  if (value === "") return false;
+  if (value === "*") return true;
+  const list = value
+    .split(",")
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  return list.length === 1 ? list[0] : list;
+}
 
 await app.register(cors, {
-  origin: config.CORS_ORIGIN === "*"
-    ? true
-    : config.CORS_ORIGIN
+  origin: parseCorsOrigin(config.CORS_ORIGIN)
 });
 
-app.get(
-  "/",
-  async () => {
-    return {
-      name: "Relayn Server",
-      version: "0.1.0",
-      status: "online"
-    };
-  }
-);
+// Ephemeral device-to-device shares (ciphertext only, single-use).
+await app.register(shareRoutes, { shareStore });
 
-app.get(
-  "/health",
-  async () => {
-    return {
-      status: "ok",
-      service: "relayn-server",
-      timestamp:
-        new Date().toISOString()
-    };
-  }
-);
+// Durable encrypted cookie backups (ciphertext only, ID + passphrase auth).
+// In-memory: restarting the server deletes all backups.
+await app.register(backupRoutes, { backupStore });
 
-app.post(
-  "/api/sessions",
-  async (_request, reply) => {
-    const session =
-      sessionStore.createSession();
+app.get("/", async () => {
+  return {
+    name: "Relayn Server",
+    version: "0.2.0",
+    status: "online"
+  };
+});
 
-    const response:
-      CreateSessionResponse = {
-        sessionId: session.id,
-        code: session.code,
-        status: session.status,
-        expiresAt: session.expiresAt
-      };
+app.get("/health", async () => {
+  return {
+    status: "ok",
+    service: "relayn-server",
+    timestamp: new Date().toISOString()
+  };
+});
 
-    return reply
-      .code(201)
-      .send(response);
-  }
-);
-
-app.get(
-  "/api/sessions/:sessionId",
-  async (request, reply) => {
-    const params =
-      request.params as {
-        sessionId: string;
-      };
-
-    const session =
-      sessionStore.getById(
-        params.sessionId
-      );
-
-    if (!session) {
-      return reply
-        .code(404)
-        .send({
-          error: "SESSION_NOT_FOUND",
-          message:
-            "Session was not found."
-        });
-    }
-
-    return {
-      sessionId: session.id,
-      code: session.code,
-      status: session.status,
-      createdAt: session.createdAt,
-      updatedAt: session.updatedAt,
-      expiresAt: session.expiresAt,
-      customerConnected:
-        session.customer?.connected ??
-        false,
-      technicianConnected:
-        session.technician?.connected ??
-        false
-    };
-  }
-);
-
-app.get(
-  "/api/sessions/code/:code",
-  async (request, reply) => {
-    const params =
-      request.params as {
-        code: string;
-      };
-
-    const session =
-      sessionStore.getByCode(
-        params.code
-      );
-
-    if (!session) {
-      return reply
-        .code(404)
-        .send({
-          error: "SESSION_NOT_FOUND",
-          message:
-            "No active session was found for this code."
-        });
-    }
-
-    return {
-      sessionId: session.id,
-      code: session.code,
-      status: session.status,
-      expiresAt: session.expiresAt,
-      customerConnected:
-        session.customer?.connected ??
-        false,
-      technicianConnected:
-        session.technician?.connected ??
-        false
-    };
-  }
-);
-
-app.get(
-  "/api/sessions/:sessionId/audit",
-  async (request, reply) => {
-    const params =
-      request.params as {
-        sessionId: string;
-      };
-
-    const session =
-      sessionStore.getById(
-        params.sessionId
-      );
-
-    if (!session) {
-      return reply
-        .code(404)
-        .send({
-          error: "SESSION_NOT_FOUND",
-          message:
-            "Session was not found."
-        });
-    }
-
-    return {
-      sessionId: session.id,
-      events: session.audit
-    };
-  }
-);
-
-app.post(
-  "/api/sessions/:sessionId/end",
-  async (request, reply) => {
-    const params =
-      request.params as {
-        sessionId: string;
-      };
-
-    const body =
-      (request.body ?? {}) as {
-        role?: ParticipantRole;
-      };
-
-    const session =
-      sessionStore.getById(
-        params.sessionId
-      );
-
-    if (!session) {
-      return reply
-        .code(404)
-        .send({
-          error: "SESSION_NOT_FOUND",
-          message:
-            "Session was not found."
-        });
-    }
-
-    if (
-      body.role !== "customer" &&
-      body.role !== "technician"
-    ) {
-      return reply
-        .code(400)
-        .send({
-          error: "INVALID_ROLE",
-          message:
-            "role must be customer or technician."
-        });
-    }
-
-    if (session.status === "ENDED") {
-      return {
-        sessionId: session.id,
-        status: session.status
-      };
-    }
-
-    if (session.status === "EXPIRED") {
-      return {
-        sessionId: session.id,
-        status: session.status
-      };
-    }
-
-    session.status =
-      "END_REQUESTED";
-
-    session.endRequestedAt =
-      new Date().toISOString();
-
-    session.endRequestedBy =
-      body.role;
-
-    addAuditEvent(
-      session,
-      "END_REQUESTED",
-      body.role
-    );
-
-    return {
-      sessionId: session.id,
-      status: session.status,
-      timeoutMs:
-        config.END_SESSION_TIMEOUT_MS
-    };
-  }
-);
-
-const websocketServer =
-  registerWebSocketServer(
-    app,
-    sessionStore
-  );
-
-const cleanupTimer =
-  setInterval(() => {
-    const expired =
-      sessionStore.cleanupExpired();
-
-    for (const session of expired) {
-      app.log.info(
-        {
-          sessionId: session.id
-        },
-        "Session expired"
-      );
-    }
-  }, 30_000);
-
-const shutdown = async (
-  signal: string
-) => {
-  app.log.info(
-    `${signal} received. Shutting down Relayn Server.`
-  );
-
-  clearInterval(cleanupTimer);
-
-  closeAllWebSockets();
-
-  websocketServer.close();
-
+const shutdown = async (signal: string) => {
+  app.log.info(`${signal} received. Shutting down Relayn Server.`);
+  shareStore.shutdown();
+  backupStore.shutdown();
   await app.close();
-
   process.exit(0);
 };
 
-process.on(
-  "SIGINT",
-  () => {
-    void shutdown("SIGINT");
-  }
-);
+process.on("SIGINT", () => {
+  void shutdown("SIGINT");
+});
 
-process.on(
-  "SIGTERM",
-  () => {
-    void shutdown("SIGTERM");
-  }
-);
+process.on("SIGTERM", () => {
+  void shutdown("SIGTERM");
+});
 
 try {
   await app.listen({
     host: config.HOST,
     port: config.PORT
   });
-
-  app.log.info(
-    `Relayn Server listening on ${config.HOST}:${config.PORT}`
-  );
+  app.log.info(`Relayn Server listening on ${config.HOST}:${config.PORT}`);
 } catch (error) {
   app.log.error(error);
   process.exit(1);

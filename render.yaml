@@ -1,0 +1,16 @@
+# Render.com deployment for the Relayn share server.
+# Push this repo (or just the server/ folder) to GitHub, then
+# "New > Blueprint" in Render and point it at this file.
+# Render injects PORT automatically; TRUST_PROXY must be true so the
+# rate limiter sees the real client IP behind Render's proxy.
+services:
+  - type: web
+    name: relayn-server
+    runtime: docker
+    dockerfilePath: ./services/server/Dockerfile
+    dockerContext: ./services/server
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: TRUST_PROXY
+        value: "true"

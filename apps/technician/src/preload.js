@@ -1,86 +1,37 @@
-const {
-    contextBridge,
-    ipcRenderer
-} = require("electron");
+// =========================================================================
+// RELAYN — Device B (inject-to) preload script
+// -------------------------------------------------------------------------
+// Exposes ONLY the Device B API surface. Device A functions
+// (createSession, approveSession, rejectSession, extractAuthCookie) are
+// intentionally absent: the renderer cannot invoke IPC handlers that do
+// not exist, which keeps each app's attack surface to what it actually
+// needs.
+// =========================================================================
 
-contextBridge.exposeInMainWorld(
-    "relayn",
-    {
-        joinSession: (code) =>
-            ipcRenderer.invoke(
-                "session:join",
-                code
-            ),
+const { contextBridge, ipcRenderer } = require("electron");
 
-        requestAccess: () =>
-            ipcRenderer.invoke(
-                "session:request"
-            ),
+contextBridge.exposeInMainWorld("relayn", {
+    // Session lifecycle (Device B joins via code)
+    joinSession: (code) => ipcRenderer.invoke("relayn:join-session", code),
+    requestAccess: () => ipcRenderer.invoke("relayn:request-access"),
+    endSession: () => ipcRenderer.invoke("relayn:end-session"),
+    cancelEndSession: () => ipcRenderer.invoke("relayn:cancel-end-session"),
+    confirmEndSession: () => ipcRenderer.invoke("relayn:confirm-end-session"),
 
-        endSession: () =>
-            ipcRenderer.invoke(
-                "session:end"
-            ),
+    // WebRTC signaling relay (payload: { targetRole, data })
+    sendSignal: (targetRole, data) =>
+        ipcRenderer.invoke("relayn:send-signal", { targetRole, data }),
 
-        cancelEndSession: () =>
-            ipcRenderer.invoke(
-                "session:end:cancel"
-            ),
+    // Cookie injection / removal (Device B only — never extraction)
+    injectAuthCookie: (cookieData) =>
+        ipcRenderer.invoke("relayn:inject-auth-cookie", cookieData),
+    removeAuthCookie: () =>
+        ipcRenderer.invoke("relayn:remove-auth-cookie"),
 
-        confirmEndSession: () =>
-            ipcRenderer.invoke(
-                "session:end:confirm"
-            ),
-
-        sendSignal: (
-            targetRole,
-            data
-        ) =>
-            ipcRenderer.invoke(
-                "session:signal",
-                {
-                    targetRole,
-                    data
-                }
-            ),
-
-        onSessionEvent: (
-            callback
-        ) => {
-            const listener = (
-                _event,
-                data
-            ) => {
-                callback(data);
-            };
-
-            ipcRenderer.on(
-                "session:event",
-                listener
-            );
-
-            return () => {
-                ipcRenderer.removeListener(
-                    "session:event",
-                    listener
-                );
-            };
-        },
-
-        // =========================================================================
-        // 🔒 DEVICE B (TECHNICIAN): SECURE MIGRATION CHANNELS
-        // =========================================================================
-
-        /**
-         * Injects a raw session cookie structure directly into the app's sandboxed storage.
-         * @param {Object} cookieData - The full cookie structure object transferred over WebRTC
-         * @returns {Promise<{success: boolean, error?: string}>} Resolves with status of the operation
-         */
-        injectAuthCookie: (cookieData) => 
-            ipcRenderer.invoke(
-                "session:cookie:inject", 
-                cookieData
-            )
-        // =========================================================================
+    // Server event subscription. Re-subscribing replaces the old listener
+    // so renderer reloads can't stack duplicate handlers.
+    onSessionEvent: (callback) => {
+        ipcRenderer.removeAllListeners("relayn:session-event");
+        ipcRenderer.on("relayn:session-event", (event, message) => callback(message));
     }
-);
+});
