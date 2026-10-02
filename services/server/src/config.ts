@@ -42,6 +42,19 @@ const envSchema = z.object({
     .default(10 * 60 * 1000),
 
   /*
+   * Account shares: uploaded under a pre-shared account ID (assigned
+   * account shared by the admin and child builds) and kept for one-tap
+   * retrieval — multi-use, NOT single-use. Default 48 hours. The full
+   * share, including the decryption key, is stored under the account:
+   * a deliberate product decision (see share-store.ts).
+   */
+  ACCOUNT_SHARE_TTL_MS: z.coerce
+    .number()
+    .int()
+    .positive()
+    .default(48 * 60 * 60 * 1000),
+
+  /*
    * Max accepted share upload body. A few thousand cookies encrypt to
    * roughly 1–3 MB of base64; 8 MB leaves comfortable headroom.
    */
@@ -75,6 +88,7 @@ export const config = envSchema.parse({
   CORS_ORIGIN: process.env.CORS_ORIGIN,
   TRUST_PROXY: process.env.TRUST_PROXY,
   SHARE_TTL_MS: process.env.SHARE_TTL_MS,
+  ACCOUNT_SHARE_TTL_MS: process.env.ACCOUNT_SHARE_TTL_MS,
   SHARE_MAX_BYTES: process.env.SHARE_MAX_BYTES,
   BACKUP_TTL_MS: process.env.BACKUP_TTL_MS,
   BACKUP_MAX_BYTES: process.env.BACKUP_MAX_BYTES

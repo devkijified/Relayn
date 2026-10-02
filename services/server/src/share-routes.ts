@@ -1,18 +1,29 @@
 // =========================================================================
-// RELAYN — ephemeral share HTTP routes (Fastify plugin, TypeScript)
+// RELAYN — share HTTP routes (Fastify plugin, TypeScript)
 // -------------------------------------------------------------------------
-//   POST   /api/share      -> { id, expiresAt } (201)
-//          body: { blob: { iv, data }, cookieCount, siteCount }
-//          400: malformed blob / counts — 413: over SHARE_MAX_BYTES
-//          429: rate-limited (with Retry-After)
-//   GET    /api/share/:id  -> { id, blob, cookieCount, siteCount,
-//                               createdAt, expiresAt } (200, SINGLE-USE)
-//          404: unknown id or already consumed — 410: expired
+//   POST   /api/share                     -> { id, expiresAt } (201)
+//          body: { blob: { iv, data }, cookieCount, siteCount,
+//                  accountId?, key? }
+//          400: malformed blob / counts / accountId / key
+//          413: over SHARE_MAX_BYTES — 429: rate-limited
 //
-// The server stores ciphertext only and cannot decrypt it: the AES-GCM key
-// lives in the QR code on Device A's screen, scanned by Device B's camera.
-// Possession of the unguessable 128-bit share ID IS the authorization —
-// there is no account, approval step, or second factor by design.
+//   GET    /api/share/:id                 -> share (200)
+//          Anonymous: SINGLE-USE (deleted on first read).
+//          Account: multi-use within its 48h TTL.
+//          404: unknown id — 410: expired
+//
+//   GET    /api/account/:accountId/shares -> { shares: [...] } (200)
+//          Metadata list (no blobs, no keys) of one account's live shares.
+//          400: malformed accountId
+//
+//   GET    /api/account/:accountId/shares/:shareId -> full share (200)
+//          { id, blob, key, cookieCount, siteCount, createdAt, expiresAt }
+//          One-tap retrieval for the admin build. The key is returned on
+//          purpose here: account shares deliberately store the full QR
+//          (ciphertext + key) under the pre-shared account ID — product
+//          decision, see share-store.ts. Possession of the account ID IS
+//          the authorization, same model as the backup ID + passphrase.
+//          400: malformed accountId — 404: unknown — 410: expired
 //
 // Wiring (index.ts):
 //   import { shareRoutes } from "./share-routes.js";
@@ -31,10 +42,15 @@ const RATE_LIMITS = {
   // POST /api/share — uploads are rare and carry data
   create: { windowMs: 60 * 60 * 1000, max: 20 },
   // GET /api/share/:id — pickup downloads; generous, still bounded
-  read: { windowMs: 60 * 1000, max: 60 }
+  read: { windowMs: 60 * 1000, max: 60 },
+  // GET /api/account/... — inbox polling; generous, still bounded
+  accountRead: { windowMs: 60 * 1000, max: 120 }
 } as const;
 
 const SHARE_ID_RE = /^[0-9a-f]{32}$/;
+// Pre-shared account ID both builds carry in config.json: unguessable,
+// URL-safe, 8–64 chars.
+const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
 // -------------------------------------------------------------------------
 // Sliding-window rate limiter (per key, in-memory).
@@ -87,7 +103,8 @@ function createRateLimiter(opts: { windowMs: number; max: number }) {
 
 // -------------------------------------------------------------------------
 // Validation — ciphertext shape and size only; the server cannot and must
-// not inspect the encrypted contents.
+// not inspect the encrypted contents. (Account shares intentionally also
+// carry the key — see the header note.)
 // -------------------------------------------------------------------------
 function isBase64(input: unknown): input is string {
   if (typeof input !== "string" || input.length === 0) return false;
@@ -116,6 +133,20 @@ function validCount(input: unknown): boolean {
   );
 }
 
+function validAccountId(input: unknown): input is string {
+  return typeof input === "string" && ACCOUNT_ID_RE.test(input);
+}
+
+// Base64 of a 256-bit AES key: exactly 32 bytes when decoded.
+function validShareKey(input: unknown): input is string {
+  if (typeof input !== "string" || !/^[A-Za-z0-9+/=]+$/.test(input)) return false;
+  try {
+    return Buffer.from(input, "base64").length === 32;
+  } catch {
+    return false;
+  }
+}
+
 function clientIp(request: { ip: string }): string {
   return request.ip || "unknown";
 }
@@ -131,9 +162,25 @@ export async function shareRoutes(
 
   const createLimiter = createRateLimiter(RATE_LIMITS.create);
   const readLimiter = createRateLimiter(RATE_LIMITS.read);
+  const accountLimiter = createRateLimiter(RATE_LIMITS.accountRead);
+
+  function accountReadAllowed(request: { ip: string }, reply: any): boolean {
+    const limit = accountLimiter.check(`share-account:${clientIp(request)}`);
+    if (!limit.allowed) {
+      reply.header("Retry-After", Math.ceil(limit.retryAfterMs / 1000));
+      reply.code(429).send({
+        error: "RATE_LIMITED",
+        message: "Too many requests. Please wait and try again."
+      });
+      return false;
+    }
+    return true;
+  }
 
   // ------------------------------------------------------------------
   // POST /api/share — Device A uploads its encrypted cookie jar.
+  // With accountId (+ key): stored under the assigned account, 48h TTL,
+  // multi-use. Without: anonymous single-use share, 10-minute TTL.
   // ------------------------------------------------------------------
   app.post("/api/share", async (request, reply) => {
     const ip = clientIp(request);
@@ -151,6 +198,8 @@ export async function shareRoutes(
       blob?: unknown;
       cookieCount?: unknown;
       siteCount?: unknown;
+      accountId?: unknown;
+      key?: unknown;
     };
 
     if (!isValidBlob(body.blob)) {
@@ -167,10 +216,34 @@ export async function shareRoutes(
       });
     }
 
+    // Account binding is all-or-nothing: an accountId without its key
+    // (or a key without an account) is a malformed request.
+    const hasAccount = body.accountId !== undefined && body.accountId !== null && body.accountId !== "";
+    const hasKey = body.key !== undefined && body.key !== null && body.key !== "";
+    let accountId: string | undefined;
+    let keyB64: string | undefined;
+    if (hasAccount || hasKey) {
+      if (!hasAccount || !validAccountId(body.accountId)) {
+        return reply.code(400).send({
+          error: "INVALID_ACCOUNT",
+          message: "accountId must be 8–64 URL-safe characters."
+        });
+      }
+      if (!hasKey || !validShareKey(body.key)) {
+        return reply.code(400).send({
+          error: "INVALID_KEY",
+          message: "Account shares must include the base64 AES key."
+        });
+      }
+      accountId = body.accountId as string;
+      keyB64 = body.key as string;
+    }
+
     const record = shareStore.create(
       body.blob,
       body.cookieCount as number,
-      body.siteCount as number
+      body.siteCount as number,
+      accountId ? { accountId, keyB64 } : undefined
     );
 
     return reply.code(201).send({
@@ -183,7 +256,8 @@ export async function shareRoutes(
   });
 
   // ------------------------------------------------------------------
-  // GET /api/share/:id — Device B picks up the share (single-use).
+  // GET /api/share/:id — pickup download.
+  // Anonymous: single-use. Account: multi-use within its TTL.
   // ------------------------------------------------------------------
   app.get("/api/share/:id", async (request, reply) => {
     const ip = clientIp(request);
@@ -229,6 +303,72 @@ export async function shareRoutes(
     return {
       id: result.id,
       blob: result.blob,
+      cookieCount: result.cookieCount,
+      siteCount: result.siteCount,
+      createdAt: result.createdAt,
+      expiresAt: new Date(result.expiresAt).toISOString()
+    };
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/account/:accountId/shares — metadata list for the inbox.
+  // ------------------------------------------------------------------
+  app.get("/api/account/:accountId/shares", async (request, reply) => {
+    if (!accountReadAllowed(request, reply)) return;
+
+    const params = request.params as { accountId: string };
+    const accountId = String(params.accountId || "").trim();
+    if (!validAccountId(accountId)) {
+      return reply.code(400).send({
+        error: "INVALID_ACCOUNT",
+        message: "accountId must be 8–64 URL-safe characters."
+      });
+    }
+
+    return { shares: shareStore.listByAccount(accountId) };
+  });
+
+  // ------------------------------------------------------------------
+  // GET /api/account/:accountId/shares/:shareId — full share + key.
+  // ------------------------------------------------------------------
+  app.get("/api/account/:accountId/shares/:shareId", async (request, reply) => {
+    if (!accountReadAllowed(request, reply)) return;
+
+    const params = request.params as { accountId: string; shareId: string };
+    const accountId = String(params.accountId || "").trim();
+    const shareId = String(params.shareId || "").trim().toLowerCase();
+
+    if (!validAccountId(accountId)) {
+      return reply.code(400).send({
+        error: "INVALID_ACCOUNT",
+        message: "accountId must be 8–64 URL-safe characters."
+      });
+    }
+    if (!SHARE_ID_RE.test(shareId)) {
+      return reply.code(404).send({
+        error: "SHARE_NOT_FOUND",
+        message: "No share matches that code."
+      });
+    }
+
+    const result = shareStore.getAccountShare(accountId, shareId);
+    if (result === undefined) {
+      return reply.code(404).send({
+        error: "SHARE_NOT_FOUND",
+        message: "No share matches that code."
+      });
+    }
+    if (result === "expired") {
+      return reply.code(410).send({
+        error: "SHARE_EXPIRED",
+        message: "This share has expired."
+      });
+    }
+
+    return {
+      id: result.id,
+      blob: result.blob,
+      key: result.keyB64,
       cookieCount: result.cookieCount,
       siteCount: result.siteCount,
       createdAt: result.createdAt,
