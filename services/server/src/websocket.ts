@@ -8,758 +8,936 @@ import { addAuditEvent } from "./audit.js";
 import { config } from "./config.js";
 import { SessionStore } from "./session-store.js";
 import type {
-  ParticipantRole,
-  Session
+    ParticipantRole,
+    Session
 } from "./types.js";
 
 interface ClientConnection {
-  socket: WebSocket;
-  sessionId: string;
-  role: ParticipantRole;
-  participantId: string;
+    socket: WebSocket;
+    sessionId: string;
+    role: ParticipantRole;
+    participantId: string;
 }
 
 const clients = new Set<ClientConnection>();
 
 function send(
-  socket: WebSocket,
-  type: string,
-  payload: unknown
+    socket: WebSocket,
+    type: string,
+    payload: unknown
 ): void {
-  if (socket.readyState !== WebSocket.OPEN) {
-    return;
-  }
+    if (socket.readyState !== WebSocket.OPEN) {
+        return;
+    }
 
-  socket.send(
-    JSON.stringify({
-      type,
-      payload
-    })
-  );
+    socket.send(
+        JSON.stringify({
+            type,
+            payload
+        })
+    );
 }
 
 function sendError(
-  socket: WebSocket,
-  code: string,
-  message: string
+    socket: WebSocket,
+    code: string,
+    message: string
 ): void {
-  send(socket, "error", {
-    code,
-    message
-  });
+    send(socket, "error", {
+        code,
+        message
+    });
 }
 
 function broadcastToSession(
-  sessionId: string,
-  type: string,
-  payload: unknown,
-  excludeSocket?: WebSocket
+    sessionId: string,
+    type: string,
+    payload: unknown,
+    excludeSocket?: WebSocket
 ): void {
-  for (const client of clients) {
-    if (
-      client.sessionId === sessionId &&
-      client.socket !== excludeSocket
-    ) {
-      send(client.socket, type, payload);
+    for (const client of clients) {
+        if (
+            client.sessionId === sessionId &&
+            client.socket !== excludeSocket
+        ) {
+            send(client.socket, type, payload);
+        }
     }
-  }
 }
 
 function sendSessionState(
-  session: Session
+    session: Session
 ): void {
-  const payload = {
-    sessionId: session.id,
-    code: session.code,
-    status: session.status,
-    customerConnected:
-      session.customer?.connected ?? false,
-    technicianConnected:
-      session.technician?.connected ?? false,
-    expiresAt: session.expiresAt
-  };
+    const payload = {
+        sessionId: session.id,
+        code: session.code,
+        status: session.status,
+        customerConnected:
+            session.customer?.connected ?? false,
+        technicianConnected:
+            session.technician?.connected ?? false,
+        expiresAt: session.expiresAt,
+        endRequestedBy:
+            session.endRequestedBy,
+        endRequestedAt:
+            session.endRequestedAt
+    };
 
-  broadcastToSession(
-    session.id,
-    "session.state",
-    payload
-  );
+    broadcastToSession(
+        session.id,
+        "session.state",
+        payload
+    );
 }
 
 function getClientForRole(
-  sessionId: string,
-  role: ParticipantRole
+    sessionId: string,
+    role: ParticipantRole
 ): ClientConnection | undefined {
-  return [...clients].find(
-    (client) =>
-      client.sessionId === sessionId &&
-      client.role === role
-  );
+    return [...clients].find(
+        (client) =>
+            client.sessionId === sessionId &&
+            client.role === role
+    );
 }
 
 function endSession(
-  sessionStore: SessionStore,
-  session: Session,
-  auditType:
-    | "END_CONFIRMED"
-    | "END_TIMEOUT"
+    sessionStore: SessionStore,
+    session: Session,
+    auditType:
+        | "END_CONFIRMED"
+        | "END_TIMEOUT"
 ): void {
-  session.status = "ENDED";
+    session.status = "ENDED";
 
-  addAuditEvent(
-    session,
-    auditType
-  );
+    addAuditEvent(
+        session,
+        auditType
+    );
 
-  addAuditEvent(
-    session,
-    "SESSION_ENDED"
-  );
+    addAuditEvent(
+        session,
+        "SESSION_ENDED"
+    );
 
-  broadcastToSession(
-    session.id,
-    "session.ended",
-    {
-      sessionId: session.id,
-      reason:
-        auditType === "END_TIMEOUT"
-          ? "END_REQUEST_TIMEOUT"
-          : "END_CONFIRMED"
-    }
-  );
+    broadcastToSession(
+        session.id,
+        "session.ended",
+        {
+            sessionId: session.id,
+            reason:
+                auditType === "END_TIMEOUT"
+                    ? "END_REQUEST_TIMEOUT"
+                    : "END_CONFIRMED"
+        }
+    );
 
-  sendSessionState(session);
+    sendSessionState(session);
 }
 
 function handleMessage(
-  connection: ClientConnection,
-  sessionStore: SessionStore,
-  rawMessage: string
+    connection: ClientConnection,
+    sessionStore: SessionStore,
+    rawMessage: string
 ): void {
-  let message: {
-    type?: string;
-    payload?: any;
-  };
+    let message: {
+        type?: string;
+        payload?: any;
+    };
 
-  try {
-    message = JSON.parse(rawMessage);
-  } catch {
-    sendError(
-      connection.socket,
-      "INVALID_JSON",
-      "Message must be valid JSON."
+    try {
+        message = JSON.parse(rawMessage);
+    } catch {
+        sendError(
+            connection.socket,
+            "INVALID_JSON",
+            "Message must be valid JSON."
+        );
+
+        return;
+    }
+
+    const session = sessionStore.getById(
+        connection.sessionId
     );
 
-    return;
-  }
-
-  const session = sessionStore.getById(
-    connection.sessionId
-  );
-
-  if (!session) {
-    sendError(
-      connection.socket,
-      "SESSION_NOT_FOUND",
-      "Session no longer exists."
-    );
-
-    return;
-  }
-
-  sessionStore.touchParticipant(
-    session,
-    connection.role
-  );
-
-  switch (message.type) {
-    case "session.request": {
-      if (connection.role !== "technician") {
+    if (!session) {
         sendError(
-          connection.socket,
-          "FORBIDDEN",
-          "Only the technician can request a session."
+            connection.socket,
+            "SESSION_NOT_FOUND",
+            "Session no longer exists."
         );
 
         return;
-      }
-
-      if (
-        session.status !==
-        "WAITING_FOR_TECHNICIAN"
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_STATE",
-          `Cannot request session while status is ${session.status}.`
-        );
-
-        return;
-      }
-
-      session.status = "TECHNICIAN_REQUESTED";
-
-      addAuditEvent(
-        session,
-        "TECHNICIAN_REQUESTED",
-        "technician"
-      );
-
-      const customer = getClientForRole(
-        session.id,
-        "customer"
-      );
-
-      if (customer) {
-        send(
-          customer.socket,
-          "session.requested",
-          {
-            sessionId: session.id,
-            code: session.code
-          }
-        );
-      }
-
-      sendSessionState(session);
-      return;
     }
 
-    case "session.approve": {
-      if (connection.role !== "customer") {
-        sendError(
-          connection.socket,
-          "FORBIDDEN",
-          "Only the customer can approve a session."
-        );
-
-        return;
-      }
-
-      if (
-        session.status !==
-        "TECHNICIAN_REQUESTED"
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_STATE",
-          `Cannot approve session while status is ${session.status}.`
-        );
-
-        return;
-      }
-
-      session.status = "CONNECTED";
-
-      addAuditEvent(
+    sessionStore.touchParticipant(
         session,
-        "CUSTOMER_APPROVED",
-        "customer"
-      );
-
-      addAuditEvent(
-        session,
-        "SESSION_CONNECTED"
-      );
-
-      broadcastToSession(
-        session.id,
-        "session.approved",
-        {
-          sessionId: session.id
-        }
-      );
-
-      sendSessionState(session);
-      return;
-    }
-
-    case "session.reject": {
-      if (connection.role !== "customer") {
-        sendError(
-          connection.socket,
-          "FORBIDDEN",
-          "Only the customer can reject a session."
-        );
-
-        return;
-      }
-
-      if (
-        session.status !==
-        "TECHNICIAN_REQUESTED"
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_STATE",
-          `Cannot reject session while status is ${session.status}.`
-        );
-
-        return;
-      }
-
-      session.status =
-        "WAITING_FOR_TECHNICIAN";
-
-      addAuditEvent(
-        session,
-        "CUSTOMER_REJECTED",
-        "customer"
-      );
-
-      broadcastToSession(
-        session.id,
-        "session.rejected",
-        {
-          sessionId: session.id
-        }
-      );
-
-      sendSessionState(session);
-      return;
-    }
-
-    case "session.end.request": {
-      if (
-        session.status !== "CONNECTED"
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_STATE",
-          `Cannot end session while status is ${session.status}.`
-        );
-
-        return;
-      }
-
-      session.status = "END_REQUESTED";
-      session.endRequestedAt =
-        new Date().toISOString();
-      session.endRequestedBy =
-        connection.role;
-
-      addAuditEvent(
-        session,
-        "END_REQUESTED",
         connection.role
-      );
+    );
 
-      const otherRole: ParticipantRole =
-        connection.role === "customer"
-          ? "technician"
-          : "customer";
+    switch (message.type) {
+        /*
+         * Both message names are supported.
+         *
+         * session.access.request
+         *     New technician app message.
+         *
+         * session.request
+         *     Existing message kept for compatibility.
+         */
+        case "session.access.request":
+        case "session.request": {
+            if (
+                connection.role !==
+                "technician"
+            ) {
+                sendError(
+                    connection.socket,
+                    "FORBIDDEN",
+                    "Only the technician can request a session."
+                );
 
-      const otherClient =
-        getClientForRole(
-          session.id,
-          otherRole
-        );
+                return;
+            }
 
-      if (otherClient) {
-        send(
-          otherClient.socket,
-          "session.end.requested",
-          {
-            sessionId: session.id,
-            requestedBy: connection.role,
-            timeoutMs:
-              config.END_SESSION_TIMEOUT_MS
-          }
-        );
-      }
+            if (
+                session.status !==
+                "WAITING_FOR_TECHNICIAN"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_STATE",
+                    `Cannot request session while status is ${session.status}.`
+                );
 
-      send(
-        connection.socket,
-        "session.end.pending",
-        {
-          sessionId: session.id,
-          timeoutMs:
-            config.END_SESSION_TIMEOUT_MS
+                return;
+            }
+
+            session.status =
+                "TECHNICIAN_REQUESTED";
+
+            addAuditEvent(
+                session,
+                "TECHNICIAN_REQUESTED",
+                "technician"
+            );
+
+            const customer =
+                getClientForRole(
+                    session.id,
+                    "customer"
+                );
+
+            if (customer) {
+                send(
+                    customer.socket,
+                    "session.requested",
+                    {
+                        sessionId:
+                            session.id,
+                        code:
+                            session.code
+                    }
+                );
+            }
+
+            sendSessionState(session);
+
+            return;
         }
-      );
 
-      sendSessionState(session);
+        case "session.approve": {
+            if (
+                connection.role !==
+                "customer"
+            ) {
+                sendError(
+                    connection.socket,
+                    "FORBIDDEN",
+                    "Only the customer can approve a session."
+                );
 
-      setTimeout(() => {
-        const currentSession =
-          sessionStore.getById(session.id);
+                return;
+            }
 
-        if (
-          currentSession &&
-          currentSession.status ===
-            "END_REQUESTED"
-        ) {
-          endSession(
-            sessionStore,
-            currentSession,
-            "END_TIMEOUT"
-          );
+            if (
+                session.status !==
+                "TECHNICIAN_REQUESTED"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_STATE",
+                    `Cannot approve session while status is ${session.status}.`
+                );
+
+                return;
+            }
+
+            session.status =
+                "CONNECTED";
+
+            addAuditEvent(
+                session,
+                "CUSTOMER_APPROVED",
+                "customer"
+            );
+
+            addAuditEvent(
+                session,
+                "SESSION_CONNECTED"
+            );
+
+            broadcastToSession(
+                session.id,
+                "session.approved",
+                {
+                    sessionId:
+                        session.id
+                }
+            );
+
+            sendSessionState(session);
+
+            return;
         }
-      }, config.END_SESSION_TIMEOUT_MS);
 
-      return;
-    }
+        case "session.reject": {
+            if (
+                connection.role !==
+                "customer"
+            ) {
+                sendError(
+                    connection.socket,
+                    "FORBIDDEN",
+                    "Only the customer can reject a session."
+                );
 
-    case "session.end.confirm": {
-      if (
-        session.status !== "END_REQUESTED"
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_STATE",
-          "There is no pending end-session request."
-        );
+                return;
+            }
 
-        return;
-      }
+            if (
+                session.status !==
+                "TECHNICIAN_REQUESTED"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_STATE",
+                    `Cannot reject session while status is ${session.status}.`
+                );
 
-      endSession(
-        sessionStore,
-        session,
-        "END_CONFIRMED"
-      );
+                return;
+            }
 
-      return;
-    }
+            session.status =
+                "WAITING_FOR_TECHNICIAN";
 
-    case "ping": {
-      send(
-        connection.socket,
-        "pong",
-        {
-          timestamp:
-            new Date().toISOString()
+            addAuditEvent(
+                session,
+                "CUSTOMER_REJECTED",
+                "customer"
+            );
+
+            broadcastToSession(
+                session.id,
+                "session.rejected",
+                {
+                    sessionId:
+                        session.id
+                }
+            );
+
+            sendSessionState(session);
+
+            return;
         }
-      );
 
-      return;
-    }
+        case "session.end.request": {
+            if (
+                session.status !==
+                "CONNECTED"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_STATE",
+                    `Cannot end session while status is ${session.status}.`
+                );
 
-    case "signal": {
-      const targetRole =
-        message.payload?.targetRole;
+                return;
+            }
 
-      if (
-        targetRole !== "customer" &&
-        targetRole !== "technician"
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_TARGET",
-          "targetRole must be customer or technician."
-        );
+            const requestedBy =
+                connection.role;
 
-        return;
-      }
+            const otherRole:
+                ParticipantRole =
+                requestedBy ===
+                "customer"
+                    ? "technician"
+                    : "customer";
 
-      if (
-        targetRole === connection.role
-      ) {
-        sendError(
-          connection.socket,
-          "INVALID_TARGET",
-          "Cannot send signaling data to yourself."
-        );
+            session.status =
+                "END_REQUESTED";
 
-        return;
-      }
+            session.endRequestedAt =
+                new Date().toISOString();
 
-      if (
-        session.status !== "CONNECTED"
-      ) {
-        sendError(
-          connection.socket,
-          "SESSION_NOT_CONNECTED",
-          "Signaling is only allowed after the session is connected."
-        );
+            session.endRequestedBy =
+                requestedBy;
 
-        return;
-      }
+            addAuditEvent(
+                session,
+                "END_REQUESTED",
+                requestedBy
+            );
 
-      const target =
-        getClientForRole(
-          session.id,
-          targetRole
-        );
+            const otherClient =
+                getClientForRole(
+                    session.id,
+                    otherRole
+                );
 
-      if (!target) {
-        sendError(
-          connection.socket,
-          "TARGET_OFFLINE",
-          "The target participant is not connected."
-        );
+            if (otherClient) {
+                send(
+                    otherClient.socket,
+                    "session.end.requested",
+                    {
+                        sessionId:
+                            session.id,
+                        requestedBy,
+                        receivedBy:
+                            otherRole,
+                        timeoutMs:
+                            config.END_SESSION_TIMEOUT_MS
+                    }
+                );
+            }
 
-        return;
-      }
+            send(
+                connection.socket,
+                "session.end.pending",
+                {
+                    sessionId:
+                        session.id,
+                    requestedBy,
+                    requestedBySelf:
+                        true,
+                    waitingFor:
+                        otherRole,
+                    timeoutMs:
+                        config.END_SESSION_TIMEOUT_MS
+                }
+            );
 
-      send(
-        target.socket,
-        "signal",
-        {
-          fromRole: connection.role,
-          data: message.payload?.data
+            sendSessionState(session);
+
+            setTimeout(() => {
+                const currentSession =
+                    sessionStore.getById(
+                        session.id
+                    );
+
+                if (
+                    currentSession &&
+                    currentSession.status ===
+                        "END_REQUESTED"
+                ) {
+                    endSession(
+                        sessionStore,
+                        currentSession,
+                        "END_TIMEOUT"
+                    );
+                }
+            }, config.END_SESSION_TIMEOUT_MS);
+
+            return;
         }
-      );
 
-      return;
+        case "session.end.cancel": {
+            if (
+                session.status !==
+                "END_REQUESTED"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_STATE",
+                    "There is no pending end-session request to cancel."
+                );
+
+                return;
+            }
+
+            if (
+                session.endRequestedBy ===
+                connection.role
+            ) {
+                sendError(
+                    connection.socket,
+                    "FORBIDDEN",
+                    "Only the participant receiving the end-session request can cancel it."
+                );
+
+                return;
+            }
+
+            const requestedBy =
+                session.endRequestedBy;
+
+            const cancelledBy =
+                connection.role;
+
+            session.status =
+                "CONNECTED";
+
+            session.endRequestedAt =
+                undefined;
+
+            session.endRequestedBy =
+                undefined;
+
+            broadcastToSession(
+                session.id,
+                "session.end.cancelled",
+                {
+                    sessionId:
+                        session.id,
+                    requestedBy,
+                    cancelledBy,
+                    message:
+                        cancelledBy ===
+                        "customer"
+                            ? "Customer kept the session active."
+                            : "Technician kept the session active."
+                }
+            );
+
+            sendSessionState(session);
+
+            return;
+        }
+
+        case "session.end.confirm": {
+            if (
+                session.status !==
+                "END_REQUESTED"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_STATE",
+                    "There is no pending end-session request."
+                );
+
+                return;
+            }
+
+            if (
+                session.endRequestedBy ===
+                connection.role
+            ) {
+                sendError(
+                    connection.socket,
+                    "FORBIDDEN",
+                    "The participant who requested the session end cannot confirm it. The other participant must confirm."
+                );
+
+                return;
+            }
+
+            endSession(
+                sessionStore,
+                session,
+                "END_CONFIRMED"
+            );
+
+            return;
+        }
+
+        case "ping": {
+            send(
+                connection.socket,
+                "pong",
+                {
+                    timestamp:
+                        new Date().toISOString()
+                }
+            );
+
+            return;
+        }
+
+        case "signal": {
+            const targetRole =
+                message.payload?.targetRole;
+
+            if (
+                targetRole !==
+                    "customer" &&
+                targetRole !==
+                    "technician"
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_TARGET",
+                    "targetRole must be customer or technician."
+                );
+
+                return;
+            }
+
+            if (
+                targetRole ===
+                connection.role
+            ) {
+                sendError(
+                    connection.socket,
+                    "INVALID_TARGET",
+                    "Cannot send signaling data to yourself."
+                );
+
+                return;
+            }
+
+            if (
+                session.status !==
+                "CONNECTED"
+            ) {
+                sendError(
+                    connection.socket,
+                    "SESSION_NOT_CONNECTED",
+                    "Signaling is only allowed after the session is connected."
+                );
+
+                return;
+            }
+
+            const target =
+                getClientForRole(
+                    session.id,
+                    targetRole
+                );
+
+            if (!target) {
+                sendError(
+                    connection.socket,
+                    "TARGET_OFFLINE",
+                    "The target participant is not connected."
+                );
+
+                return;
+            }
+
+            send(
+                target.socket,
+                "signal",
+                {
+                    fromRole:
+                        connection.role,
+                    data:
+                        message.payload?.data
+                }
+            );
+
+            return;
+        }
+
+        default:
+            sendError(
+                connection.socket,
+                "UNKNOWN_MESSAGE",
+                `Unknown message type: ${message.type ?? "undefined"}`
+            );
     }
-
-    default:
-      sendError(
-        connection.socket,
-        "UNKNOWN_MESSAGE",
-        `Unknown message type: ${message.type ?? "undefined"}`
-      );
-  }
 }
 
 export function registerWebSocketServer(
-  app: FastifyInstance,
-  sessionStore: SessionStore
+    app: FastifyInstance,
+    sessionStore: SessionStore
 ): WebSocketServer {
-  const websocketServer =
-    new WebSocketServer({
-      noServer: true
-    });
+    const websocketServer =
+        new WebSocketServer({
+            noServer: true
+        });
 
-  app.server.on(
-    "upgrade",
-    (
-      request: IncomingMessage,
-      socket,
-      head
-    ) => {
-      try {
-        const host =
-          request.headers.host ??
-          "localhost";
+    app.server.on(
+        "upgrade",
+        (
+            request: IncomingMessage,
+            socket,
+            head
+        ) => {
+            try {
+                const host =
+                    request.headers.host ??
+                    "localhost";
 
-        const url = new URL(
-          request.url ?? "/",
-          `http://${host}`
-        );
+                const url = new URL(
+                    request.url ?? "/",
+                    `http://${host}`
+                );
 
-        if (url.pathname !== "/ws") {
-          socket.destroy();
-          return;
+                if (
+                    url.pathname !==
+                    "/ws"
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                const sessionId =
+                    url.searchParams.get(
+                        "sessionId"
+                    );
+
+                const code =
+                    url.searchParams.get(
+                        "code"
+                    );
+
+                const role =
+                    url.searchParams.get(
+                        "role"
+                    ) as
+                        | ParticipantRole
+                        | null;
+
+                if (
+                    !sessionId ||
+                    !code ||
+                    !role
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                if (
+                    role !==
+                        "customer" &&
+                    role !==
+                        "technician"
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                const session =
+                    sessionStore.getById(
+                        sessionId
+                    );
+
+                if (
+                    !session ||
+                    session.code !== code
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                if (
+                    session.status ===
+                        "ENDED" ||
+                    session.status ===
+                        "EXPIRED"
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                if (
+                    role ===
+                        "customer" &&
+                    session.customer
+                        ?.connected
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                if (
+                    role ===
+                        "technician" &&
+                    session.technician
+                        ?.connected
+                ) {
+                    socket.destroy();
+                    return;
+                }
+
+                websocketServer.handleUpgrade(
+                    request,
+                    socket,
+                    head,
+                    (ws) => {
+                        websocketServer.emit(
+                            "connection",
+                            ws,
+                            request,
+                            session,
+                            role
+                        );
+                    }
+                );
+            } catch {
+                socket.destroy();
+            }
         }
+    );
 
-        const sessionId =
-          url.searchParams.get(
-            "sessionId"
-          );
+    websocketServer.on(
+        "connection",
+        (
+            socket: WebSocket,
+            _request: IncomingMessage,
+            session: Session,
+            role: ParticipantRole
+        ) => {
+            const participant =
+                sessionStore.addParticipant(
+                    session,
+                    role
+                );
 
-        const code =
-          url.searchParams.get("code");
+            const connection:
+                ClientConnection = {
+                socket,
+                sessionId:
+                    session.id,
+                role,
+                participantId:
+                    participant.id
+            };
 
-        const role =
-          url.searchParams.get("role") as
-            | ParticipantRole
-            | null;
+            clients.add(connection);
 
-        if (
-          !sessionId ||
-          !code ||
-          !role
-        ) {
-          socket.destroy();
-          return;
-        }
+            if (
+                role ===
+                "technician"
+            ) {
+                addAuditEvent(
+                    session,
+                    "TECHNICIAN_JOINED",
+                    "technician"
+                );
+            }
 
-        if (
-          role !== "customer" &&
-          role !== "technician"
-        ) {
-          socket.destroy();
-          return;
-        }
-
-        const session =
-          sessionStore.getById(
-            sessionId
-          );
-
-        if (
-          !session ||
-          session.code !== code
-        ) {
-          socket.destroy();
-          return;
-        }
-
-        if (
-          session.status === "ENDED" ||
-          session.status === "EXPIRED"
-        ) {
-          socket.destroy();
-          return;
-        }
-
-        if (
-          role === "customer" &&
-          session.customer?.connected
-        ) {
-          socket.destroy();
-          return;
-        }
-
-        if (
-          role === "technician" &&
-          session.technician?.connected
-        ) {
-          socket.destroy();
-          return;
-        }
-
-        websocketServer.handleUpgrade(
-          request,
-          socket,
-          head,
-          (ws) => {
-            websocketServer.emit(
-              "connection",
-              ws,
-              request,
-              session,
-              role
+            send(
+                socket,
+                "connected",
+                {
+                    sessionId:
+                        session.id,
+                    code:
+                        session.code,
+                    role,
+                    status:
+                        session.status
+                }
             );
-          }
-        );
-      } catch {
-        socket.destroy();
-      }
-    }
-  );
 
-  websocketServer.on(
-    "connection",
-    (
-      socket: WebSocket,
-      _request: IncomingMessage,
-      session: Session,
-      role: ParticipantRole
-    ) => {
-      const participant =
-        sessionStore.addParticipant(
-          session,
-          role
-        );
+            sendSessionState(
+                session
+            );
 
-      const connection: ClientConnection = {
-        socket,
-        sessionId: session.id,
-        role,
-        participantId:
-          participant.id
-      };
+            socket.on(
+                "message",
+                (data) => {
+                    handleMessage(
+                        connection,
+                        sessionStore,
+                        data.toString()
+                    );
+                }
+            );
 
-      clients.add(connection);
+            socket.on(
+                "close",
+                () => {
+                    clients.delete(
+                        connection
+                    );
 
-      if (role === "technician") {
-        addAuditEvent(
-          session,
-          "TECHNICIAN_JOINED",
-          "technician"
-        );
-      }
+                    sessionStore.removeParticipant(
+                        session,
+                        role
+                    );
 
-      send(
-        socket,
-        "connected",
-        {
-          sessionId: session.id,
-          code: session.code,
-          role,
-          status: session.status
+                    addAuditEvent(
+                        session,
+                        "PARTICIPANT_DISCONNECTED",
+                        role
+                    );
+
+                    sendSessionState(
+                        session
+                    );
+                }
+            );
+
+            socket.on(
+                "error",
+                () => {
+                    clients.delete(
+                        connection
+                    );
+                }
+            );
+
+            socket.on(
+                "pong",
+                () => {
+                    sessionStore.touchParticipant(
+                        session,
+                        role
+                    );
+                }
+            );
         }
-      );
+    );
 
-      sendSessionState(session);
+    const heartbeat =
+        setInterval(
+            () => {
+                for (
+                    const client of clients
+                ) {
+                    if (
+                        client.socket
+                            .readyState !==
+                        WebSocket.OPEN
+                    ) {
+                        continue;
+                    }
 
-      socket.on(
-        "message",
-        (data) => {
-          handleMessage(
-            connection,
-            sessionStore,
-            data.toString()
-          );
-        }
-      );
+                    client.socket.ping();
+                }
+            },
+            config.HEARTBEAT_INTERVAL_MS
+        );
 
-      socket.on(
+    websocketServer.on(
         "close",
         () => {
-          clients.delete(connection);
-
-          sessionStore.removeParticipant(
-            session,
-            role
-          );
-
-          addAuditEvent(
-            session,
-            "PARTICIPANT_DISCONNECTED",
-            role
-          );
-
-          sendSessionState(session);
+            clearInterval(
+                heartbeat
+            );
         }
-      );
+    );
 
-      socket.on(
-        "error",
-        () => {
-          clients.delete(connection);
-        }
-      );
-
-      socket.on(
-        "pong",
-        () => {
-          sessionStore.touchParticipant(
-            session,
-            role
-          );
-        }
-      );
-    }
-  );
-
-  const heartbeat = setInterval(() => {
-    for (const client of clients) {
-      if (
-        client.socket.readyState !==
-        WebSocket.OPEN
-      ) {
-        continue;
-      }
-
-      client.socket.ping();
-    }
-  }, config.HEARTBEAT_INTERVAL_MS);
-
-  websocketServer.on(
-    "close",
-    () => {
-      clearInterval(heartbeat);
-    }
-  );
-
-  return websocketServer;
+    return websocketServer;
 }
 
 export function closeAllWebSockets(): void {
-  for (const client of clients) {
-    try {
-      client.socket.close(
-        1001,
-        "Server shutting down"
-      );
-    } catch {
-      // Ignore shutdown errors.
+    for (
+        const client of clients
+    ) {
+        try {
+            client.socket.close(
+                1001,
+                "Server shutting down"
+            );
+        } catch {
+            // Ignore shutdown errors.
+        }
     }
-  }
 
-  clients.clear();
+    clients.clear();
 }

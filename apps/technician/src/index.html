@@ -1,21 +1,388 @@
-<!doctype html>
-<html>
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Relayn Console</title>
-<style>
-body{font-family:system-ui,sans-serif;background:#f5f7fa;color:#18212f;margin:0}.wrap{max-width:900px;margin:50px auto;padding:0 24px}.card{background:#fff;border:1px solid #dfe4ea;border-radius:16px;padding:24px;margin:18px 0;box-shadow:0 4px 20px #00000008}input,button{font:inherit;padding:12px 14px;border-radius:10px}input{border:1px solid #cbd3dc;width:180px}button{border:0;background:#18212f;color:white;cursor:pointer;margin-left:8px}.danger{background:#b42318}.muted{color:#667085}.status{font-weight:600}.events{max-height:260px;overflow:auto}.event{padding:8px 0;border-bottom:1px solid #eee}
-</style></head>
-<body><main class="wrap">
-<h1>Relayn Console</h1><p class="muted">Technician remote-support console</p>
-<div class="card"><div>Server: <span id="status" class="status">connecting…</span></div></div>
-<div class="card"><h2>Connect to customer</h2><input id="code" inputmode="numeric" maxlength="6" placeholder="6-digit code"><button id="join">Join session</button><p id="session" class="muted">No active session.</p></div>
-<div class="card"><h2>Session controls</h2><button id="end" class="danger">Request session end</button><p class="muted">Desktop streaming and input control will attach to this session in the next phase.</p></div>
-<div class="card"><h2>Events</h2><div id="events" class="events"></div></div>
-</main>
-<script>
-const $=id=>document.getElementById(id);const log=x=>{$('events').insertAdjacentHTML('afterbegin','<div class="event">'+String(x)+'</div>')};
-window.relayn.onSocketStatus(s=>{$('status').textContent=s});window.relayn.onSocketError(e=>log('Socket error: '+e));
-window.relayn.onMessage(m=>{log(m.type);if(m.type==='joined')$('session').textContent='Connected to session '+m.sessionId;if(m.type==='technician_joined')log('Customer reports technician connected.');if(m.type==='consent_granted')log('Customer approved remote control.');if(m.type==='end_confirmation_required'){const ok=confirm('Customer requested to end the session. Confirm?');window.relayn.send({type:ok?'confirm_end':'reject_end'})}if(m.type==='session_ended'){alert('Session ended: '+m.reason);location.reload()}if(m.type==='peer_disconnected')log('Customer disconnected.');});
-$('join').onclick=()=>{const code=$('code').value.trim();if(!/^\d{6}$/.test(code))return alert('Enter the 6-digit customer code.');window.relayn.send({type:'join_session',role:'technician',code})};$('end').onclick=()=>window.relayn.send({type:'request_end'});
-</script></body></html>
+    <meta charset="UTF-8" />
+
+    <meta
+        http-equiv="Content-Security-Policy"
+        content="
+            default-src 'self';
+            script-src 'self';
+            style-src 'self' 'unsafe-inline';
+            connect-src http://localhost:4000 ws://localhost:4000;
+        "
+    />
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    />
+
+    <title>Relayn Console</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+
+            font-family:
+                Inter,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+
+            background: #f5f7fb;
+            color: #182230;
+
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: min(560px, 90vw);
+        }
+
+        .card {
+            background: white;
+            border-radius: 18px;
+            padding: 40px;
+
+            box-shadow:
+                0 12px 40px
+                rgba(0, 0, 0, 0.08);
+        }
+
+        .brand {
+            font-size: 32px;
+            font-weight: 800;
+            margin-bottom: 4px;
+        }
+
+        .role {
+            color: #667085;
+            margin-bottom: 32px;
+        }
+
+        .label {
+            display: block;
+            font-size: 14px;
+            font-weight: 600;
+            color: #344054;
+            margin-bottom: 8px;
+        }
+
+        input {
+            width: 100%;
+            padding: 15px;
+
+            border: 1px solid #d0d5dd;
+            border-radius: 10px;
+
+            font-size: 22px;
+            letter-spacing: 5px;
+            text-align: center;
+
+            outline: none;
+        }
+
+        input:focus {
+            border-color: #2563eb;
+            box-shadow:
+                0 0 0 3px
+                rgba(37, 99, 235, 0.12);
+        }
+
+        button {
+            width: 100%;
+
+            border: 0;
+            border-radius: 10px;
+
+            padding: 15px 20px;
+            margin-top: 14px;
+
+            background: #2563eb;
+            color: white;
+
+            font-size: 16px;
+            font-weight: 700;
+
+            cursor: pointer;
+        }
+
+        button:hover {
+            opacity: 0.92;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .secondary {
+            background: #667085;
+        }
+
+        .reject {
+            background: #d92d20;
+        }
+
+        .session {
+            display: none;
+        }
+
+        .session.visible {
+            display: block;
+        }
+
+        .session-code {
+            background: #f1f5f9;
+            border-radius: 12px;
+
+            padding: 18px;
+
+            text-align: center;
+
+            font-size: 30px;
+            font-weight: 800;
+            letter-spacing: 7px;
+
+            margin-bottom: 20px;
+        }
+
+        .status {
+            padding: 14px;
+
+            border-radius: 10px;
+
+            background: #f8fafc;
+            color: #475467;
+
+            text-align: center;
+
+            margin-bottom: 14px;
+        }
+
+        .request {
+            display: none;
+        }
+
+        .request.visible {
+            display: block;
+        }
+
+        .end-request {
+            display: none;
+
+            margin-top: 18px;
+            padding: 20px;
+
+            border-radius: 14px;
+
+            background: #fff7ed;
+            border: 1px solid #fed7aa;
+        }
+
+        .end-request.visible {
+            display: block;
+        }
+
+        .end-request-title {
+            font-size: 18px;
+            font-weight: 800;
+
+            color: #9a3412;
+
+            margin-bottom: 8px;
+
+            text-align: center;
+        }
+
+        .end-request-text {
+            font-size: 14px;
+            line-height: 1.5;
+
+            color: #7c2d12;
+
+            text-align: center;
+
+            margin-bottom: 14px;
+        }
+
+        .request-buttons {
+            display: flex;
+            gap: 10px;
+        }
+
+        .request-buttons button {
+            margin-top: 0;
+        }
+
+        .request-buttons .secondary {
+            background: #667085;
+        }
+
+        .request-buttons .reject {
+            background: #d92d20;
+        }
+
+        .error {
+            margin-top: 16px;
+
+            color: #b42318;
+            background: #fef3f2;
+
+            padding: 12px;
+            border-radius: 8px;
+
+            display: none;
+        }
+
+        .error.visible {
+            display: block;
+        }
+
+        .connected {
+            background: #ecfdf3;
+            color: #027a48;
+        }
+    </style>
+</head>
+
+<body>
+
+    <main class="container">
+
+        <section class="card">
+
+            <div class="brand">
+                Relayn
+            </div>
+
+            <div class="role">
+                Technician Console
+            </div>
+
+            <div id="joinView">
+
+                <label
+                    class="label"
+                    for="codeInput"
+                >
+                    Customer support code
+                </label>
+
+                <input
+                    id="codeInput"
+                    type="text"
+                    inputmode="numeric"
+                    maxlength="6"
+                    placeholder="000000"
+                    autocomplete="off"
+                />
+
+                <button
+                    id="joinButton"
+                >
+                    Join Session
+                </button>
+
+            </div>
+
+            <div
+                id="sessionView"
+                class="session"
+            >
+
+                <div class="session-code">
+                    <span id="sessionCode">
+                        ------
+                    </span>
+                </div>
+
+                <div
+                    id="sessionStatus"
+                    class="status"
+                >
+                    Connected to session.
+                </div>
+
+                <div
+                    id="requestSection"
+                    class="request visible"
+                >
+
+                    <button
+                        id="requestAccessButton"
+                    >
+                        Request Access
+                    </button>
+
+                </div>
+
+                <div
+                    id="endRequestSection"
+                    class="end-request"
+                >
+
+                    <div class="end-request-title">
+                        Customer wants to end the session
+                    </div>
+
+                    <div class="end-request-text">
+                        The customer has requested
+                        to end the remote support
+                        session.
+
+                        Choose whether to keep
+                        the session active or
+                        end the session.
+                    </div>
+
+                    <div class="request-buttons">
+
+                        <button
+                            id="cancelEndButton"
+                            class="secondary"
+                        >
+                            Keep Session
+                        </button>
+
+                        <button
+                            id="confirmEndButton"
+                            class="reject"
+                        >
+                            End Session
+                        </button>
+
+                    </div>
+
+                </div>
+
+                <button
+                    id="endButton"
+                >
+                    End Session
+                </button>
+
+            </div>
+
+            <div
+                id="error"
+                class="error"
+            ></div>
+
+        </section>
+
+    </main>
+
+    <script src="./renderer.js"></script>
+
+</body>
+</html>

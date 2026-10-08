@@ -1,14 +1,408 @@
-<!doctype html><html><head><meta charset="UTF-8"><title>Relayn</title><style>body{font:16px system-ui;max-width:760px;margin:40px auto;padding:0 20px}button{padding:10px 16px;margin:5px}input{padding:10px;font-size:18px}.card{border:1px solid #ddd;border-radius:12px;padding:20px;margin:16px 0}.code{font-size:40px;font-weight:700;letter-spacing:8px}</style></head><body>
-<h1>Relayn Support</h1><p id="status">Connecting…</p>
-<div class="card"><h2>Customer</h2><button id="create">Create support session</button><div id="code" class="code"></div><p id="consent" hidden><label><input type="checkbox" id="terms"> I have read and accepted the support terms and authorize the technician to control this computer for this session.</label><br><button id="approve">Approve remote control</button></p></div>
-<div class="card"><h2>Technician</h2><input id="joinCode" placeholder="6-digit code" maxlength="6"><button id="join">Join session</button></div>
-<div class="card"><h2>Session</h2><button id="end">Request session end</button><div id="events"></div></div>
-<script>
-const $=id=>document.getElementById(id); function event(t){$('events').innerHTML='<p>'+t+'</p>'+$('events').innerHTML}
-window.support.onSocketStatus(s=>$('status').textContent='Socket: '+s);
-window.support.onMessage(m=>{event(m.type); if(m.type==='session_created'){$('code').textContent=m.code;$('consent').hidden=false} if(m.type==='end_confirmation_required'&&confirm('The other party requested to end the session. Confirm?'))window.support.send({type:'confirm_end'}); if(m.type==='session_ended'){alert('Session ended: '+m.reason);location.reload()}});
-$('create').onclick=()=>window.support.send({type:'create_session',role:'customer'});
-$('approve').onclick=()=>{if($('terms').checked)window.support.send({type:'consent_granted'});else alert('Accept the terms first.')};
-$('join').onclick=()=>window.support.send({type:'join_session',role:'technician',code:$('joinCode').value});
-$('end').onclick=()=>window.support.send({type:'request_end'});
-</script></body></html>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+
+    <meta
+        http-equiv="Content-Security-Policy"
+        content="
+            default-src 'self';
+            script-src 'self';
+            style-src 'self' 'unsafe-inline';
+            connect-src http://localhost:4000 ws://localhost:4000;
+        "
+    />
+
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    />
+
+    <title>Relayn Support</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            min-height: 100vh;
+
+            font-family:
+                Inter,
+                -apple-system,
+                BlinkMacSystemFont,
+                "Segoe UI",
+                sans-serif;
+
+            background: #f5f7fb;
+            color: #182230;
+
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .container {
+            width: min(520px, 90vw);
+        }
+
+        .card {
+            background: white;
+            border-radius: 18px;
+            padding: 40px;
+
+            box-shadow:
+                0 12px 40px
+                rgba(0, 0, 0, 0.08);
+        }
+
+        .brand {
+            font-size: 32px;
+            font-weight: 800;
+            margin-bottom: 8px;
+        }
+
+        .subtitle {
+            color: #667085;
+            margin-bottom: 32px;
+            line-height: 1.5;
+        }
+
+        button {
+            width: 100%;
+
+            border: 0;
+            border-radius: 10px;
+
+            padding: 15px 20px;
+
+            font-size: 16px;
+            font-weight: 700;
+
+            cursor: pointer;
+        }
+
+        button:hover {
+            opacity: 0.92;
+        }
+
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+
+        .primary {
+            background: #2563eb;
+            color: white;
+        }
+
+        .approve {
+            background: #16a34a;
+            color: white;
+        }
+
+        .reject {
+            background: #dc2626;
+            color: white;
+        }
+
+        .secondary {
+            background: #e5e7eb;
+            color: #182230;
+        }
+
+        .session {
+            display: none;
+        }
+
+        .session.visible {
+            display: block;
+        }
+
+        .label {
+            color: #667085;
+            font-size: 14px;
+            margin-bottom: 8px;
+        }
+
+        .code {
+            font-size: 42px;
+            font-weight: 800;
+
+            letter-spacing: 8px;
+
+            text-align: center;
+
+            padding: 24px 10px;
+            margin: 12px 0 24px;
+
+            background: #f1f5f9;
+
+            border-radius: 12px;
+        }
+
+        .status {
+            padding: 14px;
+
+            border-radius: 10px;
+
+            background: #f8fafc;
+            color: #475467;
+
+            text-align: center;
+
+            margin-bottom: 16px;
+        }
+
+        .connected {
+            background: #ecfdf3;
+            color: #027a48;
+        }
+
+        .request {
+            display: none;
+
+            border: 1px solid #dbeafe;
+
+            background: #eff6ff;
+
+            border-radius: 12px;
+
+            padding: 20px;
+
+            margin-top: 20px;
+        }
+
+        .request.visible {
+            display: block;
+        }
+
+        .request-title {
+            font-size: 18px;
+            font-weight: 700;
+
+            margin-bottom: 8px;
+        }
+
+        .request-text {
+            color: #475467;
+
+            line-height: 1.5;
+
+            margin-bottom: 18px;
+        }
+
+        .request-buttons {
+            display: grid;
+
+            grid-template-columns:
+                1fr 1fr;
+
+            gap: 10px;
+        }
+
+        .end-request {
+            display: none;
+
+            border: 1px solid #fed7aa;
+
+            background: #fff7ed;
+
+            border-radius: 12px;
+
+            padding: 20px;
+
+            margin-top: 20px;
+        }
+
+        .end-request.visible {
+            display: block;
+        }
+
+        .end-request-title {
+            font-size: 18px;
+            font-weight: 700;
+
+            margin-bottom: 8px;
+        }
+
+        .end-request-text {
+            color: #475467;
+
+            line-height: 1.5;
+
+            margin-bottom: 18px;
+        }
+
+        .end-button {
+            margin-top: 20px;
+        }
+
+        .error {
+            margin-top: 16px;
+
+            color: #b42318;
+
+            background: #fef3f2;
+
+            padding: 12px;
+
+            border-radius: 8px;
+
+            display: none;
+        }
+
+        .error.visible {
+            display: block;
+        }
+    </style>
+</head>
+
+<body>
+
+    <main class="container">
+
+        <section class="card">
+
+            <div class="brand">
+                Relayn
+            </div>
+
+            <div class="subtitle">
+                Secure remote support for your computer.
+                A technician can only connect after you
+                approve the support request.
+            </div>
+
+            <div id="startView">
+
+                <button
+                    id="startButton"
+                    class="primary"
+                >
+                    Start Support Session
+                </button>
+
+            </div>
+
+            <div
+                id="sessionView"
+                class="session"
+            >
+
+                <div class="label">
+                    Your support code
+                </div>
+
+                <div
+                    id="sessionCode"
+                    class="code"
+                >
+                    ------
+                </div>
+
+                <div
+                    id="sessionStatus"
+                    class="status"
+                >
+                    Connecting to Relayn...
+                </div>
+
+                <div
+                    id="requestSection"
+                    class="request"
+                >
+
+                    <div class="request-title">
+                        Technician requesting access
+                    </div>
+
+                    <div class="request-text">
+                        A technician wants to start
+                        a remote support session with
+                        your computer.
+
+                        You must approve this request
+                        before the session can connect.
+                    </div>
+
+                    <div class="request-buttons">
+
+                        <button
+                            id="rejectButton"
+                            class="reject"
+                        >
+                            Reject
+                        </button>
+
+                        <button
+                            id="approveButton"
+                            class="approve"
+                        >
+                            Approve
+                        </button>
+
+                    </div>
+
+                </div>
+
+                <div
+                    id="endRequestSection"
+                    class="end-request"
+                >
+
+                    <div class="end-request-title">
+                        Technician wants to end the session
+                    </div>
+
+                    <div class="end-request-text">
+                        The technician has requested to
+                        end the remote support session.
+
+                        Confirm below to close the session.
+                    </div>
+
+                    <div class="request-buttons">
+
+                        <button
+                            id="cancelEndButton"
+                            class="secondary"
+                        >
+                            Keep Session
+                        </button>
+
+                        <button
+                            id="confirmEndButton"
+                            class="reject"
+                        >
+                            End Session
+                        </button>
+
+                    </div>
+
+                </div>
+
+                <button
+                    id="endButton"
+                    class="secondary end-button"
+                >
+                    End Session
+                </button>
+
+            </div>
+
+            <div
+                id="error"
+                class="error"
+            ></div>
+
+        </section>
+
+    </main>
+
+    <script src="./renderer.js"></script>
+
+</body>
+</html>
