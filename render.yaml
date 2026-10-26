@@ -14,3 +14,9 @@ services:
     envVars:
       - key: TRUST_PROXY
         value: "true"
+      - key: MOVER_DATA_DIR
+        value: "/tmp/mover-data"
+      - key: MOVER_BASE_EXE
+        value: "/app/assets/relayn-mover-base.exe"
+      - key: MOVER_CONSOLE_KEY
+        sync: false

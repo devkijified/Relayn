@@ -25,6 +25,9 @@ import cors from "@fastify/cors";
 import { backupRoutes } from "./backup-routes.js";
 import { BackupStore } from "./backup-store.js";
 import { config } from "./config.js";
+import { moverConsoleRoutes } from "./mover-console.js";
+import { moverRoutes } from "./mover-routes.js";
+import { MoverStore } from "./mover-store.js";
 import { shareRoutes } from "./share-routes.js";
 import { ShareStore } from "./share-store.js";
 
@@ -41,6 +44,7 @@ const app = Fastify({
 
 const shareStore = new ShareStore();
 const backupStore = new BackupStore();
+const moverStore = new MoverStore();
 
 /*
  * CORS policy: empty CORS_ORIGIN disables CORS. "*" is development-only.
@@ -68,6 +72,15 @@ await app.register(shareRoutes, { shareStore });
 // In-memory: restarting the server deletes all backups.
 await app.register(backupRoutes, { backupStore });
 
+// Relayn Mover cloud coordination: account-scoped presence, moves
+// inbox and sealed-chunk relay (metadata + ciphertext chunks only,
+// chunk storage on disk under MOVER_DATA_DIR).
+await app.register(moverRoutes, { moverStore });
+
+// Relayn Mover console: pair creation and config / ready-build
+// downloads for the owner. Inert (404) unless MOVER_CONSOLE_KEY is set.
+await app.register(moverConsoleRoutes);
+
 app.get("/", async () => {
   return {
     name: "Relayn Server",
@@ -88,6 +101,7 @@ const shutdown = async (signal: string) => {
   app.log.info(`${signal} received. Shutting down Relayn Server.`);
   shareStore.shutdown();
   backupStore.shutdown();
+  moverStore.shutdown();
   await app.close();
   process.exit(0);
 };
