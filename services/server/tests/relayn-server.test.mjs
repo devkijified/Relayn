@@ -389,6 +389,45 @@ async function main() {
       "console page with key -> 200 HTML",
       r.status === 200 && html.includes("Relayn Mover Console")
     );
+    check(
+      "console colour fields are native pickers with synced hex boxes",
+      html.includes('type="color"') &&
+        html.includes('id="brandColorPick"') &&
+        html.includes('id="brandSuccessBgPick"') &&
+        html.includes('id="brandSuccessPick"') &&
+        html.includes('id="brandColor"') &&
+        html.includes('id="brandSuccessBg"') &&
+        html.includes('id="brandSuccess"')
+    );
+    const selectBlock = (id) => {
+      const i = html.indexOf(`id="${id}"`);
+      return i < 0 ? "" : html.slice(i, html.indexOf("</select>", i));
+    };
+    check(
+      "chunk size is a select with the server cap (64) preselected",
+      selectBlock("chunkMB").includes('<option value="8">') &&
+        selectBlock("chunkMB").includes('<option value="64" selected>')
+    );
+    check(
+      "parallel streams select tops out preselected at the app max (64)",
+      selectBlock("streams").includes('<option value="64" selected>')
+    );
+    check(
+      "io buffer select tops out preselected at the app max (65536)",
+      selectBlock("ioBufferKB").includes('<option value="65536" selected>')
+    );
+    check(
+      "bandwidth, retry, backoff, timeout and delay are selects too",
+      selectBlock("bandwidthMbps").includes('<option value="0" selected>') &&
+        selectBlock("retryCount").includes('<option value="5" selected>') &&
+        selectBlock("retryBackoffMs").includes(
+          '<option value="250" selected>'
+        ) &&
+        selectBlock("chunkTimeoutSec").includes(
+          '<option value="600" selected>'
+        ) &&
+        selectBlock("chunkDelayMs").includes('<option value="0" selected>')
+    );
     r = await fetch(`${a}/mover/console/api/pairs`, { method: "POST" });
     check("console pair create without key -> 404", r.status === 404);
 
@@ -441,6 +480,22 @@ async function main() {
         moverCfg.cfg.server?.url === "https://relayn-server.onrender.com" &&
         typeof moverCfg.cfg.messages?.appTitle === "string" &&
         moverCfg.cfg.transfer?.laneOrder?.[0] === "internet"
+    );
+    check(
+      "default transfer values run at max (chunk 64, streams 64, buffer 65536)",
+      moverCfg.cfg.transfer?.chunkSizeMB === 64 &&
+        moverCfg.cfg.transfer?.parallelStreams === 64 &&
+        moverCfg.cfg.transfer?.ioBufferKB === 65536 &&
+        moverCfg.cfg.transfer?.bandwidthLimitMbps === 0 &&
+        moverCfg.cfg.transfer?.chunkDelayMs === 0,
+      JSON.stringify(moverCfg.cfg.transfer)
+    );
+    check(
+      "transfer exceptions stay at their deliberate defaults (retry 5, backoff 250, timeout 600)",
+      moverCfg.cfg.transfer?.retryCount === 5 &&
+        moverCfg.cfg.transfer?.retryBackoffMs === 250 &&
+        moverCfg.cfg.transfer?.chunkTimeoutSec === 600,
+      JSON.stringify(moverCfg.cfg.transfer)
     );
 
     // Ready build: ONE exe with the config inbuilt as an overlay.

@@ -119,6 +119,12 @@ export interface MoverPairOptions {
     laneOrder?: string[];
     chunkSizeMB?: number;
     parallelStreams?: number;
+    ioBufferKB?: number;
+    bandwidthLimitMbps?: number;
+    retryCount?: number;
+    retryBackoffMs?: number;
+    chunkTimeoutSec?: number;
+    chunkDelayMs?: number;
     preferDirect?: boolean;
   };
   admin?: {
@@ -139,6 +145,12 @@ export interface MoverPairOptions {
 
 function boolOr(value: boolean | undefined, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback;
+}
+
+function numOr(value: number | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? value
+    : fallback;
 }
 
 function strOr(value: string | undefined, fallback: string): string {
@@ -213,21 +225,29 @@ export function buildMoverConfig(opts: MoverPairOptions) {
               (LANES as readonly string[]).includes(l)
             )
           : [...LANES],
-      chunkSizeMB:
-        typeof transfer.chunkSizeMB === "number" ? transfer.chunkSizeMB : 8,
+      // Transfer defaults run at the highest values the apps and
+      // this server accept (owner's max-by-default rule): chunk size
+      // is capped by the server's per-chunk upload cap (64MB) below
+      // the app's 512MB validation limit; streams and the I/O buffer
+      // sit at the app's validated maxima. Three deliberate
+      // exceptions, each flagged in the console form: retryCount 5
+      // (retries are resilience, not speed; 20 with exponential
+      // backoff would hide a dead chunk for a very long time),
+      // retryBackoffMs 250 (an inverse field, higher means slower
+      // recovery), chunkTimeoutSec 600 (the 3600 cap would let a
+      // dead chunk hang for an hour, while the old 120 is too tight
+      // for 64MB chunks on slow uplinks).
+      chunkSizeMB: numOr(transfer.chunkSizeMB, 64),
       chunkSizeBytes: 0,
       resume: true,
       encryption: true,
-      bandwidthLimitMbps: 0,
-      parallelStreams:
-        typeof transfer.parallelStreams === "number"
-          ? transfer.parallelStreams
-          : 8,
-      ioBufferKB: 256,
-      retryCount: 3,
-      retryBackoffMs: 250,
-      chunkTimeoutSec: 120,
-      chunkDelayMs: 0,
+      bandwidthLimitMbps: numOr(transfer.bandwidthLimitMbps, 0),
+      parallelStreams: numOr(transfer.parallelStreams, 64),
+      ioBufferKB: numOr(transfer.ioBufferKB, 65536),
+      retryCount: numOr(transfer.retryCount, 5),
+      retryBackoffMs: numOr(transfer.retryBackoffMs, 250),
+      chunkTimeoutSec: numOr(transfer.chunkTimeoutSec, 600),
+      chunkDelayMs: numOr(transfer.chunkDelayMs, 0),
       preferDirect: boolOr(transfer.preferDirect, false)
     },
     space: { policy: "warn-only" },
@@ -358,6 +378,9 @@ const CONSOLE_HTML = `<!doctype html>
   input[type=text], input[type=number], textarea, select { width: 100%; padding: 0.4rem; box-sizing: border-box; }
   .row { display: flex; gap: 1rem; flex-wrap: wrap; }
   .row > label { flex: 1; min-width: 160px; }
+  .crow { display: flex; gap: 0.5rem; align-items: center; }
+  .crow input[type=text] { flex: 1; }
+  input[type=color] { width: 3rem; height: 2.1rem; padding: 0.1rem; border: 1px solid #ccc; border-radius: 6px; background: #fff; box-sizing: border-box; cursor: pointer; }
   button { padding: 0.6rem 1.2rem; border-radius: 8px; border: 0; background: #AC244D; color: #fff; cursor: pointer; font-size: 1rem; }
   button.ghost { background: #eee; color: #1a1a1a; }
   #status { white-space: pre-wrap; margin: 1rem 0; color: #7a102f; }
@@ -391,9 +414,15 @@ compiled in, nothing else to carry or place beside it.</p>
     <label>Tagline <input type="text" id="brandTagline" value="Move this laptop, keep everything"></label>
   </div>
   <div class="row">
-    <label>Primary colour <input type="text" id="brandColor" value="#AC244D"></label>
-    <label>Success background <input type="text" id="brandSuccessBg" value="#e6f4ea"></label>
-    <label>Success colour <input type="text" id="brandSuccess" value="#137333"></label>
+    <label>Primary colour
+      <span class="crow"><input type="color" id="brandColorPick" value="#ac244d"><input type="text" id="brandColor" value="#AC244D"></span>
+    </label>
+    <label>Success background
+      <span class="crow"><input type="color" id="brandSuccessBgPick" value="#e6f4ea"><input type="text" id="brandSuccessBg" value="#e6f4ea"></span>
+    </label>
+    <label>Success colour
+      <span class="crow"><input type="color" id="brandSuccessPick" value="#137333"><input type="text" id="brandSuccess" value="#137333"></span>
+    </label>
   </div>
   <label>Bio <input type="text" id="brandBio" value="Moves your files, apps data and setup from an old laptop to a new one, encrypted and verified."></label>
 
@@ -408,6 +437,7 @@ compiled in, nothing else to carry or place beside it.</p>
   </label>
 
   <p><strong>Transfer</strong></p>
+  <p>Every transfer setting below starts at the highest value the apps and this server accept, so a fresh pair runs at full speed. Step one down only for weak hardware or a very slow link.</p>
   <div class="row">
     <label>Profile
       <select id="profile">
@@ -420,8 +450,85 @@ compiled in, nothing else to carry or place beside it.</p>
     </label>
   </div>
   <div class="row">
-    <label>Chunk size MB <input type="number" id="chunkMB" value="8" min="1"></label>
-    <label>Parallel streams <input type="number" id="streams" value="8" min="1"></label>
+    <label>Chunk size
+      <select id="chunkMB">
+        <option value="8">8 MB</option>
+        <option value="16">16 MB</option>
+        <option value="32">32 MB</option>
+        <option value="64" selected>64 MB (max the server accepts)</option>
+      </select>
+    </label>
+    <label>Parallel streams
+      <select id="streams">
+        <option value="4">4</option>
+        <option value="8">8</option>
+        <option value="16">16</option>
+        <option value="32">32</option>
+        <option value="64" selected>64 (max)</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label>I/O buffer
+      <select id="ioBufferKB">
+        <option value="256">256 KB</option>
+        <option value="1024">1 MB</option>
+        <option value="4096">4 MB</option>
+        <option value="16384">16 MB</option>
+        <option value="65536" selected>64 MB (max)</option>
+      </select>
+    </label>
+    <label>Bandwidth limit
+      <select id="bandwidthMbps">
+        <option value="0" selected>Unlimited (max)</option>
+        <option value="100">100 Mbps</option>
+        <option value="50">50 Mbps</option>
+        <option value="25">25 Mbps</option>
+        <option value="10">10 Mbps</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label>Retries per chunk
+      <select id="retryCount">
+        <option value="1">1</option>
+        <option value="3">3</option>
+        <option value="5" selected>5</option>
+        <option value="10">10</option>
+        <option value="20">20</option>
+      </select>
+    </label>
+    <label>Retry backoff (wait before each retry)
+      <select id="retryBackoffMs">
+        <option value="0">0 ms</option>
+        <option value="100">100 ms</option>
+        <option value="250" selected>250 ms</option>
+        <option value="500">500 ms</option>
+        <option value="1000">1 s</option>
+        <option value="2000">2 s</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <label>Chunk timeout
+      <select id="chunkTimeoutSec">
+        <option value="60">1 min</option>
+        <option value="120">2 min</option>
+        <option value="300">5 min</option>
+        <option value="600" selected>10 min</option>
+        <option value="1800">30 min</option>
+        <option value="3600">60 min</option>
+      </select>
+    </label>
+    <label>Delay between chunks
+      <select id="chunkDelayMs">
+        <option value="0" selected>0 (full speed)</option>
+        <option value="50">50 ms</option>
+        <option value="100">100 ms</option>
+        <option value="250">250 ms</option>
+        <option value="500">500 ms</option>
+      </select>
+    </label>
   </div>
   <label><input type="checkbox" id="preferDirect"> Prefer direct lane when available</label>
 
@@ -464,6 +571,27 @@ compiled in, nothing else to carry or place beside it.</p>
   var key = new URLSearchParams(location.search).get("key") || "";
   var status = document.getElementById("status");
   function say(msg) { status.textContent = msg || ""; }
+  // Colour fields: a native picker and a hex text box, kept in sync
+  // both ways. The config reads the hex text box, exactly as before;
+  // typing a valid 3 or 6 digit hex updates the picker (the picker
+  // itself only holds 6 digit values, so a 3 digit hex is expanded
+  // for the picker only, the text keeps what was typed).
+  function wireColor(pickId, textId) {
+    var pick = document.getElementById(pickId);
+    var text = document.getElementById(textId);
+    pick.addEventListener("input", function () { text.value = pick.value; });
+    text.addEventListener("input", function () {
+      var v = text.value.trim();
+      if (/^#[0-9a-fA-F]{3}$/.test(v)) {
+        pick.value = "#" + v[1] + v[1] + v[2] + v[2] + v[3] + v[3];
+      } else if (/^#[0-9a-fA-F]{6}$/.test(v)) {
+        pick.value = v;
+      }
+    });
+  }
+  wireColor("brandColorPick", "brandColor");
+  wireColor("brandSuccessBgPick", "brandSuccessBg");
+  wireColor("brandSuccessPick", "brandSuccess");
   function accountId() {
     var typed = document.getElementById("accountIdInput").value.trim();
     return typed || document.getElementById("accountId").textContent;
@@ -492,8 +620,14 @@ compiled in, nothing else to carry or place beside it.</p>
       transfer: {
         profile: document.getElementById("profile").value,
         laneOrder: document.getElementById("lanes").value.split(",").map(function (s) { return s.trim(); }).filter(Boolean),
-        chunkSizeMB: Number(document.getElementById("chunkMB").value) || 8,
-        parallelStreams: Number(document.getElementById("streams").value) || 8,
+        chunkSizeMB: Number(document.getElementById("chunkMB").value),
+        parallelStreams: Number(document.getElementById("streams").value),
+        ioBufferKB: Number(document.getElementById("ioBufferKB").value),
+        bandwidthLimitMbps: Number(document.getElementById("bandwidthMbps").value),
+        retryCount: Number(document.getElementById("retryCount").value),
+        retryBackoffMs: Number(document.getElementById("retryBackoffMs").value),
+        chunkTimeoutSec: Number(document.getElementById("chunkTimeoutSec").value),
+        chunkDelayMs: Number(document.getElementById("chunkDelayMs").value),
         preferDirect: document.getElementById("preferDirect").checked
       },
       admin: {
