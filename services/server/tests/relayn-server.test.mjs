@@ -25,6 +25,7 @@
 
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
+import { inflateRawSync } from "node:zlib";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -95,6 +96,36 @@ function parseOverlay(buf) {
     return null;
   }
   return { cfg, jsonLen: n, magicAtEnd: idx === buf.length - OVERLAY_MAGIC.length };
+}
+
+// Minimal ZIP reader for the EXT package downloads: walks the
+// central directory and inflates each entry.
+function readZip(buf) {
+  let eocd = -1;
+  for (let i = buf.length - 22; i >= 0; i--) {
+    if (buf.readUInt32LE(i) === 0x06054b50) { eocd = i; break; }
+  }
+  if (eocd < 0) return null;
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const out = {};
+  for (let n = 0; n < count; n++) {
+    if (buf.readUInt32LE(p) !== 0x02014b50) return null;
+    const method = buf.readUInt16LE(p + 10);
+    const compLen = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const localAt = buf.readUInt32LE(p + 42);
+    const name = buf.subarray(p + 46, p + 46 + nameLen).toString("utf8");
+    const lNameLen = buf.readUInt16LE(localAt + 26);
+    const lExtraLen = buf.readUInt16LE(localAt + 28);
+    const dataAt = localAt + 30 + lNameLen + lExtraLen;
+    const raw = buf.subarray(dataAt, dataAt + compLen);
+    out[name] = method === 8 ? inflateRawSync(raw) : Buffer.from(raw);
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
 }
 
 // Key-order-insensitive JSON comparison.
@@ -1695,6 +1726,164 @@ async function main() {
       headers: KH
     });
     check("console 404 when MOVER_CONSOLE_KEY unset (api)", r.status === 404);
+
+    // ---------------------------------------------------------------
+    // EXT pair flow: defaults, merged config, ready build zips,
+    // validation, license gating.
+    // ---------------------------------------------------------------
+    const extApi = async (method, suffix, body, headers = KH) => {
+      const res = await fetch(`${a}/mover/console/api/ext${suffix}`, {
+        method,
+        headers,
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      return res;
+    };
+
+    r = await fetch(`${a}/mover/console/api/ext/defaults`);
+    check("EXT defaults without key -> 404", r.status === 404);
+
+    r = await extApi("GET", "/defaults");
+    const extDefaults = (await r.json()).config;
+    check(
+      "EXT defaults are the shipped pair config (brand, 63 messages)",
+      r.status === 200 &&
+        extDefaults.brand.name === "Relayn" &&
+        Object.keys(extDefaults.messages).length === 63 &&
+        extDefaults.features.share === true,
+      `got ${r.status}`
+    );
+
+    r = await extApi("POST", "/config", {
+      accountId: extDefaults.account.id,
+      role: "admin"
+    });
+    const roundTrip = await r.json();
+    check(
+      "EXT defaults round trip: config download equals the defaults",
+      r.status === 200 && sameJson(roundTrip, extDefaults),
+      `got ${r.status}`
+    );
+
+    r = await extApi("POST", "/config", { accountId: OWNER_ACC, role: "child" });
+    const childCfg = await r.json();
+    check(
+      "EXT child config is share-only with the pair account linked",
+      r.status === 200 &&
+        childCfg.features.share === true &&
+        childCfg.features.scan === false &&
+        childCfg.features.inbox === false &&
+        childCfg.account.id === OWNER_ACC,
+      `got ${r.status} ${JSON.stringify(childCfg.features || {})}`
+    );
+
+    r = await extApi("POST", "/package", {
+      accountId: OWNER_ACC,
+      role: "child",
+      brand: { name: "Acme Sessions" },
+      features: { history: false },
+      messages: { statusReady: "All set." }
+    });
+    const zipBuf = Buffer.from(await r.arrayBuffer());
+    const zip = readZip(zipBuf);
+    let zipCfg = null;
+    try {
+      zipCfg = JSON.parse(zip["config.json"].toString("utf8"));
+    } catch {
+      zipCfg = null;
+    }
+    check(
+      "EXT package is a zip carrying the full staged file set",
+      r.status === 200 &&
+        zip !== null &&
+        ["config.json", "manifest.json", "background.js", "content.js",
+          "popup.html", "popup.js", "README.md", "qrcode.min.js", "jsQR.min.js"]
+          .every((name) => zip[name] && zip[name].length > 0),
+      `got ${r.status}`
+    );
+    check(
+      "EXT package config carries the edited values",
+      zipCfg !== null &&
+        zipCfg.brand.name === "Acme Sessions" &&
+        zipCfg.features.history === false &&
+        zipCfg.features.scan === false &&
+        zipCfg.messages.statusReady === "All set." &&
+        zipCfg.account.id === OWNER_ACC,
+      JSON.stringify(zipCfg && zipCfg.brand)
+    );
+    const stagedBg = readFileSync(
+      path.join(serverDir, "assets", "ext", "background.js")
+    );
+    check(
+      "EXT package ships the staged extension bytes untouched",
+      zip !== null && zip["background.js"].equals(stagedBg)
+    );
+
+    r = await extApi("POST", "/config", {
+      accountId: OWNER_ACC, role: "child",
+      brand: { primaryColor: "red" }
+    });
+    check(
+      "EXT config with a bad colour -> 400 INVALID_CONFIG",
+      r.status === 400 && (await r.json()).error === "INVALID_CONFIG",
+      `got ${r.status}`
+    );
+    r = await extApi("POST", "/config", {
+      accountId: OWNER_ACC, role: "child",
+      serverUrl: "https://example.com/some/path"
+    });
+    check(
+      "EXT config with a pathed server URL -> 400 INVALID_CONFIG",
+      r.status === 400 && (await r.json()).error === "INVALID_CONFIG",
+      `got ${r.status}`
+    );
+    r = await extApi("POST", "/config", {
+      accountId: OWNER_ACC, role: "child",
+      messages: { noSuchMessage: "x" }
+    });
+    check(
+      "EXT config with an unknown message key -> 400 INVALID_CONFIG",
+      r.status === 400 && (await r.json()).error === "INVALID_CONFIG",
+      `got ${r.status}`
+    );
+    r = await extApi("POST", "/config", { accountId: "bad!", role: "child" });
+    check(
+      "EXT config with a bad account ID -> 400 INVALID_ACCOUNT",
+      r.status === 400 && (await r.json()).error === "INVALID_ACCOUNT",
+      `got ${r.status}`
+    );
+
+    r = await extApi("POST", "/pairs", {});
+    const extPair = await r.json();
+    check(
+      "EXT pair creation mints an account and issues its EXT license",
+      r.status === 200 &&
+        /^mv[0-9a-f]{20}$/.test(extPair.accountId || "") &&
+        (await licApi("GET", "?product=ext")).data.licenses?.some(
+          (l) => l.accountId === extPair.accountId && l.label === "Console EXT pair"
+        ),
+      `got ${r.status} ${JSON.stringify(extPair)}`
+    );
+
+    const gateLic = await licApi("POST", "/revoke", {
+      product: "ext",
+      accountId: ASSISTANT_ACC
+    });
+    r = await extApi("POST", "/config", { accountId: ASSISTANT_ACC, role: "child" });
+    check(
+      "EXT download for a revoked account -> 403 LICENSE_REVOKED",
+      gateLic.status === 200 &&
+        r.status === 403 &&
+        (await r.json()).error === "LICENSE_REVOKED",
+      `got ${r.status}`
+    );
+    await licApi("POST", "/restore", { product: "ext", accountId: ASSISTANT_ACC });
+    r = await extApi("POST", "/config", { accountId: ASSISTANT_ACC, role: "child" });
+    check(
+      "EXT download works again after the license is restored",
+      r.status === 200,
+      `got ${r.status}`
+    );
 
     // ---------------------------------------------------------------
     // Instance C: console key set, base exe unset -> package 501.

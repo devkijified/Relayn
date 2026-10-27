@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="en-GB">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { --primary: #1a73e8; }
+  * { box-sizing: border-box; }
+  body {
+    width: 340px;
+    margin: 0;
+    padding: 16px;
+    font-family: -apple-system, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    color: #1a1a1a;
+    background: #fff;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 12px; color: #666; font-size: 12px; }
+  .hidden { display: none !important; }
+  button {
+    width: 100%;
+    padding: 10px;
+    margin: 4px 0;
+    font-size: 14px;
+    border: none;
+    border-radius: 8px;
+    background: var(--primary);
+    color: #fff;
+    cursor: pointer;
+  }
+  button:disabled { background: #9ec1f5; cursor: default; }
+  button.secondary { background: #f1f3f4; color: #1a1a1a; }
+  button.danger { background: #d93025; }
+  input {
+    width: 100%;
+    padding: 10px;
+    margin: 4px 0;
+    font-size: 14px;
+    border: 1px solid #dadce0;
+    border-radius: 8px;
+  }
+  input.mono { font-family: monospace; font-size: 12px; }
+  label { font-size: 12px; color: #666; display: block; margin-top: 8px; }
+  .divider {
+    display: flex; align-items: center; gap: 8px;
+    margin: 12px 0; color: #888; font-size: 12px;
+  }
+  .divider::before, .divider::after {
+    content: ""; flex: 1; height: 1px; background: #e0e0e0;
+  }
+  .status {
+    padding: 10px; border-radius: 8px; background: #f1f3f4;
+    margin: 8px 0; font-size: 13px;
+  }
+  .status.connected { background: var(--success-bg, #e6f4ea); color: var(--success-color, #137333); }
+  .error {
+    padding: 10px; border-radius: 8px; background: #fce8e6;
+    color: #a50e0e; margin: 8px 0; font-size: 13px;
+  }
+  .ok {
+    padding: 10px; border-radius: 8px; background: #e6f4ea;
+    color: #137333; margin: 8px 0; font-size: 13px; word-break: break-all;
+  }
+  .card {
+    border: 1px solid #dadce0; border-radius: 8px;
+    padding: 10px; margin: 8px 0; font-size: 13px;
+  }
+  .card .row { display: flex; gap: 8px; margin-top: 8px; }
+  .card .row button { margin: 0; }
+  .site-list {
+    max-height: 140px; overflow-y: auto; margin: 8px 0;
+    border-top: 1px solid #eee;
+  }
+  .site-row {
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 0; border-bottom: 1px solid #eee; font-size: 12px;
+  }
+  .site-row button {
+    width: auto; padding: 4px 10px; font-size: 12px; margin: 0;
+  }
+  .hint { font-size: 11px; color: #888; margin: 4px 0 8px; }
+</style>
+</head>
+<body>
+  <h1 id="brandName">Relayn</h1>
+  <p class="sub" id="brandTagline">Move your logins to another device</p>
+
+  <div class="status" id="statusBox">Ready.</div>
+  <div class="error hidden" id="errorBox"></div>
+
+  <!-- DEVICE A: this browser's logins go to the other device -->
+  <div id="shareSection">
+    <button id="shareButton">📤 Share this device</button>
+    <div class="hint" id="brandBio">Move your logins to another device: share this browser via an encrypted QR code, scan it on the other device, done.</div>
+    <button id="diagnoseButton" class="secondary">🔍 Check what's captured</button>
+    <div class="hint hidden" id="diagnoseResultBox"></div>
+    <button id="restoreStatusButton" class="secondary">🔍 Check restore status</button>
+    <div class="hint hidden" id="restoreStatusBox"></div>
+    <div class="card hidden" id="restoreLogCard" style="font-size:11px">
+      <div class="hint" style="margin-top:0" id="restoreLogTitle">Restore activity:</div>
+      <div id="restoreLogBox" style="white-space:pre-line;word-break:break-word"></div>
+    </div>
+
+    <div class="card hidden" id="shareQrCard">
+      <div style="text-align:center" id="qrCodeBox"></div>
+      <div class="hint" id="qrExpiryHint" style="text-align:center"></div>
+      <div class="hint">Single-use — scanning it once uses it up. Expires in 10 minutes. You can also download the QR as an image and send it to the other device.</div>
+      <div class="row">
+        <button id="downloadQrButton" class="secondary">Download QR image</button>
+        <button id="closeQrButton" class="secondary">Done</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- DEVICE B: scan Device A's QR and get logged in -->
+  <div id="scanSection">
+    <div class="divider">or receive on this device</div>
+    <button id="scanQrButton" class="secondary">📷 Scan QR code</button>
+
+    <div class="card hidden" id="scanQrCard">
+      <div class="hint" style="margin-top:0">Point your camera at Device A's QR code — or upload a screenshot of it. Everything else is automatic.</div>
+      <div class="row">
+        <button id="startCameraButton" class="secondary">📷 Use camera</button>
+        <button id="uploadQrButton" class="secondary">🖼️ Upload image</button>
+      </div>
+      <input type="file" id="qrFileInput" accept="image/*" class="hidden" />
+      <video id="qrVideo" playsinline muted class="hidden" style="width:100%;border-radius:8px;background:#000;min-height:180px;margin-top:8px"></video>
+      <canvas id="qrCanvas" class="hidden"></canvas>
+      <div class="hint" id="scanHint"></div>
+      <div class="row">
+        <button id="stopScanButton" class="secondary">Cancel</button>
+      </div>
+    </div>
+
+    <!-- Staged share waiting for import (after a scan, or restored after
+         the worker restarted). Auto-import runs first; anything that
+         failed stays here for a manual retry. -->
+    <div class="card hidden" id="backupReceivedCard">
+      <div id="backupReceivedSummary"></div>
+      <input id="backupSearch" class="mono" placeholder="Search sites…" autocomplete="off" />
+      <div class="site-list" id="backupSiteList"></div>
+      <div class="row">
+        <button id="importAllButton">Import All</button>
+        <button id="dismissButton" class="secondary">Dismiss</button>
+      </div>
+      <div class="error hidden" id="importError"></div>
+      <div class="ok hidden" id="importResult"></div>
+    </div>
+  </div>
+
+  <!-- ADMIN INBOX: incoming account shares — one-tap import, no QR scan.
+       Visible only when "features": { "inbox": true } in config.json. -->
+  <div id="inboxSection" class="hidden">
+    <div class="divider">incoming shares</div>
+    <div class="card">
+      <div class="hint" style="margin-top:0">Shares uploaded to your account appear here for 48 hours — one tap imports everything.</div>
+      <div class="site-list" id="inboxList"></div>
+      <div class="row">
+        <button id="refreshInboxButton" class="secondary">↻ Refresh</button>
+      </div>
+      <div class="error hidden" id="inboxError"></div>
+    </div>
+  </div>
+
+  <!-- Server address — hidden from users by default. Enable with
+       "features": { "serverCard": true } in config.json. -->
+  <div class="card hidden" id="serverCard" style="margin-top:12px">
+    <label style="margin-top:0"><span id="brandNameServer">Relayn</span> server</label>
+    <input id="serverUrlInput" class="mono" placeholder="https://relayn-server.onrender.com" spellcheck="false" />
+    <div class="row">
+      <button id="saveServerButton" class="secondary">Save</button>
+      <button id="resetServerButton" class="secondary">Reset</button>
+    </div>
+    <div class="hint">Your cloud server address — set once on Device A. Device B gets it from the QR code automatically.</div>
+    <div class="ok hidden" id="serverSavedBox"></div>
+    <div class="error hidden" id="serverErrorBox"></div>
+  </div>
+
+  <script src="vendor/qrcode.min.js"></script>
+  <script src="vendor/jsQR.min.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

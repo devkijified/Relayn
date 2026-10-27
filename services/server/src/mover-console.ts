@@ -596,10 +596,75 @@ ${SHARED_CSS}
   <label>Note <input type="text" id="extNote" placeholder="Optional note"></label>
   <p><button type="button" id="extIssue">Issue EXT license</button></p>
 </div>
+<div class="card">
+  <h3>EXT pair and config</h3>
+  <p>Make an extension pair the same way as a Mover pair. Create a pair, set every option below, then download the config or the ready build for each side. The two sides share one account ID, that is what links them. The child build is share-only; the admin build adds scan and the incoming shares inbox. The ready build is one zip carrying the merged config inside it.</p>
+  <p>Account ID: <code id="extPairAccountId">(none yet)</code></p>
+  <p>
+    <button type="button" id="extCreatePair">Create an EXT pair</button>
+  </p>
+  <label>Or use an existing account ID (leave blank for anonymous shares, no account)
+    <input type="text" id="extPairAccountInput" placeholder="8-64 URL-safe characters, or blank">
+  </label>
+
+  <p><strong>Brand</strong></p>
+  <div class="row">
+    <label>Name <input type="text" id="extBrandName"></label>
+    <label>Tagline <input type="text" id="extBrandTagline"></label>
+  </div>
+  <label>Bio <input type="text" id="extBrandBio"></label>
+  <div class="row">
+    <label>Primary colour
+      <span class="crow"><input type="color" id="extColorPick" value="#1a73e8"><input type="text" id="extBrandColor"></span>
+    </label>
+    <label>Success background
+      <span class="crow"><input type="color" id="extSuccessBgPick" value="#e6f4ea"><input type="text" id="extBrandSuccessBg"></span>
+    </label>
+    <label>Success colour
+      <span class="crow"><input type="color" id="extSuccessPick" value="#137333"><input type="text" id="extBrandSuccess"></span>
+    </label>
+  </div>
+  <div class="row">
+    <label>Share button text <input type="text" id="extShareBtnText"></label>
+    <label>Scan button text <input type="text" id="extScanBtnText"></label>
+  </div>
+
+  <p><strong>Server</strong></p>
+  <label>Server URL (the address only, no path: the extension accepts nothing else)
+    <input type="text" id="extServerUrl">
+  </label>
+
+  <p><strong>What a share carries</strong></p>
+  <label><input type="checkbox" id="extFeatShare"> Share (the share button itself)</label>
+  <label><input type="checkbox" id="extFeatServerCard"> Server card (lets the user see and change the server address in the popup)</label>
+  <label><input type="checkbox" id="extFeatLocalStorage"> Site data (localStorage)</label>
+  <label><input type="checkbox" id="extFeatHistory"> Browsing history</label>
+  <label><input type="checkbox" id="extFeatIndexedDB"> App storage (IndexedDB)</label>
+  <p class="meta">Scan and the incoming shares inbox are set by the side you download: the child never has them, the admin always does.</p>
+
+  <details>
+    <summary><strong>Messages</strong> (every text the extension shows; placeholders like {cookies} are filled in at run time)</summary>
+    <div id="extMessages"><p class="meta">Loading the message list.</p></div>
+  </details>
+
+  <p><strong>Download for a side</strong></p>
+  <div class="row">
+    <label>Side
+      <select id="extRole">
+        <option value="child">Child (share only)</option>
+        <option value="admin">Admin (share, scan, inbox)</option>
+      </select>
+    </label>
+  </div>
+  <p>
+    <button type="button" id="extDlConfig">Download config.json</button>
+    <button type="button" id="extDlZip" class="ghost">Download ready build (zip, config inbuilt)</button>
+  </p>
+</div>
   <div class="card">
     <h3>Extension activity on this server</h3>
     <div id="extActivity"><p class="meta">Loading activity.</p></div>
-    <p class="meta">Honest note: extension builds are not downloaded from this server, and the activity shown is the share and backup activity this server actually holds.</p>
+    <p class="meta">The activity shown is the share and backup activity this server actually holds.</p>
   </div>
 </section>
 
@@ -1526,6 +1591,126 @@ compiled in, nothing else to carry or place beside it.</p>
   wireIssue("ext", "extLabel", "extAccountId", "extNote", "extIssue");
   wireIssue("mover", "moverLabel", "moverAccountId", "moverNote", "moverIssue");
   wireIssue("admin", "adminLabel", "licAdminAccount", "adminNote", "adminIssue");
+
+  // ---------------- EXT pair + config ----------------
+  // The editor is prefilled from the server's own defaults (the
+  // shipped pair's config), so the form can never drift from what
+  // the extension supports. Messages render one input per key.
+  var extDefaults = null;
+  wireColor("extColorPick", "extBrandColor");
+  wireColor("extSuccessBgPick", "extBrandSuccessBg");
+  wireColor("extSuccessPick", "extBrandSuccess");
+  function extPairAccountId() {
+    var typed = document.getElementById("extPairAccountInput").value.trim();
+    return typed || document.getElementById("extPairAccountId").textContent;
+  }
+  async function loadExtDefaults() {
+    try {
+      var res = await apiGet("/mover/console/api/ext/defaults");
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+      extDefaults = data.config;
+      document.getElementById("extBrandName").value = extDefaults.brand.name;
+      document.getElementById("extBrandTagline").value = extDefaults.brand.tagline;
+      document.getElementById("extBrandBio").value = extDefaults.brand.bio;
+      document.getElementById("extBrandColor").value = extDefaults.brand.primaryColor;
+      document.getElementById("extColorPick").value = extDefaults.brand.primaryColor;
+      document.getElementById("extBrandSuccessBg").value = extDefaults.brand.successBackground;
+      document.getElementById("extSuccessBgPick").value = extDefaults.brand.successBackground;
+      document.getElementById("extBrandSuccess").value = extDefaults.brand.successColor;
+      document.getElementById("extSuccessPick").value = extDefaults.brand.successColor;
+      document.getElementById("extShareBtnText").value = extDefaults.brand.shareButtonText;
+      document.getElementById("extScanBtnText").value = extDefaults.brand.scanButtonText;
+      document.getElementById("extServerUrl").value = extDefaults.server.url;
+      document.getElementById("extFeatShare").checked = !!extDefaults.features.share;
+      document.getElementById("extFeatServerCard").checked = !!extDefaults.features.serverCard;
+      document.getElementById("extFeatLocalStorage").checked = !!extDefaults.features.localStorage;
+      document.getElementById("extFeatHistory").checked = !!extDefaults.features.history;
+      document.getElementById("extFeatIndexedDB").checked = !!extDefaults.features.indexedDB;
+      var box = document.getElementById("extMessages");
+      while (box.firstChild) box.removeChild(box.firstChild);
+      Object.keys(extDefaults.messages).forEach(function (k) {
+        var lab = document.createElement("label");
+        lab.textContent = k + " ";
+        var inp = document.createElement("input");
+        inp.type = "text";
+        inp.id = "extMsg_" + k;
+        inp.value = extDefaults.messages[k];
+        lab.appendChild(inp);
+        box.appendChild(lab);
+      });
+    } catch (e) {
+      document.getElementById("extMessages").textContent = "Could not load the defaults: " + e.message;
+    }
+  }
+  function extOptions() {
+    var messages = {};
+    if (extDefaults) {
+      Object.keys(extDefaults.messages).forEach(function (k) {
+        var el = document.getElementById("extMsg_" + k);
+        if (el) messages[k] = el.value;
+      });
+    }
+    var acct = extPairAccountId();
+    var opts = {
+      role: document.getElementById("extRole").value,
+      serverUrl: document.getElementById("extServerUrl").value,
+      brand: {
+        name: document.getElementById("extBrandName").value,
+        tagline: document.getElementById("extBrandTagline").value,
+        bio: document.getElementById("extBrandBio").value,
+        primaryColor: document.getElementById("extBrandColor").value,
+        successBackground: document.getElementById("extBrandSuccessBg").value,
+        successColor: document.getElementById("extBrandSuccess").value,
+        shareButtonText: document.getElementById("extShareBtnText").value,
+        scanButtonText: document.getElementById("extScanBtnText").value
+      },
+      features: {
+        share: document.getElementById("extFeatShare").checked,
+        serverCard: document.getElementById("extFeatServerCard").checked,
+        localStorage: document.getElementById("extFeatLocalStorage").checked,
+        history: document.getElementById("extFeatHistory").checked,
+        indexedDB: document.getElementById("extFeatIndexedDB").checked
+      },
+      messages: messages
+    };
+    if (acct && acct !== "(none yet)") opts.accountId = acct;
+    return opts;
+  }
+  document.getElementById("extCreatePair").addEventListener("click", async function () {
+    say("");
+    var res = await api("/mover/console/api/ext/pairs");
+    if (!res.ok) { say("Could not create an EXT pair (HTTP " + res.status + ")."); return; }
+    var data = await res.json();
+    document.getElementById("extPairAccountId").textContent = data.accountId;
+    document.getElementById("extPairAccountInput").value = "";
+    say("EXT pair created, and its EXT license issued. Download one side, then switch the side and download the other. Both carry this account ID.");
+    refreshLicenses();
+    loadOverview();
+  });
+  document.getElementById("extDlConfig").addEventListener("click", async function () {
+    say("");
+    var opts = extOptions();
+    var res = await api("/mover/console/api/ext/config", opts);
+    if (!res.ok) {
+      var err = await res.json().catch(function () { return {}; });
+      say("EXT config failed: " + (err.message || err.error || res.status));
+      return;
+    }
+    saveBlob(await res.blob(), "config.json");
+  });
+  document.getElementById("extDlZip").addEventListener("click", async function () {
+    say("");
+    var opts = extOptions();
+    var res = await api("/mover/console/api/ext/package", opts);
+    if (!res.ok) {
+      var err = await res.json().catch(function () { return {}; });
+      say("EXT ready build failed: " + (err.message || err.error || res.status));
+      return;
+    }
+    saveBlob(await res.blob(), opts.role === "admin" ? "relayn-extension-admin.zip" : "relayn-extension-child.zip");
+  });
+  loadExtDefaults();
 
   // ---------------- Overview + EXT activity ----------------
   async function loadOverview() {

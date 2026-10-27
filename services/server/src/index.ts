@@ -26,6 +26,7 @@ import { backupRoutes } from "./backup-routes.js";
 import { BackupStore } from "./backup-store.js";
 import { config } from "./config.js";
 import { LicenseStore } from "./license-store.js";
+import { extConsoleRoutes } from "./ext-console.js";
 import { headlessRoutes } from "./mover-headless.js";
 import { moverConsoleRoutes } from "./mover-console.js";
 import { moverRoutes } from "./mover-routes.js";
@@ -98,6 +99,12 @@ await app.register(moverConsoleRoutes, {
   shareStore,
   backupStore
 });
+
+// EXT pair flow inside the same console: the extension's full
+// config editor defaults, pair accounts, merged config downloads
+// and ready build zips from the staged extension files. Same
+// console key gate; inert (404) unless MOVER_CONSOLE_KEY is set.
+await app.register(extConsoleRoutes, { licenseStore });
 
 app.get("/", async () => {
   return {
