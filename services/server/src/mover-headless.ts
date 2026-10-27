@@ -11,6 +11,12 @@
 //   POST  /api/headless/heartbeat                state + job progress + desk report
 //   GET   /api/headless/commands                 pending commands (clears)
 //   POST  /api/headless/commands/:id/result      store a command result
+//   GET   /api/headless/build?role=<role>        one role build for this
+//                                                machine's account (the
+//                                                anchor's download door:
+//                                                machine-authenticated,
+//                                                license-gated exactly like
+//                                                a console pair download)
 //
 // Plus the OPERATOR channel (account header only, no machine
 // secret), used by the console and the RelaynAdminViewer app:
@@ -46,6 +52,18 @@
 //   files-browse { prefix, offset?, limit? }      result: the app browse response, with modTime on each child
 //   files-fetch  { moveName, paths: [concrete files] } (signed)
 //   files-push   { moveId, destDir }              (signed)
+//   anchor-update  { stamp }                      (signed; the Host anchor
+//                                                  renews itself to the named
+//                                                  build, fetched from
+//                                                  /api/headless/build)
+//   anchor-deliver { role, stamp? }               (signed; the anchor fetches
+//                                                  and places a sibling build)
+// An anchor result may carry an "anchor" deed object: the store
+// folds it into the account's anchor ledger (noteAnchorTransfer),
+// stamped with the server receipt time, and onto the machine
+// record. Enrollments and heartbeats may also carry "buildStamp"
+// (the running build's YYYYMMDDHHMM) and the same "anchor" deed;
+// both fold onto the machine record.
 // Scan/browse/paths results are the engine's own app shapes (the same
 // JSON its local /api/inventory endpoints produce), passed through
 // untouched so the console renders them like the app does.
@@ -63,6 +81,11 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
 import type { LicenseStore } from "./license-store.js";
+import {
+  buildRoleExe,
+  productForRole,
+  type MoverRole
+} from "./mover-console.js";
 import {
   isValidHeadlessMachineId,
   type HeadlessMachineRecord,
@@ -169,6 +192,8 @@ export async function headlessRoutes(
         interactiveAway?: unknown;
         sessions?: unknown;
         runMode?: unknown;
+        buildStamp?: unknown;
+        anchor?: unknown;
       };
       if (!isValidHeadlessMachineId(body.machineId)) {
         return reply.code(400).send({
@@ -185,7 +210,9 @@ export async function headlessRoutes(
         interactiveUser: body.interactiveUser,
         interactiveAway: body.interactiveAway,
         sessionsDiag: body.sessions,
-        runMode: body.runMode
+        runMode: body.runMode,
+        buildStamp: body.buildStamp,
+        anchor: body.anchor
       });
       return { machineId: rec.machineId, machineSecret: rec.secret };
     }
@@ -212,6 +239,11 @@ export async function headlessRoutes(
       sessions?: unknown;
       poll?: unknown;
       runMode?: unknown;
+      hostLogPath?: unknown;
+      serviceDacl?: unknown;
+      serviceDaclDetail?: unknown;
+      buildStamp?: unknown;
+      anchor?: unknown;
     };
     moverStore.heartbeatHeadless(found.acc, found.machine.machineId, {
       ...body,
@@ -345,4 +377,57 @@ export async function headlessRoutes(
       return { ok: "true" };
     }
   );
+
+  // ------------------------------------------------------------------
+  // Build download: the anchor's door. An enrolled machine fetches
+  // ONE role build for its OWN account (the config merged into the
+  // download names the caller's account, so a machine can only
+  // ever receive builds that belong to it; the engine additionally
+  // verifies the overlay account before placing anything). The
+  // license gate is the pair download's own: the role's product
+  // license revoked for this account refuses with LICENSE_REVOKED.
+  // X-Build-Stamp carries the served base build's stamp and
+  // X-Build-Size the exact byte count, so the anchor can verify
+  // the download against the commanded stamp before any swap.
+  // ------------------------------------------------------------------
+  app.get("/api/headless/build", async (request, reply) => {
+    const found = needMachine(request, reply);
+    if (!found) return;
+    const role = (request.query as { role?: unknown } | null)?.role;
+    if (
+      role !== "mover" &&
+      role !== "admin" &&
+      role !== "host" &&
+      role !== "viewer"
+    ) {
+      return reply
+        .code(400)
+        .send({ error: "role must be one of mover, admin, host, viewer" });
+    }
+    if (
+      licenseStore &&
+      licenseStore.isRevoked(productForRole(role as MoverRole), found.acc)
+    ) {
+      return reply.code(403).send({
+        error: "LICENSE_REVOKED",
+        message:
+          "This account's license for that product is revoked, so its builds cannot be downloaded. Restore the license in the console to allow downloads again."
+      });
+    }
+    const built = await buildRoleExe(role as MoverRole, found.acc);
+    if (!built.ok) {
+      return reply
+        .code(built.status)
+        .send({ error: built.error, message: built.message });
+    }
+    return reply
+      .header("content-type", "application/octet-stream")
+      .header(
+        "content-disposition",
+        `attachment; filename="${built.filename}"`
+      )
+      .header("x-build-stamp", built.stamp)
+      .header("x-build-size", String(built.bytes.length))
+      .send(built.bytes);
+  });
 }

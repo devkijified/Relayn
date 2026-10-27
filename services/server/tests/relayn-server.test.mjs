@@ -1814,6 +1814,329 @@ async function main() {
       JSON.stringify(ffetchReopened.data)
     );
 
+    // ---- Anchor: build endpoint, update queueing, folds ---------
+    console.log("anchor");
+    check(
+      "console page carries the anchor panel and ledger",
+      html.includes('id="anchorPanel"') &&
+        html.includes('id="anchorLedger"') &&
+        html.includes("/mover/console/api/anchor-ledger") &&
+        html.includes("Update Host to build") &&
+        html.includes("Anchor ledger") &&
+        html.includes("askAnchorUpdate"),
+      ""
+    );
+    // The generated config carries the anchor block at the apps'
+    // defaults (Go config defaults: enabled, data-dir suite,
+    // 120 second proof window).
+    r = await fetch(`${a}/mover/console/api/config`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: HL_ACC, role: "host" })
+    });
+    const anchorHostCfg = await r.json();
+    check(
+      "host config carries the anchor block at its defaults",
+      r.status === 200 &&
+        anchorHostCfg.anchor?.enabled === true &&
+        anchorHostCfg.anchor?.suiteDir === "" &&
+        anchorHostCfg.anchor?.updateProofSec === 120,
+      JSON.stringify(anchorHostCfg.anchor ?? {})
+    );
+    // Instance A serves an unstamped base: no update can be
+    // ordered (the exact-target rule refuses before queueing).
+    const noStampUpd = await fetch(
+      `${a}/mover/console/api/machines/any-machine/anchor-update`,
+      {
+        method: "POST",
+        headers: KH,
+        body: JSON.stringify({ accountId: HL_ACC, stamp: "209901010000" })
+      }
+    );
+    const noStampData = await noStampUpd.json().catch(() => ({}));
+    check(
+      "anchor-update with no stamped build served -> 400 STAMP_MISMATCH",
+      noStampUpd.status === 400 && noStampData.error === "STAMP_MISMATCH",
+      JSON.stringify(noStampData)
+    );
+
+    // Instance D: the base exe is a stamped fixture (the real
+    // base bytes plus a future stamp string appended; the
+    // content scan takes the largest plausible stamp, which is
+    // the appended one on this fixture).
+    const ANCHOR_ACC = "anchortest01";
+    const SERVED_STAMP = "209901010000";
+    const fixturePath = path.join(dataDir, "fixture-base.exe");
+    writeFileSync(
+      fixturePath,
+      Buffer.concat([
+        readFileSync(BASE_EXE),
+        Buffer.from(`\n${SERVED_STAMP}\n`, "ascii")
+      ])
+    );
+    const D = 4420;
+    children.push(
+      boot(D, {
+        MOVER_DATA_DIR: `${dataDir}-d`,
+        MOVER_CONSOLE_KEY: CONSOLE_KEY,
+        MOVER_BASE_EXE: fixturePath
+      })
+    );
+    check("instance D boots (stamped fixture base)", await waitHealth(D));
+    const d = `http://127.0.0.1:${D}`;
+    const AMID = "anchor-host-01";
+    r = await fetch(`${d}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": ANCHOR_ACC, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: AMID,
+        name: "ANCHOR-HOST",
+        os: "Windows Server 2022",
+        profiles: ["Administrator"],
+        capabilities: { desktop: true, anchor: true },
+        buildStamp: "202601010000"
+      })
+    });
+    const anchorEnrolled = await r.json();
+    check(
+      "anchor host enrolls carrying its build stamp",
+      r.status === 200 &&
+        /^[0-9a-f]{64}$/.test(anchorEnrolled.machineSecret ?? ""),
+      JSON.stringify(anchorEnrolled)
+    );
+    const ASECRET = anchorEnrolled.machineSecret;
+    const AAUTH = {
+      "x-account-id": ANCHOR_ACC,
+      "x-machine-id": AMID,
+      "x-machine-secret": ASECRET
+    };
+    // Issue the account's admin license up front: the console
+    // ledgers read across known (licensed or paired) accounts,
+    // the files ledger's rule, and the gate test below needs a
+    // license to revoke.
+    const issueD = await fetch(`${d}/mover/console/api/licenses`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({
+        product: "admin",
+        accountId: ANCHOR_ACC,
+        label: "Anchor test"
+      })
+    });
+    check(
+      "anchor test account admin license issued (setup)",
+      issueD.status === 200,
+      `got ${issueD.status}`
+    );
+    r = await fetch(`${d}/api/headless/build?role=host`, {
+      headers: { ...AAUTH, "x-machine-secret": "wrong-secret" }
+    });
+    check("build download with a bad secret -> 401", r.status === 401);
+    r = await fetch(`${d}/api/headless/build?role=bogus`, { headers: AAUTH });
+    check("build download with a bad role -> 400", r.status === 400);
+    r = await fetch(`${d}/api/headless/build?role=host`, { headers: AAUTH });
+    const builtBody = Buffer.from(await r.arrayBuffer());
+    const overlayAt = builtBody.lastIndexOf("RLNMCFG1");
+    const overlayLen =
+      overlayAt >= 4 ? builtBody.readUInt32LE(overlayAt - 4) : 0;
+    const overlayCfg = JSON.parse(
+      builtBody.toString("utf8", overlayAt - 4 - overlayLen, overlayAt - 4)
+    );
+    check(
+      "build download serves the stamped build for the machine's own account",
+      r.status === 200 &&
+        r.headers.get("x-build-stamp") === SERVED_STAMP &&
+        Number(r.headers.get("x-build-size")) === builtBody.length &&
+        overlayCfg.account?.id === ANCHOR_ACC &&
+        overlayCfg.role === "host" &&
+        overlayCfg.anchor?.enabled === true,
+      `stamp ${r.headers.get("x-build-stamp")} size ${r.headers.get("x-build-size")} overlay ${JSON.stringify(overlayCfg.account ?? {})}/${overlayCfg.role ?? ""}`
+    );
+    r = await fetch(
+      `${d}/mover/console/api/machines?accountId=${ANCHOR_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const dMachines = await r.json();
+    const dRow = (dMachines.machines ?? []).find((m) => m.machineId === AMID);
+    check(
+      "console machines list carries the served stamp and the machine's build stamp",
+      r.status === 200 &&
+        dMachines.buildStamp === SERVED_STAMP &&
+        dRow?.buildStamp === "202601010000" &&
+        dRow?.anchorLast === null,
+      JSON.stringify({ served: dMachines.buildStamp, row: dRow?.buildStamp })
+    );
+    const queueAnchor = async (action, body) => {
+      const res = await fetch(
+        `${d}/mover/console/api/machines/${AMID}/${action}`,
+        {
+          method: "POST",
+          headers: KH,
+          body: JSON.stringify({ accountId: ANCHOR_ACC, ...body })
+        }
+      );
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    const wrongStamp = await queueAnchor("anchor-update", {
+      stamp: "202601020000"
+    });
+    check(
+      "anchor-update naming a stamp the server does not serve -> 400 STAMP_MISMATCH",
+      wrongStamp.status === 400 && wrongStamp.data.error === "STAMP_MISMATCH",
+      JSON.stringify(wrongStamp.data)
+    );
+    const updQ = await queueAnchor("anchor-update", { stamp: SERVED_STAMP });
+    check(
+      "console anchor-update queues a signed command for the served stamp",
+      updQ.status === 200 &&
+        /^[0-9a-f]{64}$/.test(updQ.data.signature ?? ""),
+      JSON.stringify(updQ.data)
+    );
+    const awire = await (
+      await fetch(`${d}/api/headless/commands`, { headers: AAUTH })
+    ).json();
+    const updCmd = (awire ?? []).find((c) => c.id === updQ.data.commandId);
+    const expectedUpdSig = createHmac("sha256", ASECRET)
+      .update(
+        JSON.stringify(
+          canon({
+            id: updQ.data.commandId,
+            type: "anchor-update",
+            payload: { stamp: SERVED_STAMP }
+          })
+        )
+      )
+      .digest("hex");
+    check(
+      "anchor-update arrives signed, verifiable against canonical JSON + machine secret",
+      !!updCmd &&
+        updCmd.type === "anchor-update" &&
+        updCmd.payload?.stamp === SERVED_STAMP &&
+        updCmd.signature === expectedUpdSig &&
+        updCmd.signature === updQ.data.signature,
+      JSON.stringify(updCmd)
+    );
+    // The deed the machine reports folds into the anchor ledger
+    // and onto its record.
+    r = await fetch(`${d}/api/headless/commands/${updQ.data.commandId}/result`, {
+      method: "POST",
+      headers: { ...AAUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        result: {
+          status: "updating",
+          anchor: {
+            action: "update",
+            role: "host",
+            fromStamp: "202601010000",
+            toStamp: SERVED_STAMP,
+            outcome: "updating",
+            detail: "restarting onto the new build"
+          }
+        }
+      })
+    });
+    check("anchor-update result posts", r.status === 200);
+    r = await fetch(`${d}/mover/console/api/anchor-ledger`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const aLedger = await r.json();
+    check(
+      "anchor result folds into the anchor ledger with the full record shape",
+      r.status === 200 &&
+        aLedger.records?.length === 1 &&
+        aLedger.records[0].machineId === AMID &&
+        aLedger.records[0].accountId === ANCHOR_ACC &&
+        aLedger.records[0].action === "update" &&
+        aLedger.records[0].fromStamp === "202601010000" &&
+        aLedger.records[0].toStamp === SERVED_STAMP &&
+        aLedger.records[0].outcome === "updating" &&
+        typeof aLedger.records[0].at === "string",
+      JSON.stringify(aLedger).slice(0, 300)
+    );
+    // The new instance heartbeats its new stamp and the
+    // concluded deed: both land on the machine record.
+    r = await fetch(`${d}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: { ...AAUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        state: "idle",
+        buildStamp: SERVED_STAMP,
+        anchor: {
+          action: "update",
+          role: "host",
+          fromStamp: "202601010000",
+          toStamp: SERVED_STAMP,
+          outcome: "updated",
+          detail: "The Host updated itself."
+        }
+      })
+    });
+    check("post-update heartbeat posts", r.status === 200);
+    r = await fetch(
+      `${d}/mover/console/api/machines?accountId=${ANCHOR_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const dMachines2 = await r.json();
+    const dRow2 = (dMachines2.machines ?? []).find(
+      (m) => m.machineId === AMID
+    );
+    check(
+      "machine record shows the new stamp and the concluded deed",
+      dRow2?.buildStamp === SERVED_STAMP &&
+        dRow2?.anchorLast?.outcome === "updated" &&
+        dRow2?.anchorLast?.toStamp === SERVED_STAMP,
+      JSON.stringify(dRow2 ?? {}).slice(0, 300)
+    );
+    // A deliver queues signed too, naming the sibling role.
+    const delQ = await queueAnchor("anchor-deliver", {
+      role: "viewer",
+      stamp: SERVED_STAMP
+    });
+    check(
+      "console anchor-deliver queues a signed command",
+      delQ.status === 200 &&
+        /^[0-9a-f]{64}$/.test(delQ.data.signature ?? ""),
+      JSON.stringify(delQ.data)
+    );
+    // License gate: revoking the admin product blocks host
+    // build downloads for the account; the mover product's
+    // builds still flow; restoring reopens the door.
+    const licD = async (action, product) => {
+      const res = await fetch(`${d}/mover/console/api/licenses/${action}`, {
+        method: "POST",
+        headers: KH,
+        body: JSON.stringify({ product, accountId: ANCHOR_ACC })
+      });
+      return res.status;
+    };
+    check(
+      "anchor test account admin license revoked (gate setup)",
+      (await licD("revoke", "admin")) === 200
+    );
+    r = await fetch(`${d}/api/headless/build?role=host`, { headers: AAUTH });
+    const revokedBody = await r.json().catch(() => ({}));
+    check(
+      "host build download for a revoked account -> 403 LICENSE_REVOKED",
+      r.status === 403 && revokedBody.error === "LICENSE_REVOKED",
+      `got ${r.status} ${JSON.stringify(revokedBody)}`
+    );
+    r = await fetch(`${d}/api/headless/build?role=mover`, { headers: AAUTH });
+    check(
+      "mover build download still flows (only the admin product is revoked)",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    check(
+      "anchor test account admin license restored",
+      (await licD("restore", "admin")) === 200
+    );
+    r = await fetch(`${d}/api/headless/build?role=host`, { headers: AAUTH });
+    check(
+      "host build download works again after the restore",
+      r.status === 200,
+      `got ${r.status}`
+    );
+
     // ---- Licenses, unified console, host + viewer builds ---------
     console.log("licenses + unified console");
     const OWNER_ACC = "mv79ce74e43cc48d276ca0";

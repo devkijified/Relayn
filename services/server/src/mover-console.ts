@@ -34,6 +34,9 @@
 //   POST /mover/console/api/machines/:id/files-fetch     queue a SIGNED files-fetch
 //   POST /mover/console/api/machines/:id/files-push      queue a SIGNED files-push
 //   GET  /mover/console/api/files-ledger                 Files transfer ledger
+//   POST /mover/console/api/machines/:id/anchor-update   queue a SIGNED anchor-update
+//   POST /mover/console/api/machines/:id/anchor-deliver  queue a SIGNED anchor-deliver
+//   GET  /mover/console/api/anchor-ledger                anchor deed ledger
 //
 // The files-fetch payload carries concrete files only, exactly like
 // start: the console expands ticked folders through "paths", shows
@@ -79,7 +82,7 @@
 // =========================================================================
 
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync, statSync } from "node:fs";
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
@@ -134,6 +137,9 @@ export const MOVER_DEFAULT_MESSAGES: Record<string, string> = {
   importParts: "Import parts...",
   report: "Report",
   importDone: "Import finished. Report:",
+  anchorDisabled: "The anchor is turned off on this machine.",
+  viewerBuildStamp: "build {stamp}",
+  viewerAnchorLast: "Anchor: {outcome}",
   filesTitle: "Files",
   filesDisabled: "Files is turned off on this machine.",
   filesEmpty: "No files here yet.",
@@ -390,6 +396,12 @@ export function buildMoverConfig(opts: MoverPairOptions) {
     // push) on a machine. An empty downloadDir means the app's own
     // default download folder.
     files: { enabled: true, downloadDir: "" },
+    // Anchor defaults: the planted Host as the suite's SYSTEM
+    // carrier (self-update + sibling delivery on signed operator
+    // command). An empty suiteDir means <dataDir>/suite;
+    // updateProofSec bounds the updater's wait for the new
+    // build's proof before it rolls back.
+    anchor: { enabled: true, suiteDir: "", updateProofSec: 120 },
     messages: { ...MOVER_DEFAULT_MESSAGES }
   };
 }
@@ -497,6 +509,134 @@ export function packageFilename(role: MoverRole): string {
 }
 
 // -------------------------------------------------------------------------
+// Build stamps and anchor downloads. A shipped base exe carries
+// its build stamp exactly once (the linker writes
+// -X main.buildStamp=YYYYMMDDHHMM as a 12 digit string into the
+// binary). extractBuildStamp mirrors the Go implementation
+// (internal/config/stamp_extract.go) byte for byte in behaviour:
+// scan for ASCII runs shaped 20 + 10 digits, bounded by
+// non-digits, that parse as a plausible date and time, and take
+// the numerically largest. The anchor verifies a fetched build
+// the same way on its side; the two must stay in step.
+// -------------------------------------------------------------------------
+
+export function extractBuildStamp(data: Buffer): string {
+  let best = "";
+  for (let i = 0; i + 12 <= data.length; i++) {
+    if (data[i] !== 0x32 || data[i + 1] !== 0x30) continue; // "20"
+    let ok = true;
+    for (let j = 2; j < 12; j++) {
+      const b = data[i + j];
+      if (b < 0x30 || b > 0x39) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) continue;
+    if (i > 0 && data[i - 1] >= 0x30 && data[i - 1] <= 0x39) continue;
+    if (
+      i + 12 < data.length &&
+      data[i + 12] >= 0x30 &&
+      data[i + 12] <= 0x39
+    ) {
+      continue;
+    }
+    const cand = data.toString("ascii", i, i + 12);
+    const month = Number(cand.slice(4, 6));
+    const day = Number(cand.slice(6, 8));
+    const hour = Number(cand.slice(8, 10));
+    const minute = Number(cand.slice(10, 12));
+    if (
+      month < 1 || month > 12 || day < 1 || day > 31 ||
+      hour > 23 || minute > 59
+    ) {
+      continue;
+    }
+    if (cand > best) best = cand;
+  }
+  return best;
+}
+
+let servedStampCache = { key: "", stamp: "" };
+
+/**
+ * The build stamp of the base exe this server currently serves
+ * ("" when MOVER_BASE_EXE is unset, unreadable, or the base
+ * carries no stamp). Cached on the file's path+size+mtime so
+ * the machines list can carry it on every read without
+ * re-reading ~10 MB each time.
+ */
+export function servedBuildStamp(): string {
+  const baseExe = process.env.MOVER_BASE_EXE ?? "";
+  if (!baseExe) return "";
+  try {
+    const st = statSync(baseExe);
+    const key = `${baseExe}:${st.size}:${Math.floor(st.mtimeMs)}`;
+    if (servedStampCache.key === key) return servedStampCache.stamp;
+    const stamp = extractBuildStamp(readFileSync(baseExe));
+    servedStampCache = { key, stamp };
+    return stamp;
+  } catch {
+    return "";
+  }
+}
+
+export type BuildRoleResult =
+  | { ok: true; bytes: Buffer; stamp: string; filename: string }
+  | { ok: false; status: number; error: string; message: string };
+
+/**
+ * Build one role's ready exe for one account: the pair
+ * download's construction (base exe + that account's merged
+ * config as the inbuilt overlay), shared by the console
+ * package download and the anchor's machine-authenticated
+ * build endpoint (mover-headless.ts). The license gate stays
+ * with the callers: both refuse revoked products before
+ * building, in their own shapes.
+ */
+export async function buildRoleExe(
+  role: MoverRole,
+  accountId: string
+): Promise<BuildRoleResult> {
+  const baseExe = process.env.MOVER_BASE_EXE ?? "";
+  if (!baseExe) {
+    return {
+      ok: false,
+      status: 501,
+      error: "BASE_EXE_NOT_CONFIGURED",
+      message:
+        "MOVER_BASE_EXE is not set on this server, so ready builds are unavailable. The config.json download still works."
+    };
+  }
+  let exe: Buffer;
+  try {
+    exe = await fs.readFile(baseExe);
+  } catch {
+    return {
+      ok: false,
+      status: 500,
+      error: "BASE_EXE_UNREADABLE",
+      message: "The base app file configured on this server could not be read."
+    };
+  }
+  const cfg = buildMoverConfig({ accountId, role });
+  const check = validateMoverConfig(cfg);
+  if (!check.ok) {
+    return {
+      ok: false,
+      status: 400,
+      error: "INVALID_CONFIG",
+      message: check.errors.join("; ")
+    };
+  }
+  const bytes = buildInbuiltExe(
+    exe,
+    Buffer.from(JSON.stringify(cfg, null, 1), "utf8")
+  );
+  return { ok: true, bytes, stamp: extractBuildStamp(exe), filename: packageFilename(role) };
+}
+
+// -------------------------------------------------------------------------
 // Shared console styling. One visual language for every console
 // page (the tabbed console, the background desktop viewer and the
 // view screen viewer), matching the Go apps: cream background,
@@ -563,6 +703,7 @@ th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.0
 .trow .meta{color:var(--muted);font-size:12px;margin-left:0.4rem;}
 .kids{margin-left:1.4rem;border-left:1px dotted var(--border2);padding-left:0.6rem;}
 #confirmPanel{border:2px solid var(--primary);border-radius:var(--radius);padding:0.8rem;margin-top:0.8rem;background:var(--surface);}
+#anchorPanel{border:2px solid var(--primary);border-radius:var(--radius);padding:0.8rem;margin-top:0.8rem;background:var(--surface);}
 .ledger{border:1px solid var(--border);border-radius:10px;padding:0.6rem 0.8rem;margin:0.4rem 0;background:var(--surface);font-size:13px;}
 `;
 
@@ -921,6 +1062,15 @@ compiled in, nothing else to carry or place beside it.</p>
       </p>
     </div>
   </div>
+  <div id="anchorPanel" style="display:none">
+    <p><strong id="anchorPanelTitle">Confirm anchor deed</strong></p>
+    <p id="anchorText"></p>
+    <p>
+      <button id="anchorConfirm" type="button">Confirm</button>
+      <button id="anchorCancel" type="button" class="ghost">Back</button>
+    </p>
+    <div id="anchorNote"></div>
+  </div>
 </fieldset>
   <div class="card">
     <h3>5. Cloud moves</h3>
@@ -1002,6 +1152,10 @@ compiled in, nothing else to carry or place beside it.</p>
     <p>Every file a machine reports moving under a fetch or a push, newest first, across every known account.</p>
     <p><button type="button" id="filesLedgerRefresh" class="ghost">Refresh ledger</button></p>
     <div id="filesLedger"><p class="meta">Not loaded yet.</p></div>
+    <p><strong>Anchor ledger</strong></p>
+    <p>Every anchor deed a machine reports: a Host that updated itself, or a sibling build the anchor delivered to its suite folder. Newest first, across every known account. Updates are never automatic: each one was ordered from the MOVER tab with its exact target build named.</p>
+    <p><button type="button" id="anchorLedgerRefresh" class="ghost">Refresh ledger</button></p>
+    <div id="anchorLedger"><p class="meta">Not loaded yet.</p></div>
   </div>
 </section>
 
@@ -1481,8 +1635,106 @@ compiled in, nothing else to carry or place beside it.</p>
         filesBtn.addEventListener("click", function () { showFilesFor(m.machineId); });
         div.appendChild(filesBtn);
       }
+      // The anchor: the row names the build the machine is
+      // running and the anchor's last deed, and offers the two
+      // deeds (update itself, deliver a sibling) when the
+      // machine carries the anchor capability. Update is only
+      // offered when this server serves a different stamp.
+      var anchorBits = [];
+      if (m.buildStamp) anchorBits.push("build " + m.buildStamp);
+      if (m.anchorLast) {
+        anchorBits.push("Anchor: " + m.anchorLast.outcome +
+          (m.anchorLast.detail ? " · " + m.anchorLast.detail : ""));
+      }
+      if (anchorBits.length) {
+        var anchorMeta = document.createElement("div");
+        anchorMeta.className = "meta";
+        anchorMeta.textContent = anchorBits.join(" · ");
+        div.appendChild(anchorMeta);
+      }
+      if (m.online && caps2.anchor) {
+        var served = data.buildStamp || "";
+        if (served && m.buildStamp !== served) {
+          var updBtn = document.createElement("button");
+          updBtn.type = "button";
+          updBtn.className = "small";
+          updBtn.style.marginLeft = "0.5rem";
+          updBtn.textContent = "Update Host to build " + served;
+          updBtn.addEventListener("click", function () { askAnchorUpdate(m, served); });
+          div.appendChild(updBtn);
+        }
+        var roleSel = document.createElement("select");
+        roleSel.className = "small";
+        roleSel.style.marginLeft = "0.5rem";
+        ["mover", "admin", "viewer", "host"].forEach(function (roleName) {
+          var opt = document.createElement("option");
+          opt.value = roleName;
+          opt.textContent = roleName + " build";
+          roleSel.appendChild(opt);
+        });
+        div.appendChild(roleSel);
+        var delBtn = document.createElement("button");
+        delBtn.type = "button";
+        delBtn.className = "small";
+        delBtn.textContent = "Deliver sibling";
+        delBtn.addEventListener("click", function () { askAnchorDeliver(m, roleSel.value, served); });
+        div.appendChild(delBtn);
+      }
       list.appendChild(div);
     });
+  });
+
+  // ---------------- Anchor deeds (update + deliver) ----------------
+  var anchorPending = null;
+  function askAnchorUpdate(m, served) {
+    anchorPending = { mode: "update", machineId: m.machineId, stamp: served };
+    document.getElementById("anchorPanelTitle").textContent = "Confirm Host update";
+    document.getElementById("anchorText").textContent =
+      "Update the Host on " + (m.name || m.machineId) + " from build " +
+      (m.buildStamp || "an unstamped build") + " to build " + served + ". " +
+      "The machine downloads the new build from this server, checks that its stamp is exactly " + served +
+      " and that it belongs to this account, then restarts its own service onto it. " +
+      "If the new build does not check in, the previous build is restored on its own. Nothing else on the machine is touched.";
+    document.getElementById("anchorConfirm").textContent = "Confirm and update Host";
+    document.getElementById("anchorNote").textContent = "";
+    document.getElementById("anchorPanel").style.display = "block";
+  }
+  function askAnchorDeliver(m, role, served) {
+    anchorPending = { mode: "deliver", machineId: m.machineId, role: role, stamp: served };
+    document.getElementById("anchorPanelTitle").textContent = "Confirm sibling delivery";
+    document.getElementById("anchorText").textContent =
+      "Deliver the " + role + " build" + (served ? " " + served : "") + " to " + (m.name || m.machineId) + ". " +
+      "The machine downloads it from this server, checks that it belongs to this account, and places it in its suite folder. " +
+      "A host build is also planted as the machine's service, or refreshed onto it, where that applies. Nothing runs until an admin uses the delivered build.";
+    document.getElementById("anchorConfirm").textContent = "Confirm and deliver";
+    document.getElementById("anchorNote").textContent = "";
+    document.getElementById("anchorPanel").style.display = "block";
+  }
+  document.getElementById("anchorCancel").addEventListener("click", function () {
+    anchorPending = null;
+    document.getElementById("anchorPanel").style.display = "none";
+  });
+  document.getElementById("anchorConfirm").addEventListener("click", async function () {
+    if (!anchorPending) return;
+    var pending = anchorPending;
+    var action = pending.mode === "update" ? "anchor-update" : "anchor-deliver";
+    var body = { accountId: accountId() };
+    if (pending.mode === "update") body.stamp = pending.stamp;
+    if (pending.mode === "deliver") {
+      body.role = pending.role;
+      if (pending.stamp) body.stamp = pending.stamp;
+    }
+    var res = await machineApi(pending.machineId, action, body);
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) {
+      document.getElementById("anchorNote").textContent =
+        "Could not queue the deed: " + (data.message || data.error || res.status);
+      return;
+    }
+    anchorPending = null;
+    document.getElementById("anchorPanel").style.display = "none";
+    say((pending.mode === "update" ? "Host update" : "Sibling delivery") +
+      " ordered (command " + data.commandId + "). The machine reports the outcome in its row and in the anchor ledger in the ADMIN tab.");
   });
   document.getElementById("rescan").addEventListener("click", function () {
     if (hm.machineId) scanMachine(hm.machineId, hm.machineName);
@@ -1946,9 +2198,14 @@ compiled in, nothing else to carry or place beside it.</p>
         '<div class="meta">' + esc(m.machineId) + " · state: " + esc(m.state || "idle") +
         " · signed in: " + esc(signedIn) + esc(sessText) +
         (m.runMode ? " · run mode: " + esc(m.runMode === "foreground" ? "temporary (foreground)" : m.runMode) : "") +
+        (m.buildStamp ? " · build " + esc(m.buildStamp) : "") +
         " · capabilities: " + esc(capNames.length ? capNames.join(", ") : "none reported") + "</div>" +
         (m.pollOk === false
           ? '<div class="meta" style="color:var(--err)">Cannot hear orders: ' + esc(m.pollError || "the last order check failed") + "</div>"
+          : "") +
+        (m.anchorLast
+          ? '<div class="meta">Anchor: ' + esc(m.anchorLast.outcome) +
+            (m.anchorLast.detail ? " · " + esc(m.anchorLast.detail) : "") + "</div>"
           : "") +
         (m.runMode === "foreground"
           ? '<div class="meta">Temporary mode: this guard stops when its window closes. Run the Host as administrator once to plant it permanently.</div>'
@@ -2274,6 +2531,33 @@ compiled in, nothing else to carry or place beside it.</p>
     }
   }
   document.getElementById("filesLedgerRefresh").addEventListener("click", loadFilesLedger);
+  async function loadAnchorLedger() {
+    var el = document.getElementById("anchorLedger");
+    try {
+      var res = await apiGet("/mover/console/api/anchor-ledger");
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+      var records = data.records || [];
+      if (records.length === 0) {
+        el.innerHTML = '<p class="meta">No anchor deeds recorded yet.</p>';
+        return;
+      }
+      var html = "<table><tr><th>When</th><th>Machine</th><th>Deed</th><th>Builds</th><th>Outcome</th></tr>";
+      records.forEach(function (rec) {
+        var builds = (rec.fromStamp || "an unstamped build") + " to " + (rec.toStamp || "");
+        html += "<tr><td>" + esc(rec.at) + "</td><td>" + esc(rec.machineId) +
+          "</td><td>" + esc(rec.action + (rec.role ? " (" + rec.role + ")" : "")) +
+          "</td><td>" + esc(builds) +
+          "</td><td>" + esc(rec.outcome) +
+          (rec.detail ? '<div class="meta">' + esc(rec.detail) + "</div>" : "") + "</td></tr>";
+      });
+      html += "</table>";
+      el.innerHTML = html;
+    } catch (e) {
+      el.innerHTML = '<p class="meta">Could not load the ledger: ' + esc(e.message) + "</p>";
+    }
+  }
+  document.getElementById("anchorLedgerRefresh").addEventListener("click", loadAnchorLedger);
 
   refreshLicenses();
   loadOverview();
@@ -2723,7 +3007,14 @@ export async function moverConsoleRoutes(
       (request.query ?? {}) as Record<string, unknown>
     );
     if (!acc) return;
-    return { machines: st.listHeadlessMachines(acc) };
+    // The stamp this server currently serves rides along, so
+    // the page can offer "Update Host" exactly when a machine's
+    // running build differs from it ("" when no base exe is
+    // configured or it carries no stamp: no offer is made).
+    return {
+      machines: st.listHeadlessMachines(acc),
+      buildStamp: servedBuildStamp()
+    };
   });
 
   /** Queue one command for a machine; 404 when it is not enrolled. */
@@ -3202,6 +3493,113 @@ export async function moverConsoleRoutes(
     const st = needStore(reply);
     if (!st) return;
     return { records: st.listAllFilesLedger(knownAccounts()) };
+  });
+
+  // ----------------------------------------------------------------
+  // Anchor operator API: the planted Host as the suite's SYSTEM
+  // carrier. anchor-update orders a self-update to the EXACT
+  // build stamp this server serves (the confirm-step rule,
+  // enforced server-side like the start rule: a stamp that is
+  // not the served stamp queues nothing). anchor-deliver orders
+  // a sibling build placed in the machine's suite folder. Both
+  // commands are signed at queue time by the store, both are
+  // license gated like the other signed queueings, and there is
+  // NO automatic path: an admin orders each deed here.
+  // ----------------------------------------------------------------
+
+  /** True when an anchor queue may proceed for this account. */
+  function anchorLicenseGate(reply: FastifyReply, acc: string): boolean {
+    if (!licenseStore) return true;
+    if (!licenseStore.hasRevoked(acc)) return true;
+    reply.code(403).send({
+      error: "LICENSE_REVOKED",
+      message:
+        "This account has a revoked license, so anchor updates and deliveries are blocked. Restore the license in the console to allow them again."
+    });
+    return false;
+  }
+
+  app.post(
+    "/mover/console/api/machines/:machineId/anchor-update",
+    async (request, reply) => {
+      if (!gate(request, reply)) return;
+      const st = needStore(reply);
+      if (!st) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const acc = consoleAccountId(reply, body, null);
+      if (!acc) return;
+      const served = servedBuildStamp();
+      const stamp = typeof body.stamp === "string" ? body.stamp : "";
+      if (!served || stamp !== served) {
+        return reply.code(400).send({
+          error: "STAMP_MISMATCH",
+          message: served
+            ? `An update names the exact build this server serves (${served}); the request named "${stamp || "no stamp"}", so nothing was queued.`
+            : "This server serves no stamped build (MOVER_BASE_EXE unset or unstamped), so no update can be ordered."
+        });
+      }
+      if (!anchorLicenseGate(reply, acc)) return;
+      const params = request.params as { machineId: string };
+      const cmd = isValidHeadlessMachineId(params.machineId)
+        ? st.queueHeadlessCommand(acc, params.machineId, "anchor-update", {
+            stamp
+          })
+        : undefined;
+      if (!cmd) return machineNotFound(reply);
+      return { commandId: cmd.id, signature: cmd.signature };
+    }
+  );
+
+  app.post(
+    "/mover/console/api/machines/:machineId/anchor-deliver",
+    async (request, reply) => {
+      if (!gate(request, reply)) return;
+      const st = needStore(reply);
+      if (!st) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const acc = consoleAccountId(reply, body, null);
+      if (!acc) return;
+      const role = body.role;
+      if (
+        role !== "mover" &&
+        role !== "admin" &&
+        role !== "viewer" &&
+        role !== "host"
+      ) {
+        return reply.code(400).send({
+          error: "BAD_ROLE",
+          message:
+            "A delivery names a sibling role: mover, admin, viewer or host."
+        });
+      }
+      const served = servedBuildStamp();
+      const stamp =
+        typeof body.stamp === "string" && body.stamp !== ""
+          ? body.stamp
+          : served;
+      if (stamp && served && stamp !== served) {
+        return reply.code(400).send({
+          error: "STAMP_MISMATCH",
+          message: `A delivery names the exact build this server serves (${served}); the request named "${stamp}", so nothing was queued.`
+        });
+      }
+      if (!anchorLicenseGate(reply, acc)) return;
+      const payload: Record<string, unknown> = { role };
+      if (stamp) payload.stamp = stamp;
+      const params = request.params as { machineId: string };
+      const cmd = isValidHeadlessMachineId(params.machineId)
+        ? st.queueHeadlessCommand(acc, params.machineId, "anchor-deliver", payload)
+        : undefined;
+      if (!cmd) return machineNotFound(reply);
+      return { commandId: cmd.id, signature: cmd.signature };
+    }
+  );
+
+  app.get("/mover/console/api/anchor-ledger", async (request, reply) => {
+    if (!gate(request, reply)) return;
+    const st = needStore(reply);
+    if (!st) return;
+    return { records: st.listAllAnchorLedger(knownAccounts()) };
   });
 }
 

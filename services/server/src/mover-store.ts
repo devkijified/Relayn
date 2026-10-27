@@ -60,10 +60,11 @@ export interface MoveMeta {
 // user. A machine enrolls once per account and receives a per-machine
 // secret; after that it authenticates with X-Machine-Id +
 // X-Machine-Secret. The console queues commands (scan, browse, paths,
-// start, files-browse, files-fetch, files-push); the machine polls
-// for them, executes, and posts results back. "start", "files-fetch"
-// and "files-push" commands are SIGNED with the machine's secret (see
-// headlessCommandSignature) so a start exists only because an
+// start, files-browse, files-fetch, files-push, anchor-update,
+// anchor-deliver); the machine polls for them, executes, and posts
+// results back. "start", "files-fetch", "files-push", "anchor-update"
+// and "anchor-deliver" commands are SIGNED with the machine's secret
+// (see headlessCommandSignature) so each exists only because an
 // operator clicked it in the console — never zero-touch.
 //
 // Headless state is held IN MEMORY, exactly like presence above: a
@@ -93,6 +94,11 @@ export interface HeadlessMachineRecord {
   pollError: string; // short failure reason when the last poll failed
   pollAt: string; // RFC3339 of the last poll outcome
   runMode: string; // how the guard is hosted: "service" | "foreground" | "" (unreported)
+  hostLogPath: string; // absolute path of the machine's host.log, engine-reported
+  serviceDacl: string; // service DACL state as the engine derived it: "pinned" | "default" | "unknown" | "" (unreported)
+  serviceDaclDetail: string; // why the DACL state is what it is, when it is not pinned
+  buildStamp: string; // the running build's stamp, YYYYMMDDHHMM ("" = unreported/unstamped)
+  anchorLast: AnchorState | null; // the anchor's most recent deed, as reported
 }
 
 /**
@@ -179,6 +185,66 @@ export interface ViewSessionRecord {
   user?: string; // who is signed in and being viewed
 }
 
+/**
+ * The anchor's last deed on one machine, as the engine reports
+ * it on enrollments, heartbeats and anchor command results
+ * (see cmd/mover/anchor.go): a self-update ("update") or a
+ * sibling delivery ("deliver"), the stamps it moved between,
+ * its outcome, and the plain-words detail the console renders.
+ */
+export interface AnchorState {
+  action: string; // "update" | "deliver"
+  role: string;
+  fromStamp: string;
+  toStamp: string;
+  outcome: string;
+  detail: string;
+  at: string; // RFC3339 UTC, when the engine recorded the deed
+}
+
+/**
+ * Validate an engine-sent anchor state. Anything malformed
+ * folds to null (unreported), never to invented deeds: the
+ * strings are length-clamped because the console renders them.
+ */
+export function foldAnchorState(value: unknown): AnchorState | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const str = (x: unknown, max: number): string =>
+    typeof x === "string" ? x.slice(0, max) : "";
+  const action = str(v.action, 32);
+  const outcome = str(v.outcome, 64);
+  if (!action || !outcome) return null;
+  return {
+    action,
+    role: str(v.role, 32),
+    fromStamp: str(v.fromStamp, 16),
+    toStamp: str(v.toStamp, 16),
+    outcome,
+    detail: str(v.detail, 600),
+    at: str(v.at, 40)
+  };
+}
+
+/**
+ * One entry in the anchor ledger: a deed a machine reported in
+ * an anchor command result, folded from the result's "anchor"
+ * object and stamped with the reporting machine and the server
+ * receipt time. The Files ledger's twin: held in memory, a
+ * restart clears it and new deeds refill it.
+ */
+export interface AnchorLedgerRecord {
+  accountId: string;
+  machineId: string;
+  action: string;
+  role: string;
+  fromStamp: string;
+  toStamp: string;
+  outcome: string;
+  detail: string;
+  at: string; // RFC3339 UTC, server receipt time
+}
+
 /** The console-facing shape: everything except the secret. */
 export interface HeadlessMachineView {
   machineId: string;
@@ -201,15 +267,20 @@ export interface HeadlessMachineView {
   pollError: string;
   pollAt: string;
   runMode: string;
+  hostLogPath: string;
+  serviceDacl: string;
+  serviceDaclDetail: string;
+  buildStamp: string;
+  anchorLast: AnchorState | null;
 }
 
 export interface HeadlessCommand {
   id: string;
   account: string;
   machineId: string;
-  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | files-browse | files-fetch | files-push
+  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | files-browse | files-fetch | files-push | anchor-update | anchor-deliver
   payload: Record<string, unknown>;
-  signature?: string; // set for "start", "desk-end", "view-end", "files-fetch" and "files-push" commands
+  signature?: string; // set for "start", "desk-end", "view-end", "files-fetch", "files-push", "anchor-update" and "anchor-deliver" commands
   createdAt: string; // RFC3339 UTC
   status: "pending" | "delivered" | "done";
   result?: unknown;
@@ -303,7 +374,12 @@ function headlessMachineView(
     pollOk: rec.pollOk,
     pollError: rec.pollError,
     pollAt: rec.pollAt,
-    runMode: rec.runMode
+    runMode: rec.runMode,
+    hostLogPath: rec.hostLogPath,
+    serviceDacl: rec.serviceDacl,
+    serviceDaclDetail: rec.serviceDaclDetail,
+    buildStamp: rec.buildStamp,
+    anchorLast: rec.anchorLast
   };
 }
 
@@ -380,6 +456,7 @@ export class MoverStore {
   >();
   private headlessCommands = new Map<string, HeadlessCommand>();
   private filesTransfers: FilesTransferRecord[] = [];
+  private anchorTransfers: AnchorLedgerRecord[] = [];
   private sweepTimer?: NodeJS.Timeout;
 
   constructor(config: MoverCloudConfig = loadMoverConfig()) {
@@ -456,6 +533,8 @@ export class MoverStore {
       interactiveAway?: unknown;
       sessionsDiag?: unknown;
       runMode?: unknown;
+      buildStamp?: unknown;
+      anchor?: unknown;
     }
   ): HeadlessMachineRecord {
     const rec: HeadlessMachineRecord = {
@@ -480,7 +559,12 @@ export class MoverStore {
       pollOk: null,
       pollError: "",
       pollAt: "",
-      runMode: typeof init.runMode === "string" ? init.runMode : ""
+      runMode: typeof init.runMode === "string" ? init.runMode : "",
+      hostLogPath: "",
+      serviceDacl: "",
+      serviceDaclDetail: "",
+      buildStamp: typeof init.buildStamp === "string" ? init.buildStamp : "",
+      anchorLast: foldAnchorState(init.anchor)
     };
     let byId = this.headlessMachines.get(account);
     if (!byId) {
@@ -501,6 +585,14 @@ export class MoverStore {
       rec.pollOk = prior.pollOk;
       rec.pollError = prior.pollError;
       rec.pollAt = prior.pollAt;
+      rec.hostLogPath = prior.hostLogPath;
+      rec.serviceDacl = prior.serviceDacl;
+      rec.serviceDaclDetail = prior.serviceDaclDetail;
+      // An enroll that says nothing about the anchor (an older
+      // engine, or a deed-free one) must not erase the last
+      // deed the record already holds.
+      if (!rec.anchorLast) rec.anchorLast = prior.anchorLast;
+      if (!rec.buildStamp) rec.buildStamp = prior.buildStamp;
     }
     byId.set(rec.machineId, rec);
     // Drop ONLY never-delivered commands ("pending" here means
@@ -564,6 +656,11 @@ export class MoverStore {
       sessionsDiag?: unknown;
       poll?: unknown;
       runMode?: unknown;
+      hostLogPath?: unknown;
+      serviceDacl?: unknown;
+      serviceDaclDetail?: unknown;
+      buildStamp?: unknown;
+      anchor?: unknown;
     }
   ): boolean {
     const rec = this.getHeadlessMachine(account, machineId);
@@ -593,6 +690,22 @@ export class MoverStore {
     }
     if (typeof beat.runMode === "string") {
       rec.runMode = beat.runMode;
+    }
+    if (typeof beat.buildStamp === "string") {
+      rec.buildStamp = beat.buildStamp;
+    }
+    if (typeof beat.hostLogPath === "string") {
+      rec.hostLogPath = beat.hostLogPath.slice(0, 300);
+    }
+    if (typeof beat.serviceDacl === "string") {
+      rec.serviceDacl = beat.serviceDacl.slice(0, 40);
+    }
+    if (typeof beat.serviceDaclDetail === "string") {
+      rec.serviceDaclDetail = beat.serviceDaclDetail.slice(0, 300);
+    }
+    if (beat.anchor !== undefined && beat.anchor !== null) {
+      const deed = foldAnchorState(beat.anchor);
+      if (deed) rec.anchorLast = deed;
     }
     if (beat.desk !== undefined && beat.desk !== null) {
       this.noteDeskReport(rec, beat.desk);
@@ -743,11 +856,60 @@ export class MoverStore {
   }
 
   /**
+   * Fold one anchor command result's deed into the anchor
+   * ledger and onto the machine's record. The deed is the
+   * engine's own report (the result's "anchor" object, validated
+   * like an enroll's); the ledger entry is stamped with the
+   * account, the reporting machine and the server receipt time.
+   * Returns whether a deed was folded.
+   */
+  noteAnchorTransfer(
+    account: string,
+    machineId: string,
+    anchor: unknown
+  ): boolean {
+    const deed = foldAnchorState(anchor);
+    if (!deed) return false;
+    this.anchorTransfers.push({
+      accountId: account,
+      machineId,
+      action: deed.action,
+      role: deed.role,
+      fromStamp: deed.fromStamp,
+      toStamp: deed.toStamp,
+      outcome: deed.outcome,
+      detail: deed.detail,
+      at: rfc3339Now()
+    });
+    const rec = this.getHeadlessMachine(account, machineId);
+    if (rec) rec.anchorLast = deed;
+    return true;
+  }
+
+  /** This account's anchor ledger, newest first. */
+  listAnchorLedger(account: string): AnchorLedgerRecord[] {
+    return this.anchorTransfers
+      .filter((r) => r.accountId === account)
+      .map((r) => ({ ...r }))
+      .reverse();
+  }
+
+  /** The anchor ledger across the given accounts, newest first. */
+  listAllAnchorLedger(accounts: string[]): AnchorLedgerRecord[] {
+    const wanted = new Set(accounts);
+    return this.anchorTransfers
+      .filter((r) => wanted.has(r.accountId))
+      .map((r) => ({ ...r }))
+      .reverse();
+  }
+
+  /**
    * Queue a command for a machine. "start", "desk-end",
-   * "view-end", "files-fetch" and "files-push" commands are
-   * signed with the machine's secret at queue time, so each
-   * exists only because an operator on an account channel queued
-   * it; the engine refuses any of them without a valid signature.
+   * "view-end", "files-fetch", "files-push", "anchor-update"
+   * and "anchor-deliver" commands are signed with the machine's
+   * secret at queue time, so each exists only because an
+   * operator on an account channel queued it; the engine refuses
+   * any of them without a valid signature.
    * Undefined when the machine is not enrolled under this account.
    */
   queueHeadlessCommand(
@@ -772,7 +934,9 @@ export class MoverStore {
       type === "desk-end" ||
       type === "view-end" ||
       type === "files-fetch" ||
-      type === "files-push"
+      type === "files-push" ||
+      type === "anchor-update" ||
+      type === "anchor-deliver"
     ) {
       cmd.signature = headlessCommandSignature(rec.secret, cmd);
     }
@@ -897,6 +1061,15 @@ export class MoverStore {
         ?.transfers;
       if (Array.isArray(transfers)) {
         this.noteFilesTransfers(account, machineId, transfers);
+      }
+    }
+    // Anchor results feed the anchor ledger: an anchor-update or
+    // anchor-deliver result carrying an "anchor" deed folds into
+    // the ledger and onto the machine record (noteAnchorTransfer).
+    if (cmd.type === "anchor-update" || cmd.type === "anchor-deliver") {
+      const deed = (result as { anchor?: unknown } | null)?.anchor;
+      if (deed !== undefined) {
+        this.noteAnchorTransfer(account, machineId, deed);
       }
     }
     return true;
