@@ -30,6 +30,20 @@
 //   POST /mover/console/api/machines/:id/paths           queue a paths expansion
 //   GET  /mover/console/api/machines/:id/result/:cmdId   a command's result
 //   POST /mover/console/api/machines/:id/start           queue a SIGNED start
+//   POST /mover/console/api/machines/:id/files-browse    queue a files-browse
+//   POST /mover/console/api/machines/:id/files-fetch     queue a SIGNED files-fetch
+//   POST /mover/console/api/machines/:id/files-push      queue a SIGNED files-push
+//   GET  /mover/console/api/files-ledger                 Files transfer ledger
+//
+// The files-fetch payload carries concrete files only, exactly like
+// start: the console expands ticked folders through "paths", shows
+// the exact list in a confirmation step, and only then is the signed
+// fetch queued. files-fetch and files-push queueing is license gated
+// (a revoked license for the account answers 403); files-browse is
+// read-only and stays ungated, like scan and browse. A machine that
+// posts a files-fetch or files-push result with a "transfers" array
+// folds those entries into the Files transfer ledger the ADMIN tab
+// shows (see mover-store.ts: noteFilesTransfers).
 //
 // The start payload carries concrete paths only: the console first
 // expands the operator's ticked prefixes through "paths" commands,
@@ -120,6 +134,14 @@ export const MOVER_DEFAULT_MESSAGES: Record<string, string> = {
   importParts: "Import parts...",
   report: "Report",
   importDone: "Import finished. Report:",
+  filesTitle: "Files",
+  filesDisabled: "Files is turned off on this machine.",
+  filesEmpty: "No files here yet.",
+  filesBrowse: "Browse files",
+  filesDownload: "Download",
+  filesUpload: "Upload",
+  filesFetchConfirm: "Check this list, then confirm. Nothing moves until you confirm.",
+  filesPushDone: "File written to the machine.",
   continuityTitle: "Continuity: how this machine feels now",
   readyNow: "Ready now",
   needsAttention: "Needs your attention",
@@ -361,6 +383,10 @@ export function buildMoverConfig(opts: MoverPairOptions) {
       simulateUser: "",
       simulateSessionFrames: 0
     },
+    // Files defaults: the on-demand file door (browse, fetch and
+    // push) on a machine. An empty downloadDir means the app's own
+    // default download folder.
+    files: { enabled: true, downloadDir: "" },
     messages: { ...MOVER_DEFAULT_MESSAGES }
   };
 }
@@ -940,6 +966,40 @@ compiled in, nothing else to carry or place beside it.</p>
     <p><button type="button" id="loadAdminMachines" class="ghost">Load machines oversight</button></p>
     <div id="adminMachineList"><p class="meta">Not loaded yet.</p></div>
   </div>
+  <div class="card">
+    <h3>Files</h3>
+    <p>Browse files on a machine for the account in section 1 of the MOVER tab. Tick the exact files to fetch, then review the list. Check this list, then confirm. Nothing moves until you confirm.</p>
+    <p>Upload runs from the Viewer app only. This panel cannot upload.</p>
+    <div class="row">
+      <label>Machine
+        <select id="filesMachine"></select>
+      </label>
+    </div>
+    <p>
+      <button type="button" id="filesLoadMachines" class="ghost">Load machines</button>
+      <button type="button" id="filesBrowseBtn">Browse files</button>
+    </p>
+    <div id="filesTree"></div>
+    <p id="filesSelTotal">Selected: 0 files, 0 B</p>
+    <label>Move name <input type="text" id="filesMoveName" value=""></label>
+    <p>
+      <button type="button" id="filesReview">Review fetch...</button>
+    </p>
+    <div id="filesConfirmPanel" style="display:none">
+      <p><strong>Confirm this fetch</strong></p>
+      <p id="filesConfirmText"></p>
+      <div id="filesConfirmList" class="meta"></div>
+      <p>
+        <button type="button" id="filesConfirmFetch">Confirm and fetch</button>
+        <button type="button" id="filesCancelFetch" class="ghost">Back</button>
+      </p>
+    </div>
+    <div id="filesFetchNote"></div>
+    <p><strong>Transfer ledger</strong></p>
+    <p>Every file a machine reports moving under a fetch or a push, newest first, across every known account.</p>
+    <p><button type="button" id="filesLedgerRefresh" class="ghost">Refresh ledger</button></p>
+    <div id="filesLedger"><p class="meta">Not loaded yet.</p></div>
+  </div>
 </section>
 
 <script>
@@ -1408,6 +1468,15 @@ compiled in, nothing else to carry or place beside it.</p>
           });
           div.appendChild(viewBtn);
         }
+      }
+      if (m.online && caps2.files) {
+        var filesBtn = document.createElement("button");
+        filesBtn.type = "button";
+        filesBtn.className = "small";
+        filesBtn.style.marginLeft = "0.5rem";
+        filesBtn.textContent = "Files";
+        filesBtn.addEventListener("click", function () { showFilesFor(m.machineId); });
+        div.appendChild(filesBtn);
       }
       list.appendChild(div);
     });
@@ -1897,8 +1966,284 @@ compiled in, nothing else to carry or place beside it.</p>
           slot.appendChild(viewBtn);
         }
       }
+      if (m.online && caps.files) {
+        var filesBtn = document.createElement("button");
+        filesBtn.type = "button";
+        filesBtn.className = "small";
+        filesBtn.style.marginLeft = "0.5rem";
+        filesBtn.textContent = "Files";
+        filesBtn.addEventListener("click", function () { showFilesFor(m.machineId); });
+        slot.appendChild(filesBtn);
+      }
     });
   });
+
+  // ---------------- Admin Files panel ----------------
+  // Browse one machine level by level through files-browse, tick
+  // the exact files, review the expanded list, and only then queue
+  // the signed files-fetch. Upload is Viewer-app only, so this
+  // panel has no upload control at all.
+  var fp = {
+    machineId: "",
+    machineName: "",
+    ticked: {},     // path -> true
+    agg: {},        // path -> {kind, count, bytes, size}
+    pathsCache: {}  // prefix -> [concrete file paths]
+  };
+  var pendingFilesFetch = null; // {paths, count, bytes} awaiting confirmation
+  var filesPreselect = "";
+  function showFilesFor(machineId) {
+    filesPreselect = machineId;
+    var adminBtn = document.querySelector('[data-tab="admin"]');
+    if (adminBtn) adminBtn.click();
+    loadFilesMachines();
+    loadFilesLedger();
+  }
+  async function loadFilesMachines() {
+    var sel = document.getElementById("filesMachine");
+    try {
+      var res = await apiGet("/mover/console/api/machines?accountId=" + encodeURIComponent(accountId()));
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+      while (sel.firstChild) sel.removeChild(sel.firstChild);
+      var machines = data.machines || [];
+      if (machines.length === 0) {
+        var opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No machines enrolled for this account yet";
+        sel.appendChild(opt);
+        return;
+      }
+      machines.forEach(function (m) {
+        var opt = document.createElement("option");
+        opt.value = m.machineId;
+        opt.textContent = (m.name || m.machineId) + (m.online ? "" : " (offline)");
+        sel.appendChild(opt);
+      });
+      if (filesPreselect && machines.some(function (m) { return m.machineId === filesPreselect; })) {
+        sel.value = filesPreselect;
+        filesPreselect = "";
+      }
+    } catch (e) {
+      say("Could not load machines for Files: " + e.message);
+    }
+  }
+  document.getElementById("filesLoadMachines").addEventListener("click", loadFilesMachines);
+  function filesSelPaths() {
+    return Object.keys(fp.ticked).filter(function (p) { return fp.ticked[p]; });
+  }
+  function renderFilesSelTotal() {
+    var count = 0, bytes = 0;
+    filesSelPaths().forEach(function (p) {
+      var a = fp.agg[p] || { kind: "file", count: 1, bytes: 0 };
+      count += a.count || 0;
+      bytes += a.bytes || 0;
+    });
+    document.getElementById("filesSelTotal").textContent =
+      "Selected: " + count + " files, " + fmtBytes(bytes);
+  }
+  function makeFilesRow(child) {
+    fp.agg[child.path] = child.kind === "folder"
+      ? { kind: "folder", count: child.count || 0, bytes: child.bytes || 0 }
+      : { kind: "file", count: 1, bytes: child.size || 0, size: child.size || 0 };
+    var wrap = document.createElement("div");
+    var row = document.createElement("div");
+    row.className = "trow";
+    var box = document.createElement("input");
+    box.type = "checkbox";
+    box.checked = !!fp.ticked[child.path];
+    box.addEventListener("change", function () {
+      if (box.checked) fp.ticked[child.path] = true;
+      else delete fp.ticked[child.path];
+      document.getElementById("filesConfirmPanel").style.display = "none";
+      pendingFilesFetch = null;
+      renderFilesSelTotal();
+    });
+    row.appendChild(box);
+    var kids = document.createElement("div");
+    kids.className = "kids";
+    kids.style.display = "none";
+    if (child.kind === "folder") {
+      var exp = document.createElement("button");
+      exp.type = "button";
+      exp.className = "ghost small";
+      exp.textContent = "Open";
+      exp.addEventListener("click", async function () {
+        if (kids.style.display !== "none") { kids.style.display = "none"; exp.textContent = "Open"; return; }
+        if (!kids.hasChildNodes()) {
+          exp.textContent = "Loading...";
+          try {
+            await loadFilesLevel(kids, child.path, 0);
+          } catch (e) {
+            say("Browse failed: " + e.message);
+            exp.textContent = "Open";
+            return;
+          }
+        }
+        kids.style.display = "block";
+        exp.textContent = "Close";
+      });
+      row.appendChild(exp);
+    }
+    var label = document.createElement("span");
+    label.textContent = " " + child.name;
+    row.appendChild(label);
+    var meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = child.kind === "folder"
+      ? "(" + (child.count || 0) + " files, " + fmtBytes(child.bytes || 0) + ")"
+      : "(" + fmtBytes(child.size || 0) + (child.modTime ? ", " + child.modTime : "") + ")";
+    row.appendChild(meta);
+    wrap.appendChild(row);
+    wrap.appendChild(kids);
+    return wrap;
+  }
+  async function loadFilesLevel(kidsEl, prefix, offset) {
+    var resp = await queueAndWait(fp.machineId, "files-browse", { prefix: prefix, offset: offset, limit: 200 });
+    var children = (resp && resp.children) || [];
+    if (children.length === 0 && offset === 0) {
+      var empty = document.createElement("p");
+      empty.className = "meta";
+      empty.textContent = "No files here yet.";
+      kidsEl.appendChild(empty);
+      return;
+    }
+    children.forEach(function (ch) { kidsEl.appendChild(makeFilesRow(ch)); });
+    var shown = offset + children.length;
+    if (resp && typeof resp.total === "number" && resp.total > shown) {
+      var more = document.createElement("button");
+      more.type = "button";
+      more.className = "ghost small";
+      more.textContent = "Show more (" + shown + " of " + resp.total + ")";
+      more.addEventListener("click", async function () {
+        more.remove();
+        await loadFilesLevel(kidsEl, prefix, shown);
+      });
+      kidsEl.appendChild(more);
+    }
+  }
+  document.getElementById("filesBrowseBtn").addEventListener("click", async function () {
+    var sel = document.getElementById("filesMachine");
+    if (!sel.value) { say("Load machines and pick one first."); return; }
+    fp.machineId = sel.value;
+    fp.machineName = sel.options[sel.selectedIndex] ? sel.options[sel.selectedIndex].textContent : sel.value;
+    fp.ticked = {}; fp.agg = {}; fp.pathsCache = {};
+    pendingFilesFetch = null;
+    document.getElementById("filesConfirmPanel").style.display = "none";
+    document.getElementById("filesFetchNote").textContent = "";
+    var tree = document.getElementById("filesTree");
+    while (tree.firstChild) tree.removeChild(tree.firstChild);
+    say("Browsing files on " + fp.machineName + ". The machine answers on its next poll, this can take a few seconds.");
+    try {
+      await loadFilesLevel(tree, "", 0);
+      document.getElementById("filesMoveName").value = "Files from " + fp.machineName;
+      renderFilesSelTotal();
+      say("Tick the exact files to fetch, then review the fetch.");
+    } catch (e) {
+      say("Browse failed: " + e.message);
+    }
+  });
+  async function expandFilesPaths(prefix) {
+    if (fp.pathsCache[prefix]) return fp.pathsCache[prefix];
+    var result = await queueAndWait(fp.machineId, "paths", { prefix: prefix });
+    var list = Array.isArray(result) ? result : ((result && result.paths) || []);
+    fp.pathsCache[prefix] = list;
+    return list;
+  }
+  document.getElementById("filesReview").addEventListener("click", async function () {
+    if (!fp.machineId) { say("Browse a machine first."); return; }
+    var ticked = filesSelPaths();
+    if (ticked.length === 0) { say("Tick at least one folder or file first."); return; }
+    say("Expanding the selection to the exact file list...");
+    try {
+      // Keep only the widest ticked paths: a ticked file inside a
+      // ticked folder is already covered by the folder.
+      var roots = ticked.filter(function (p) {
+        return !ticked.some(function (o) { return o !== p && (p === o || p.indexOf(o + "/") === 0); });
+      });
+      var seen = {}, paths = [], bytes = 0;
+      for (var i = 0; i < roots.length; i++) {
+        var root = roots[i];
+        var a = fp.agg[root] || { kind: "file", bytes: 0 };
+        bytes += a.bytes || 0;
+        if (a.kind === "file") {
+          if (!seen[root]) { seen[root] = true; paths.push(root); }
+        } else {
+          var expanded = await expandFilesPaths(root);
+          expanded.forEach(function (p) {
+            if (!seen[p]) { seen[p] = true; paths.push(p); }
+          });
+        }
+      }
+      pendingFilesFetch = { paths: paths, count: paths.length, bytes: bytes };
+      var name = document.getElementById("filesMoveName").value.trim() || ("Files from " + fp.machineName);
+      document.getElementById("filesConfirmText").textContent =
+        "Fetch '" + name + "' from " + fp.machineName + ": " +
+        pendingFilesFetch.count + " files, " + fmtBytes(pendingFilesFetch.bytes) +
+        ". Check this list, then confirm. Nothing moves until you confirm. " +
+        "Confirming queues a signed files-fetch command with exactly this file list.";
+      var listEl = document.getElementById("filesConfirmList");
+      while (listEl.firstChild) listEl.removeChild(listEl.firstChild);
+      paths.forEach(function (p) {
+        var line = document.createElement("div");
+        line.textContent = p;
+        listEl.appendChild(line);
+      });
+      document.getElementById("filesConfirmPanel").style.display = "block";
+      say("");
+    } catch (e) {
+      say("Could not expand the selection: " + e.message);
+    }
+  });
+  document.getElementById("filesCancelFetch").addEventListener("click", function () {
+    document.getElementById("filesConfirmPanel").style.display = "none";
+    pendingFilesFetch = null;
+  });
+  document.getElementById("filesConfirmFetch").addEventListener("click", async function () {
+    if (!pendingFilesFetch) return;
+    var name = document.getElementById("filesMoveName").value.trim() || ("Files from " + fp.machineName);
+    var res = await machineApi(fp.machineId, "files-fetch", {
+      accountId: accountId(),
+      moveName: name,
+      paths: pendingFilesFetch.paths
+    });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) { say("Fetch failed: " + (data.message || data.error || res.status)); return; }
+    document.getElementById("filesConfirmPanel").style.display = "none";
+    var note = "Signed files-fetch command queued for " + fp.machineName +
+      " (command " + data.commandId + "). Move '" + name + "' covers the " +
+      pendingFilesFetch.count + " files you confirmed. " +
+      "The Viewer app assembles downloads from this move; this browser never holds the account key.";
+    document.getElementById("filesFetchNote").textContent = note;
+    say(note);
+    pendingFilesFetch = null;
+    loadFilesLedger();
+  });
+  async function loadFilesLedger() {
+    var el = document.getElementById("filesLedger");
+    try {
+      var res = await apiGet("/mover/console/api/files-ledger");
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+      var records = data.records || [];
+      if (records.length === 0) {
+        el.innerHTML = '<p class="meta">No file transfers recorded yet.</p>';
+        return;
+      }
+      var html = "<table><tr><th>When</th><th>Machine</th><th>Direction</th><th>Path</th><th>Size</th><th>Outcome</th></tr>";
+      records.forEach(function (rec) {
+        html += "<tr><td>" + esc(rec.at) + "</td><td>" + esc(rec.machineId) +
+          "</td><td>" + pill(rec.direction || "", rec.direction === "download" ? "ok" : "warn") +
+          "</td><td>" + esc(rec.path) + "</td><td>" + esc(fmtBytes(rec.size || 0)) +
+          "</td><td>" + esc(rec.outcome) + "</td></tr>";
+      });
+      html += "</table>";
+      el.innerHTML = html;
+    } catch (e) {
+      el.innerHTML = '<p class="meta">Could not load the ledger: ' + esc(e.message) + "</p>";
+    }
+  }
+  document.getElementById("filesLedgerRefresh").addEventListener("click", loadFilesLedger);
 
   refreshLicenses();
   loadOverview();
@@ -2699,6 +3044,134 @@ export async function moverConsoleRoutes(
   app.get("/mover/console/view/:machineId", async (request, reply) => {
     if (!gate(request, reply)) return;
     return reply.header("content-type", "text/html").send(VIEW_VIEWER_HTML);
+  });
+
+  // ----------------------------------------------------------------
+  // Files door operator API. Same console gate and account scoping
+  // as the desk and view families. files-browse is read-only and
+  // ungated, like browse and scan. files-fetch and files-push are
+  // signed at queue time by the store, and queueing either is
+  // license gated: a revoked license for the account answers 403
+  // before anything is queued. files-fetch carries the exact
+  // concrete file list the operator confirmed (the server-side
+  // confirm rule: no confirmed list, no fetch).
+  // ----------------------------------------------------------------
+
+  /** True when a files queue may proceed for this account. */
+  function filesLicenseGate(reply: FastifyReply, acc: string): boolean {
+    if (!licenseStore) return true;
+    if (!licenseStore.hasRevoked(acc)) return true;
+    reply.code(403).send({
+      error: "LICENSE_REVOKED",
+      message:
+        "This account has a revoked license, so file fetches and pushes are blocked. Restore the license in the console to allow them again."
+    });
+    return false;
+  }
+
+  app.post(
+    "/mover/console/api/machines/:machineId/files-browse",
+    async (request, reply) => {
+      if (!gate(request, reply)) return;
+      const st = needStore(reply);
+      if (!st) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const acc = consoleAccountId(reply, body, null);
+      if (!acc) return;
+      const payload: Record<string, unknown> = {
+        prefix: typeof body.prefix === "string" ? body.prefix : ""
+      };
+      if (typeof body.offset === "number" && Number.isFinite(body.offset)) {
+        payload.offset = body.offset;
+      }
+      if (typeof body.limit === "number" && Number.isFinite(body.limit)) {
+        payload.limit = body.limit;
+      }
+      const params = request.params as { machineId: string };
+      return queueFor(reply, st, acc, params.machineId, "files-browse", payload);
+    }
+  );
+
+  app.post(
+    "/mover/console/api/machines/:machineId/files-fetch",
+    { bodyLimit: 64 * 1024 * 1024 },
+    async (request, reply) => {
+      if (!gate(request, reply)) return;
+      const st = needStore(reply);
+      if (!st) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const acc = consoleAccountId(reply, body, null);
+      if (!acc) return;
+      // The operator-verification rule, enforced server-side: a
+      // fetch names the exact confirmed files. No list, no fetch.
+      const paths = body.paths;
+      if (
+        !Array.isArray(paths) ||
+        paths.length === 0 ||
+        paths.some((p) => typeof p !== "string" || p === "")
+      ) {
+        return reply.code(400).send({
+          error: "EMPTY_SELECTION",
+          message:
+            "A fetch names the exact confirmed files: at least one file path the operator confirmed. Nothing is queued without that list."
+        });
+      }
+      if (!filesLicenseGate(reply, acc)) return;
+      const moveName =
+        typeof body.moveName === "string" && body.moveName !== ""
+          ? body.moveName
+          : "Files fetch";
+      const params = request.params as { machineId: string };
+      const cmd = isValidHeadlessMachineId(params.machineId)
+        ? st.queueHeadlessCommand(acc, params.machineId, "files-fetch", {
+            moveName,
+            paths
+          })
+        : undefined;
+      if (!cmd) return machineNotFound(reply);
+      return { commandId: cmd.id, signature: cmd.signature };
+    }
+  );
+
+  app.post(
+    "/mover/console/api/machines/:machineId/files-push",
+    async (request, reply) => {
+      if (!gate(request, reply)) return;
+      const st = needStore(reply);
+      if (!st) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const acc = consoleAccountId(reply, body, null);
+      if (!acc) return;
+      if (
+        typeof body.moveId !== "string" ||
+        body.moveId === "" ||
+        typeof body.destDir !== "string" ||
+        body.destDir === ""
+      ) {
+        return reply.code(400).send({
+          error: "BAD_FILES_PAYLOAD",
+          message:
+            "A push needs a moveId and a destDir, both as non-empty strings."
+        });
+      }
+      if (!filesLicenseGate(reply, acc)) return;
+      const params = request.params as { machineId: string };
+      const cmd = isValidHeadlessMachineId(params.machineId)
+        ? st.queueHeadlessCommand(acc, params.machineId, "files-push", {
+            moveId: body.moveId,
+            destDir: body.destDir
+          })
+        : undefined;
+      if (!cmd) return machineNotFound(reply);
+      return { commandId: cmd.id, signature: cmd.signature };
+    }
+  );
+
+  app.get("/mover/console/api/files-ledger", async (request, reply) => {
+    if (!gate(request, reply)) return;
+    const st = needStore(reply);
+    if (!st) return;
+    return { records: st.listAllFilesLedger(knownAccounts()) };
   });
 }
 

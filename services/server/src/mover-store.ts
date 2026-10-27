@@ -60,8 +60,9 @@ export interface MoveMeta {
 // user. A machine enrolls once per account and receives a per-machine
 // secret; after that it authenticates with X-Machine-Id +
 // X-Machine-Secret. The console queues commands (scan, browse, paths,
-// start); the machine polls for them, executes, and posts results
-// back. "start" commands are SIGNED with the machine's secret (see
+// start, files-browse, files-fetch, files-push); the machine polls
+// for them, executes, and posts results back. "start", "files-fetch"
+// and "files-push" commands are SIGNED with the machine's secret (see
 // headlessCommandSignature) so a start exists only because an
 // operator clicked it in the console — never zero-touch.
 //
@@ -144,13 +145,32 @@ export interface HeadlessCommand {
   id: string;
   account: string;
   machineId: string;
-  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end
+  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | files-browse | files-fetch | files-push
   payload: Record<string, unknown>;
-  signature?: string; // set for "start", "desk-end" and "view-end" commands
+  signature?: string; // set for "start", "desk-end", "view-end", "files-fetch" and "files-push" commands
   createdAt: string; // RFC3339 UTC
   status: "pending" | "delivered" | "done";
   result?: unknown;
   resultAt?: string; // RFC3339 UTC
+}
+
+/**
+ * One entry in the Files transfer ledger: a single file a machine
+ * reports moving under a files-fetch or files-push command. The
+ * record is the server's fold of the machine's own report entry
+ * ({ direction, path, size, outcome }) plus who reported it and
+ * when the server received the report ("at", RFC3339 UTC). The
+ * ledger is held in memory, like presence and the session
+ * ledgers: a restart clears it and new transfers refill it.
+ */
+export interface FilesTransferRecord {
+  accountId: string;
+  machineId: string;
+  direction: string;
+  path: string;
+  size: number;
+  outcome: string;
+  at: string; // RFC3339 UTC, server receipt time
 }
 
 /** A machine reads as online when seen within this window. */
@@ -291,6 +311,7 @@ export class MoverStore {
     Map<string, HeadlessMachineRecord>
   >();
   private headlessCommands = new Map<string, HeadlessCommand>();
+  private filesTransfers: FilesTransferRecord[] = [];
   private sweepTimer?: NodeJS.Timeout;
 
   constructor(config: MoverCloudConfig = loadMoverConfig()) {
@@ -561,11 +582,65 @@ export class MoverStore {
   }
 
   /**
-   * Queue a command for a machine. "start", "desk-end" and
-   * "view-end" commands are signed with the machine's secret at
-   * queue time, so each exists only because an operator on an
-   * account channel queued it; the engine refuses any of them
-   * without a valid signature.
+   * Fold one files-fetch or files-push result's transfer entries
+   * into the per-account Files ledger. Each entry is the engine's
+   * own words: { direction, path, size, outcome }. Entries with
+   * no usable path are skipped; the rest are stamped with the
+   * account, the reporting machine and the server receipt time.
+   * Heartbeats never carry transfers: results only. Returns how
+   * many entries were folded.
+   */
+  noteFilesTransfers(
+    account: string,
+    machineId: string,
+    transfers: unknown
+  ): number {
+    if (!Array.isArray(transfers)) return 0;
+    let folded = 0;
+    for (const entry of transfers) {
+      if (typeof entry !== "object" || entry === null) continue;
+      const e = entry as Record<string, unknown>;
+      if (typeof e.path !== "string" || e.path === "") continue;
+      this.filesTransfers.push({
+        accountId: account,
+        machineId,
+        direction: typeof e.direction === "string" ? e.direction : "",
+        path: e.path,
+        size:
+          typeof e.size === "number" && Number.isFinite(e.size)
+            ? e.size
+            : 0,
+        outcome: typeof e.outcome === "string" ? e.outcome : "",
+        at: rfc3339Now()
+      });
+      folded++;
+    }
+    return folded;
+  }
+
+  /** This account's Files ledger, newest first. */
+  listFilesLedger(account: string): FilesTransferRecord[] {
+    return this.filesTransfers
+      .filter((r) => r.accountId === account)
+      .map((r) => ({ ...r }))
+      .reverse();
+  }
+
+  /** The Files ledger across the given accounts, newest first. */
+  listAllFilesLedger(accounts: string[]): FilesTransferRecord[] {
+    const wanted = new Set(accounts);
+    return this.filesTransfers
+      .filter((r) => wanted.has(r.accountId))
+      .map((r) => ({ ...r }))
+      .reverse();
+  }
+
+  /**
+   * Queue a command for a machine. "start", "desk-end",
+   * "view-end", "files-fetch" and "files-push" commands are
+   * signed with the machine's secret at queue time, so each
+   * exists only because an operator on an account channel queued
+   * it; the engine refuses any of them without a valid signature.
    * Undefined when the machine is not enrolled under this account.
    */
   queueHeadlessCommand(
@@ -585,7 +660,13 @@ export class MoverStore {
       createdAt: rfc3339Now(),
       status: "pending"
     };
-    if (type === "start" || type === "desk-end" || type === "view-end") {
+    if (
+      type === "start" ||
+      type === "desk-end" ||
+      type === "view-end" ||
+      type === "files-fetch" ||
+      type === "files-push"
+    ) {
       cmd.signature = headlessCommandSignature(rec.secret, cmd);
     }
     this.headlessCommands.set(cmd.id, cmd);
@@ -699,6 +780,16 @@ export class MoverStore {
         if (typeof frames === "number" && frames > cur.framesServed) {
           cur.framesServed = Math.floor(frames);
         }
+      }
+    }
+    // Files results feed the transfer ledger: a files-fetch or
+    // files-push result carrying a "transfers" array folds each
+    // entry into the account's ledger (see noteFilesTransfers).
+    if (cmd.type === "files-fetch" || cmd.type === "files-push") {
+      const transfers = (result as { transfers?: unknown } | null)
+        ?.transfers;
+      if (Array.isArray(transfers)) {
+        this.noteFilesTransfers(account, machineId, transfers);
       }
     }
     return true;

@@ -16,6 +16,10 @@
 //     heartbeat, console machine list (account-scoped, no secret),
 //     scan/browse/paths command queueing and clearing, result storage,
 //     signed start commands (HMAC recomputed in the test),
+//   * files door: files-browse queueing, the signed files-fetch and
+//     files-push commands (HMAC recomputed in the test), the
+//     server-side confirm rule for fetches, the transfer ledger a
+//     files result folds into, and license gating on fetch/push,
 //     ready build is ONE exe with the config inbuilt (base exe bytes a
 //     strict prefix, overlay tail parses back to the exact config),
 //     the merged artifact boots paired in an empty dir (config=inbuilt,
@@ -1403,6 +1407,320 @@ async function main() {
         !viewHtml.includes("view-input") &&
         !viewHtml.includes("desk-input"),
       viewHtml.slice(0, 120)
+    );
+
+    // ---- Files door (files) ---------------------------------------
+    console.log("files door (files)");
+    check(
+      "generated pair configs carry the files block (enabled, empty downloadDir)",
+      moverCfg.cfg.files?.enabled === true &&
+        moverCfg.cfg.files?.downloadDir === "" &&
+        moverCfg.cfg.messages?.filesTitle === "Files" &&
+        moverCfg.cfg.messages?.filesDisabled ===
+          "Files is turned off on this machine." &&
+        moverCfg.cfg.messages?.filesEmpty === "No files here yet." &&
+        moverCfg.cfg.messages?.filesBrowse === "Browse files" &&
+        moverCfg.cfg.messages?.filesDownload === "Download" &&
+        moverCfg.cfg.messages?.filesUpload === "Upload" &&
+        moverCfg.cfg.messages?.filesFetchConfirm ===
+          "Check this list, then confirm. Nothing moves until you confirm." &&
+        moverCfg.cfg.messages?.filesPushDone ===
+          "File written to the machine.",
+      JSON.stringify(moverCfg.cfg.files ?? {})
+    );
+    check(
+      "console page carries the ADMIN Files panel with its ledger",
+      html.includes('id="filesMachine"') &&
+        html.includes('id="filesBrowseBtn"') &&
+        html.includes('id="filesReview"') &&
+        html.includes('id="filesConfirmFetch"') &&
+        html.includes('id="filesLedger"') &&
+        html.includes("/mover/console/api/files-ledger") &&
+        html.includes("Upload runs from the Viewer app only") &&
+        html.includes("showFilesFor"),
+      ""
+    );
+    const FILES_MID = "files-host-01";
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": HL_ACC, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: FILES_MID,
+        name: "FILES-HOST",
+        os: "Windows 11 Pro",
+        profiles: ["USER"],
+        capabilities: { desktop: true, files: true }
+      })
+    });
+    const filesEnrolled = await r.json();
+    check(
+      "files host enrolls with the files capability",
+      r.status === 200 &&
+        /^[0-9a-f]{64}$/.test(filesEnrolled.machineSecret ?? ""),
+      JSON.stringify(filesEnrolled)
+    );
+    const FSECRET = filesEnrolled.machineSecret;
+    const FAUTH = {
+      "x-account-id": HL_ACC,
+      "x-machine-id": FILES_MID,
+      "x-machine-secret": FSECRET
+    };
+    const queueFiles = async (action, body, acct = HL_ACC) => {
+      const res = await fetch(
+        `${a}/mover/console/api/machines/${FILES_MID}/${action}`,
+        {
+          method: "POST",
+          headers: KH,
+          body: JSON.stringify({ accountId: acct, ...body })
+        }
+      );
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    const pollFiles = async () =>
+      ((await (await fetch(`${a}/api/headless/commands`, { headers: FAUTH })).json())
+        .commands ?? []);
+    const postFilesResult = (commandId, result) =>
+      fetch(`${a}/api/headless/commands/${commandId}/result`, {
+        method: "POST",
+        headers: { ...FAUTH, "content-type": "application/json" },
+        body: JSON.stringify({ result })
+      });
+
+    const fbrowseQ = await queueFiles("files-browse", {
+      prefix: "docs",
+      offset: 0,
+      limit: 50
+    });
+    check(
+      "console files-browse queues a command",
+      fbrowseQ.status === 200 &&
+        /^cmd-[0-9a-f]{20}$/.test(fbrowseQ.data.commandId ?? ""),
+      JSON.stringify(fbrowseQ.data)
+    );
+    const fwire1 = await pollFiles();
+    check(
+      "files-browse arrives unsigned with its payload",
+      fwire1.length === 1 &&
+        fwire1[0].id === fbrowseQ.data.commandId &&
+        fwire1[0].type === "files-browse" &&
+        fwire1[0].payload?.prefix === "docs" &&
+        fwire1[0].payload?.offset === 0 &&
+        fwire1[0].payload?.limit === 50 &&
+        !("signature" in fwire1[0]),
+      JSON.stringify(fwire1).slice(0, 200)
+    );
+
+    const ffetchEmpty = await queueFiles("files-fetch", {
+      moveName: "Files from FILES-HOST",
+      paths: []
+    });
+    check(
+      "files-fetch with empty paths -> 400 EMPTY_SELECTION",
+      ffetchEmpty.status === 400 &&
+        ffetchEmpty.data.error === "EMPTY_SELECTION",
+      JSON.stringify(ffetchEmpty.data)
+    );
+    const ffetchNonList = await queueFiles("files-fetch", {
+      moveName: "Files from FILES-HOST",
+      paths: "docs/a.txt"
+    });
+    check(
+      "files-fetch with a non-list paths -> 400 EMPTY_SELECTION",
+      ffetchNonList.status === 400 &&
+        ffetchNonList.data.error === "EMPTY_SELECTION",
+      JSON.stringify(ffetchNonList.data)
+    );
+    const fpushBad = await queueFiles("files-push", {
+      moveId: "move-files-1"
+    });
+    check(
+      "files-push with missing destDir -> 400 BAD_FILES_PAYLOAD",
+      fpushBad.status === 400 && fpushBad.data.error === "BAD_FILES_PAYLOAD",
+      JSON.stringify(fpushBad.data)
+    );
+
+    const fetchPayload = {
+      moveName: "Files from FILES-HOST",
+      paths: ["docs/a.txt", "docs/b.bin"]
+    };
+    const ffetchQ = await queueFiles("files-fetch", fetchPayload);
+    check(
+      "console files-fetch queues a signed command",
+      ffetchQ.status === 200 &&
+        /^[0-9a-f]{64}$/.test(ffetchQ.data.signature ?? ""),
+      JSON.stringify(ffetchQ.data)
+    );
+    const fwire2 = await pollFiles();
+    const ffetchCmd = fwire2.find((c) => c.id === ffetchQ.data.commandId);
+    const expectedFetchSig = createHmac("sha256", FSECRET)
+      .update(
+        JSON.stringify(
+          canon({
+            id: ffetchQ.data.commandId,
+            type: "files-fetch",
+            payload: fetchPayload
+          })
+        )
+      )
+      .digest("hex");
+    check(
+      "files-fetch signature verifies against canonical JSON + machine secret",
+      !!ffetchCmd &&
+        ffetchCmd.type === "files-fetch" &&
+        ffetchCmd.signature === expectedFetchSig &&
+        ffetchCmd.signature === ffetchQ.data.signature,
+      JSON.stringify(ffetchCmd)
+    );
+
+    const pushPayload = { moveId: "move-files-1", destDir: "C:/Incoming" };
+    const fpushQ = await queueFiles("files-push", pushPayload);
+    check(
+      "console files-push queues a signed command",
+      fpushQ.status === 200 &&
+        /^[0-9a-f]{64}$/.test(fpushQ.data.signature ?? ""),
+      JSON.stringify(fpushQ.data)
+    );
+    const fwire3 = await pollFiles();
+    const fpushCmd = fwire3.find((c) => c.id === fpushQ.data.commandId);
+    const expectedPushSig = createHmac("sha256", FSECRET)
+      .update(
+        JSON.stringify(
+          canon({
+            id: fpushQ.data.commandId,
+            type: "files-push",
+            payload: pushPayload
+          })
+        )
+      )
+      .digest("hex");
+    check(
+      "files-push signature verifies against canonical JSON + machine secret",
+      !!fpushCmd &&
+        fpushCmd.type === "files-push" &&
+        fpushCmd.signature === expectedPushSig &&
+        fpushCmd.signature === fpushQ.data.signature,
+      JSON.stringify(fpushCmd)
+    );
+
+    r = await postFilesResult(ffetchQ.data.commandId, {
+      transfers: [
+        { direction: "download", path: "docs/a.txt", size: 5, outcome: "ok" },
+        { direction: "download", path: "docs/b.bin", size: 7, outcome: "ok" }
+      ]
+    });
+    check("files-fetch result with transfers posts", r.status === 200);
+    r = await fetch(`${a}/mover/console/api/files-ledger`);
+    check("files-ledger without key -> 404", r.status === 404);
+    r = await fetch(`${a}/mover/console/api/files-ledger`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const ledger = await r.json();
+    check(
+      "files-fetch transfers fold into the ledger (newest first, full record shape)",
+      r.status === 200 &&
+        ledger.records?.length === 2 &&
+        ledger.records[0].path === "docs/b.bin" &&
+        ledger.records[0].direction === "download" &&
+        ledger.records[0].size === 7 &&
+        ledger.records[0].outcome === "ok" &&
+        ledger.records[0].machineId === FILES_MID &&
+        ledger.records[0].accountId === HL_ACC &&
+        typeof ledger.records[0].at === "string" &&
+        ledger.records[1].path === "docs/a.txt" &&
+        ledger.records[1].size === 5 &&
+        ledger.records[1].machineId === FILES_MID,
+      JSON.stringify(ledger).slice(0, 300)
+    );
+
+    // License gating: revoke the test account (all products), and
+    // fetch/push queueing must block while browse stays open;
+    // restoring every license reopens the fetch.
+    const FILES_REVOKED_ACC = "mv67c7c1a8916a988e0000";
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: {
+        "x-account-id": FILES_REVOKED_ACC,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        machineId: FILES_MID,
+        name: "FILES-HOST-ASSISTANT",
+        capabilities: { files: true }
+      })
+    });
+    check(
+      "files machine enrolls under the test account before revoking",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    const licChangeFiles = async (action, product) => {
+      const res = await fetch(`${a}/mover/console/api/licenses/${action}`, {
+        method: "POST",
+        headers: KH,
+        body: JSON.stringify({ product, accountId: FILES_REVOKED_ACC })
+      });
+      return res.status;
+    };
+    const revokeCodes = [];
+    for (const p of ["ext", "mover", "admin"]) {
+      revokeCodes.push(await licChangeFiles("revoke", p));
+    }
+    check(
+      "test account licenses revoked for all products (files gate setup)",
+      revokeCodes.every((s) => s === 200),
+      JSON.stringify(revokeCodes)
+    );
+    const fbrowseRevoked = await queueFiles(
+      "files-browse",
+      { prefix: "docs" },
+      FILES_REVOKED_ACC
+    );
+    check(
+      "files-browse stays ungated for a revoked account (read only)",
+      fbrowseRevoked.status === 200 && !!fbrowseRevoked.data.commandId,
+      JSON.stringify(fbrowseRevoked.data)
+    );
+    const ffetchRevoked = await queueFiles(
+      "files-fetch",
+      fetchPayload,
+      FILES_REVOKED_ACC
+    );
+    check(
+      "files-fetch for a revoked account -> 403 LICENSE_REVOKED",
+      ffetchRevoked.status === 403 &&
+        ffetchRevoked.data.error === "LICENSE_REVOKED",
+      JSON.stringify(ffetchRevoked.data)
+    );
+    const fpushRevoked = await queueFiles(
+      "files-push",
+      pushPayload,
+      FILES_REVOKED_ACC
+    );
+    check(
+      "files-push for a revoked account -> 403 LICENSE_REVOKED",
+      fpushRevoked.status === 403 &&
+        fpushRevoked.data.error === "LICENSE_REVOKED",
+      JSON.stringify(fpushRevoked.data)
+    );
+    const restoreCodes = [];
+    for (const p of ["ext", "mover", "admin"]) {
+      restoreCodes.push(await licChangeFiles("restore", p));
+    }
+    check(
+      "test account licenses restored for all products",
+      restoreCodes.every((s) => s === 200),
+      JSON.stringify(restoreCodes)
+    );
+    const ffetchReopened = await queueFiles(
+      "files-fetch",
+      fetchPayload,
+      FILES_REVOKED_ACC
+    );
+    check(
+      "files-fetch queues again once the licenses are restored",
+      ffetchReopened.status === 200 &&
+        /^[0-9a-f]{64}$/.test(ffetchReopened.data.signature ?? ""),
+      JSON.stringify(ffetchReopened.data)
     );
 
     // ---- Licenses, unified console, host + viewer builds ---------

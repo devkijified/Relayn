@@ -17,8 +17,10 @@
 //
 //   GET   /api/headless/machines                 this account's machines
 //   POST  /api/headless/commands                 queue a command (X-Machine-Id
-//                                                names the target; "start"
-//                                                and "desk-end" are signed
+//                                                names the target; "start",
+//                                                "desk-end", "view-end",
+//                                                "files-fetch" and
+//                                                "files-push" are signed
 //                                                by the store at queue time)
 //   GET   /api/headless/commands/:id             one command's state + result
 //
@@ -41,9 +43,17 @@
 //   browse  { prefix, offset?, limit? }           result: the app browse response
 //   paths   { prefix }                            result: { prefix, paths: [...] }
 //   start   { moveName, paths: [concrete paths] } (signed)
+//   files-browse { prefix, offset?, limit? }      result: the app browse response, with modTime on each child
+//   files-fetch  { moveName, paths: [concrete files] } (signed)
+//   files-push   { moveId, destDir }              (signed)
 // Scan/browse/paths results are the engine's own app shapes (the same
 // JSON its local /api/inventory endpoints produce), passed through
 // untouched so the console renders them like the app does.
+// A files-fetch or files-push result may carry a "transfers" array
+// of { direction, path, size, outcome }: the store folds each entry
+// into the account's Files transfer ledger (see mover-store.ts:
+// noteFilesTransfers), stamped with the server receipt time.
+// Heartbeats never carry transfers; results only.
 //
 // Wiring (index.ts):
 //   import { headlessRoutes } from "./mover-headless.js";
@@ -201,8 +211,9 @@ export async function headlessRoutes(
   // Operator channel (account header only; NO machine secret):
   // this is how the console and the RelaynAdminViewer app drive
   // machines. It can list the account's machines, queue a command
-  // for one (the store signs "start", "desk-end" and "view-end"
-  // with the machine's secret server-side, so those commands exist only
+  // for one (the store signs "start", "desk-end", "view-end",
+  // "files-fetch" and "files-push" with the machine's secret
+  // server-side, so those commands exist only
   // because an operator queued them here), and read a command
   // back. The machine channel above deliberately has NO enqueue
   // route: a machine can poll and post results, never command
@@ -287,6 +298,10 @@ export async function headlessRoutes(
   // ------------------------------------------------------------------
   // Command result: body is { result: ... } (a bare body is stored
   // as-is). The console reads it back through its result endpoint.
+  // Storing a result also folds it where the store keeps ledgers:
+  // desk and view results feed their session ledgers, and a
+  // files-fetch or files-push result's "transfers" array folds
+  // into the Files transfer ledger (mover-store.ts).
   // ------------------------------------------------------------------
   app.post(
     "/api/headless/commands/:id/result",
