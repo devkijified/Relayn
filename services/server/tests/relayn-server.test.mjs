@@ -735,6 +735,40 @@ async function main() {
       r.status === 200 && (await r.json()).machines?.length === 0
     );
 
+    // Run mode: the guard reports how it is hosted (the planted
+    // service vs a temporary foreground copy) and the fold +
+    // the view carry it, so the viewers can name the mode and
+    // its limits instead of guessing why a machine went quiet.
+    r = await beat(MAUTH, { state: "idle", runMode: "foreground" });
+    const beatOk = r.status === 200;
+    r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const rmList = await r.json();
+    check(
+      "run mode folds from heartbeat into the machines list",
+      beatOk &&
+        rmList.machines?.length === 1 &&
+        rmList.machines[0].runMode === "foreground",
+      JSON.stringify(rmList).slice(0, 200)
+    );
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": "runmodeacc01", "content-type": "application/json" },
+      body: JSON.stringify({ machineId: "hl-norunmode", name: "OLD-ENGINE", runMode: "service" })
+    });
+    const rmEnrolled = r.status === 200 ? await r.json() : {};
+    r = await fetch(`${a}/mover/console/api/machines?accountId=runmodeacc01`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const rmList2 = await r.json();
+    const rmRow = (rmList2.machines ?? []).find((m) => m.machineId === "hl-norunmode");
+    check(
+      "run mode folds from enroll into the machines list",
+      !!rmEnrolled.machineSecret && !!rmRow && rmRow.runMode === "service",
+      JSON.stringify(rmRow ?? {}).slice(0, 200)
+    );
+
     r = await fetch(`${a}/mover/console/api/machines/${HL_MID}/scan`, {
       method: "POST",
       headers: KH,

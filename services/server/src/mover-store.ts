@@ -87,6 +87,7 @@ export interface HeadlessMachineRecord {
   deskSession: DeskSessionRecord | null; // Background Admin ledger
   viewSession: ViewSessionRecord | null; // View Screen ledger
   interactiveUser: string; // who is signed in at the console ("" = nobody)
+  runMode: string; // how the guard is hosted: "service" | "foreground" | "" (unreported)
 }
 
 /**
@@ -139,6 +140,7 @@ export interface HeadlessMachineView {
   deskSession: DeskSessionRecord | null;
   viewSession: ViewSessionRecord | null;
   interactiveUser: string;
+  runMode: string;
 }
 
 export interface HeadlessCommand {
@@ -235,7 +237,8 @@ function headlessMachineView(
     progress: rec.progress,
     deskSession: rec.deskSession,
     viewSession: rec.viewSession,
-    interactiveUser: rec.interactiveUser
+    interactiveUser: rec.interactiveUser,
+    runMode: rec.runMode
   };
 }
 
@@ -385,6 +388,7 @@ export class MoverStore {
       profiles: unknown;
       capabilities: unknown;
       interactiveUser?: unknown;
+      runMode?: unknown;
     }
   ): HeadlessMachineRecord {
     const rec: HeadlessMachineRecord = {
@@ -403,7 +407,8 @@ export class MoverStore {
       deskSession: null,
       viewSession: null,
       interactiveUser:
-        typeof init.interactiveUser === "string" ? init.interactiveUser : ""
+        typeof init.interactiveUser === "string" ? init.interactiveUser : "",
+      runMode: typeof init.runMode === "string" ? init.runMode : ""
     };
     let byId = this.headlessMachines.get(account);
     if (!byId) {
@@ -476,6 +481,7 @@ export class MoverStore {
       desk?: unknown;
       view?: unknown;
       interactiveUser?: unknown;
+      runMode?: unknown;
     }
   ): boolean {
     const rec = this.getHeadlessMachine(account, machineId);
@@ -486,6 +492,9 @@ export class MoverStore {
     if ("progress" in beat) rec.progress = beat.progress;
     if (typeof beat.interactiveUser === "string") {
       rec.interactiveUser = beat.interactiveUser;
+    }
+    if (typeof beat.runMode === "string") {
+      rec.runMode = beat.runMode;
     }
     if (beat.desk !== undefined && beat.desk !== null) {
       this.noteDeskReport(rec, beat.desk);

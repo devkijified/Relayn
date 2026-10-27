@@ -166,6 +166,7 @@ export async function headlessRoutes(
         profiles?: unknown;
         capabilities?: unknown;
         interactiveUser?: unknown;
+        runMode?: unknown;
       };
       if (!isValidHeadlessMachineId(body.machineId)) {
         return reply.code(400).send({
@@ -179,7 +180,8 @@ export async function headlessRoutes(
         os: typeof body.os === "string" ? body.os : "",
         profiles: body.profiles ?? null,
         capabilities: body.capabilities ?? null,
-        interactiveUser: body.interactiveUser
+        interactiveUser: body.interactiveUser,
+        runMode: body.runMode
       });
       return { machineId: rec.machineId, machineSecret: rec.secret };
     }
@@ -202,6 +204,7 @@ export async function headlessRoutes(
       desk?: unknown;
       view?: unknown;
       interactiveUser?: unknown;
+      runMode?: unknown;
     };
     moverStore.heartbeatHeadless(found.acc, found.machine.machineId, body);
     return { ok: "true" };

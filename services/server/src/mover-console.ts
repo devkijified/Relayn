@@ -1925,7 +1925,11 @@ compiled in, nothing else to carry or place beside it.</p>
         esc(m.name || m.machineId) + "</strong> " + pill(m.online ? "online" : "offline", m.online ? "ok" : "mut") + "</div>" +
         '<div class="meta">' + esc(m.machineId) + " · state: " + esc(m.state || "idle") +
         " · signed in: " + esc(m.interactiveUser || "no one") +
+        (m.runMode ? " · run mode: " + esc(m.runMode === "foreground" ? "temporary (foreground)" : m.runMode) : "") +
         " · capabilities: " + esc(capNames.length ? capNames.join(", ") : "none reported") + "</div>" +
+        (m.runMode === "foreground"
+          ? '<div class="meta">Temporary mode: this guard stops when its window closes. Run the Host as administrator once to plant it permanently.</div>'
+          : "") +
         ledgerHtml("Background desktop", m.deskSession) +
         ledgerHtml("Screen view", m.viewSession) +
         '<div data-admin-actions="' + i + '"></div></div>';
