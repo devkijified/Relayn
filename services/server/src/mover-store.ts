@@ -31,6 +31,7 @@
 //   MOVER_MAX_CHUNK_MB      64    (per-chunk upload cap; 0 = no cap)
 // =========================================================================
 
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -52,6 +53,170 @@ export interface MoveMeta {
   chunks: number;
   status: string; // announced, sending, sent
   createdAt: string; // RFC3339 UTC
+}
+
+// -----------------------------------------------------------------
+// Headless machines: enrolled engines that run with NO signed-in
+// user. A machine enrolls once per account and receives a per-machine
+// secret; after that it authenticates with X-Machine-Id +
+// X-Machine-Secret. The console queues commands (scan, browse, paths,
+// start); the machine polls for them, executes, and posts results
+// back. "start" commands are SIGNED with the machine's secret (see
+// headlessCommandSignature) so a start exists only because an
+// operator clicked it in the console — never zero-touch.
+//
+// Headless state is held IN MEMORY, exactly like presence above: a
+// server restart clears enrollments, queued commands and results,
+// and machines simply re-enroll (the same recovery presence uses).
+// -----------------------------------------------------------------
+
+export interface HeadlessMachineRecord {
+  account: string;
+  machineId: string;
+  name: string;
+  os: string;
+  profiles: unknown; // as enrolled (engine-defined, typically names)
+  capabilities: unknown; // as enrolled, e.g. { desktop: true }
+  secret: string;
+  enrolledAt: string; // RFC3339 UTC
+  lastSeenMs: number; // epoch ms of the last enroll/heartbeat
+  state: string; // engine-reported: idle, scanning, moving, ...
+  jobId: string; // engine-reported current job, "" when none
+  progress: unknown; // engine-reported progress for the current job
+  deskSession: DeskSessionRecord | null; // Background Admin ledger
+  viewSession: ViewSessionRecord | null; // View Screen ledger
+  interactiveUser: string; // who is signed in at the console ("" = nobody)
+}
+
+/**
+ * The Background Admin session ledger for one machine: the current
+ * or most recent private-desktop session. Fed by desk command
+ * results and heartbeat desk reports. "endedBy" is "admin" when
+ * the admin ended it from the viewer or console, "idle" when the
+ * engine's idle TTL ended it on its own.
+ */
+export interface DeskSessionRecord {
+  sessionId: string;
+  state: "live" | "ended";
+  openedAt: string; // RFC3339 UTC
+  endedAt?: string; // RFC3339 UTC
+  endedBy?: "admin" | "idle";
+  framesServed: number;
+}
+
+/**
+ * The View Screen session ledger: the desk ledger's twin for the
+ * view-only stream of the interactive desktop. Independent of
+ * the desk record in every way (a machine can hold both at once;
+ * each closes by its own end). "endedBy" adds "session-gone":
+ * the signed-in session ended under the view (logoff or a
+ * session switch), which the engine reports by heartbeat.
+ */
+export interface ViewSessionRecord {
+  sessionId: string;
+  state: "live" | "ended";
+  openedAt: string; // RFC3339 UTC
+  endedAt?: string; // RFC3339 UTC
+  endedBy?: "admin" | "idle" | "session-gone";
+  framesServed: number;
+  user?: string; // who is signed in and being viewed
+}
+
+/** The console-facing shape: everything except the secret. */
+export interface HeadlessMachineView {
+  machineId: string;
+  name: string;
+  os: string;
+  profiles: unknown;
+  capabilities: unknown;
+  enrolledAt: string;
+  lastSeen: string; // RFC3339 UTC
+  online: boolean;
+  state: string;
+  jobId: string;
+  progress: unknown;
+  deskSession: DeskSessionRecord | null;
+  viewSession: ViewSessionRecord | null;
+  interactiveUser: string;
+}
+
+export interface HeadlessCommand {
+  id: string;
+  account: string;
+  machineId: string;
+  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end
+  payload: Record<string, unknown>;
+  signature?: string; // set for "start", "desk-end" and "view-end" commands
+  createdAt: string; // RFC3339 UTC
+  status: "pending" | "delivered" | "done";
+  result?: unknown;
+  resultAt?: string; // RFC3339 UTC
+}
+
+/** A machine reads as online when seen within this window. */
+export const HEADLESS_ONLINE_MS = 30_000;
+
+const HEADLESS_MACHINE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+
+export function isValidHeadlessMachineId(input: unknown): input is string {
+  return typeof input === "string" && HEADLESS_MACHINE_ID_RE.test(input);
+}
+
+/**
+ * Canonical JSON: object keys sorted recursively, arrays in order,
+ * no whitespace — plain JSON.stringify of a key-sorted deep copy.
+ * The engine recomputes signatures over exactly this encoding.
+ */
+export function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "null";
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map((v) => canonicalJson(v)).join(",")}]`;
+  }
+  const rec = value as Record<string, unknown>;
+  const keys = Object.keys(rec).sort();
+  const parts = keys.map(
+    (k) => `${JSON.stringify(k)}:${canonicalJson(rec[k])}`
+  );
+  return `{${parts.join(",")}}`;
+}
+
+/**
+ * Command signature: HMAC-SHA256 (hex) over the canonical JSON of
+ * { id, type, payload }, keyed with the machine's secret.
+ */
+export function headlessCommandSignature(
+  secret: string,
+  cmd: { id: string; type: string; payload: unknown }
+): string {
+  return createHmac("sha256", secret)
+    .update(
+      canonicalJson({ id: cmd.id, type: cmd.type, payload: cmd.payload }),
+      "utf8"
+    )
+    .digest("hex");
+}
+
+function headlessMachineView(
+  rec: HeadlessMachineRecord
+): HeadlessMachineView {
+  return {
+    machineId: rec.machineId,
+    name: rec.name,
+    os: rec.os,
+    profiles: rec.profiles,
+    capabilities: rec.capabilities,
+    enrolledAt: rec.enrolledAt,
+    lastSeen: new Date(rec.lastSeenMs).toISOString().replace(/\.\d{3}Z$/, "Z"),
+    online: Date.now() - rec.lastSeenMs <= HEADLESS_ONLINE_MS,
+    state: rec.state,
+    jobId: rec.jobId,
+    progress: rec.progress,
+    deskSession: rec.deskSession,
+    viewSession: rec.viewSession,
+    interactiveUser: rec.interactiveUser
+  };
 }
 
 export interface MoverCloudConfig {
@@ -121,6 +286,11 @@ async function readFileJSON<T>(file: string): Promise<T | undefined> {
 export class MoverStore {
   readonly config: MoverCloudConfig;
   private machines = new Map<string, MoverMachine[]>();
+  private headlessMachines = new Map<
+    string,
+    Map<string, HeadlessMachineRecord>
+  >();
+  private headlessCommands = new Map<string, HeadlessCommand>();
   private sweepTimer?: NodeJS.Timeout;
 
   constructor(config: MoverCloudConfig = loadMoverConfig()) {
@@ -159,6 +329,388 @@ export class MoverStore {
 
   listMachines(account: string): MoverMachine[] {
     return this.machines.get(account) ?? [];
+  }
+
+  // -----------------------------------------------------------------
+  // Headless machines (in-memory, like presence: a restart clears
+  // enrollments, queued commands and results; machines re-enroll)
+  // -----------------------------------------------------------------
+
+  /**
+   * Enroll (or re-enroll) a machine: a fresh per-machine secret is
+   * generated and returned in the record; the caller hands it to the
+   * machine once. Re-enrolling the same machineId replaces the
+   * record and drops only its NEVER-DELIVERED commands
+   * (status "pending": queued, but not yet taken by a poll) — they
+   * were sealed for the old secret, and a "start" among them carries
+   * a signature the machine can no longer verify.
+   *
+   * Commands already delivered (status "delivered") are IN FLIGHT
+   * and survive re-enroll and secret rotation, together with their
+   * result slots: the engine re-enrolls after any 401 (e.g. a
+   * restart with a rotated secret) and must still be able to post
+   * the result of a command it is already executing — a resumed
+   * mid-flight job would otherwise lose its result channel. The
+   * engine dedups a start whose id matches its persisted job, so
+   * keeping delivered commands server-side is safe. Commands with a
+   * stored result (status "done") also survive.
+   */
+  enrollHeadlessMachine(
+    account: string,
+    init: {
+      machineId: string;
+      name: string;
+      os: string;
+      profiles: unknown;
+      capabilities: unknown;
+      interactiveUser?: unknown;
+    }
+  ): HeadlessMachineRecord {
+    const rec: HeadlessMachineRecord = {
+      account,
+      machineId: init.machineId,
+      name: init.name,
+      os: init.os,
+      profiles: init.profiles,
+      capabilities: init.capabilities,
+      secret: randomBytes(32).toString("hex"),
+      enrolledAt: rfc3339Now(),
+      lastSeenMs: Date.now(),
+      state: "idle",
+      jobId: "",
+      progress: null,
+      deskSession: null,
+      viewSession: null,
+      interactiveUser:
+        typeof init.interactiveUser === "string" ? init.interactiveUser : ""
+    };
+    let byId = this.headlessMachines.get(account);
+    if (!byId) {
+      byId = new Map();
+      this.headlessMachines.set(account, byId);
+    }
+    // The session ledgers survive a re-enroll (secret rotation
+    // must not erase how a session ended); the engine's next
+    // heartbeat refreshes them either way.
+    const prior = byId.get(init.machineId);
+    if (prior) {
+      rec.deskSession = prior.deskSession;
+      rec.viewSession = prior.viewSession;
+    }
+    byId.set(rec.machineId, rec);
+    // Drop ONLY never-delivered commands ("pending" here means
+    // queued and not yet taken by a poll). Delivered and done
+    // commands survive: see the doc comment above.
+    for (const [id, cmd] of this.headlessCommands) {
+      if (
+        cmd.account === account &&
+        cmd.machineId === rec.machineId &&
+        cmd.status === "pending"
+      ) {
+        this.headlessCommands.delete(id);
+      }
+    }
+    return rec;
+  }
+
+  getHeadlessMachine(
+    account: string,
+    machineId: string
+  ): HeadlessMachineRecord | undefined {
+    return this.headlessMachines.get(account)?.get(machineId);
+  }
+
+  /** Constant-time secret check; undefined when machine or secret fails. */
+  verifyHeadlessMachine(
+    account: string,
+    machineId: string,
+    secret: string
+  ): HeadlessMachineRecord | undefined {
+    const rec = this.getHeadlessMachine(account, machineId);
+    if (!rec) return undefined;
+    const given = Buffer.from(secret, "utf8");
+    const held = Buffer.from(rec.secret, "utf8");
+    if (given.length !== held.length || !timingSafeEqual(given, held)) {
+      return undefined;
+    }
+    return rec;
+  }
+
+  listHeadlessMachines(account: string): HeadlessMachineView[] {
+    const byId = this.headlessMachines.get(account);
+    if (!byId) return [];
+    return [...byId.values()]
+      .sort((a, b) => (a.machineId < b.machineId ? -1 : 1))
+      .map(headlessMachineView);
+  }
+
+  /** Heartbeat: always refreshes lastSeen; fields update when present. */
+  heartbeatHeadless(
+    account: string,
+    machineId: string,
+    beat: {
+      state?: unknown;
+      jobId?: unknown;
+      progress?: unknown;
+      desk?: unknown;
+      view?: unknown;
+      interactiveUser?: unknown;
+    }
+  ): boolean {
+    const rec = this.getHeadlessMachine(account, machineId);
+    if (!rec) return false;
+    rec.lastSeenMs = Date.now();
+    if (typeof beat.state === "string") rec.state = beat.state;
+    if (typeof beat.jobId === "string") rec.jobId = beat.jobId;
+    if ("progress" in beat) rec.progress = beat.progress;
+    if (typeof beat.interactiveUser === "string") {
+      rec.interactiveUser = beat.interactiveUser;
+    }
+    if (beat.desk !== undefined && beat.desk !== null) {
+      this.noteDeskReport(rec, beat.desk);
+    }
+    if (beat.view !== undefined && beat.view !== null) {
+      this.noteViewReport(rec, beat.view);
+    }
+    return true;
+  }
+
+  /**
+   * Fold one desk report into the machine's session ledger. A
+   * report is the engine's own words: { sessionId, state,
+   * openedAt?, endedAt?, endedBy?, framesServed? } — from a
+   * heartbeat's desk field or from a desk command result. A live
+   * report for a new session id replaces the record; an ended
+   * report closes the matching live record.
+   */
+  noteDeskReport(rec: HeadlessMachineRecord, report: unknown): void {
+    if (typeof report !== "object" || report === null) return;
+    const r = report as Record<string, unknown>;
+    const sessionId = typeof r.sessionId === "string" ? r.sessionId : "";
+    if (!sessionId) return;
+    const frames =
+      typeof r.framesServed === "number" && Number.isFinite(r.framesServed)
+        ? Math.max(0, Math.floor(r.framesServed))
+        : 0;
+    const cur = rec.deskSession;
+    if (r.state === "live") {
+      if (!cur || cur.sessionId !== sessionId || cur.state !== "live") {
+        rec.deskSession = {
+          sessionId,
+          state: "live",
+          openedAt: typeof r.openedAt === "string" ? r.openedAt : rfc3339Now(),
+          framesServed: frames
+        };
+      } else if (frames > cur.framesServed) {
+        cur.framesServed = frames;
+      }
+    } else if (r.state === "ended") {
+      if (cur && cur.sessionId === sessionId && cur.state === "live") {
+        cur.state = "ended";
+        cur.endedBy = r.endedBy === "idle" ? "idle" : "admin";
+        cur.endedAt =
+          typeof r.endedAt === "string" ? r.endedAt : rfc3339Now();
+        if (frames > cur.framesServed) cur.framesServed = frames;
+      }
+    }
+  }
+
+  /**
+   * Fold one view report into the machine's view ledger:
+   * noteDeskReport's twin, with the viewed user kept on the
+   * record and "session-gone" preserved as its own endedBy (an
+   * idle end arrives by heartbeat too, an admin end by the
+   * signed view-end command's result).
+   */
+  noteViewReport(rec: HeadlessMachineRecord, report: unknown): void {
+    if (typeof report !== "object" || report === null) return;
+    const r = report as Record<string, unknown>;
+    const sessionId = typeof r.sessionId === "string" ? r.sessionId : "";
+    if (!sessionId) return;
+    const frames =
+      typeof r.framesServed === "number" && Number.isFinite(r.framesServed)
+        ? Math.max(0, Math.floor(r.framesServed))
+        : 0;
+    const cur = rec.viewSession;
+    if (r.state === "live") {
+      if (!cur || cur.sessionId !== sessionId || cur.state !== "live") {
+        rec.viewSession = {
+          sessionId,
+          state: "live",
+          openedAt: typeof r.openedAt === "string" ? r.openedAt : rfc3339Now(),
+          framesServed: frames,
+          user: typeof r.user === "string" ? r.user : undefined
+        };
+      } else if (frames > cur.framesServed) {
+        cur.framesServed = frames;
+      }
+    } else if (r.state === "ended") {
+      if (cur && cur.sessionId === sessionId && cur.state === "live") {
+        cur.state = "ended";
+        cur.endedBy =
+          r.endedBy === "idle"
+            ? "idle"
+            : r.endedBy === "session-gone"
+              ? "session-gone"
+              : "admin";
+        cur.endedAt =
+          typeof r.endedAt === "string" ? r.endedAt : rfc3339Now();
+        if (frames > cur.framesServed) cur.framesServed = frames;
+      }
+    }
+  }
+
+  /**
+   * Queue a command for a machine. "start", "desk-end" and
+   * "view-end" commands are signed with the machine's secret at
+   * queue time, so each exists only because an operator on an
+   * account channel queued it; the engine refuses any of them
+   * without a valid signature.
+   * Undefined when the machine is not enrolled under this account.
+   */
+  queueHeadlessCommand(
+    account: string,
+    machineId: string,
+    type: string,
+    payload: Record<string, unknown>
+  ): HeadlessCommand | undefined {
+    const rec = this.getHeadlessMachine(account, machineId);
+    if (!rec) return undefined;
+    const cmd: HeadlessCommand = {
+      id: `cmd-${randomBytes(10).toString("hex")}`,
+      account,
+      machineId,
+      type,
+      payload,
+      createdAt: rfc3339Now(),
+      status: "pending"
+    };
+    if (type === "start" || type === "desk-end" || type === "view-end") {
+      cmd.signature = headlessCommandSignature(rec.secret, cmd);
+    }
+    this.headlessCommands.set(cmd.id, cmd);
+    return cmd;
+  }
+
+  /**
+   * Take (poll) a machine's pending commands: they are returned in
+   * queue order and marked delivered, so the pending queue is clear.
+   * The records stay for result posting and console reads.
+   */
+  takeHeadlessCommands(
+    account: string,
+    machineId: string
+  ): Array<{
+    id: string;
+    type: string;
+    payload: Record<string, unknown>;
+    signature?: string;
+  }> {
+    const out: HeadlessCommand[] = [];
+    for (const cmd of this.headlessCommands.values()) {
+      if (
+        cmd.account === account &&
+        cmd.machineId === machineId &&
+        cmd.status === "pending"
+      ) {
+        cmd.status = "delivered";
+        out.push(cmd);
+      }
+    }
+    out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    return out.map((cmd) => {
+      const wire: {
+        id: string;
+        type: string;
+        payload: Record<string, unknown>;
+        signature?: string;
+      } = { id: cmd.id, type: cmd.type, payload: cmd.payload };
+      if (cmd.signature) wire.signature = cmd.signature;
+      return wire;
+    });
+  }
+
+  /** Store a command result posted by the machine that owns it. */
+  storeHeadlessResult(
+    account: string,
+    machineId: string,
+    commandId: string,
+    result: unknown
+  ): boolean {
+    const cmd = this.headlessCommands.get(commandId);
+    if (!cmd || cmd.account !== account || cmd.machineId !== machineId) {
+      return false;
+    }
+    cmd.result = result;
+    cmd.resultAt = rfc3339Now();
+    cmd.status = "done";
+    // Desk results feed the session ledger: an open raises the
+    // live record, an end closes it (always "admin" here: a
+    // desk-end command only exists because an operator queued it
+    // and the engine verified its signature; an idle end arrives
+    // by heartbeat instead). Frames are handled separately below.
+    if (cmd.type === "desk-open" || cmd.type === "desk-end") {
+      const rec = this.getHeadlessMachine(account, machineId);
+      if (rec) {
+        const rep =
+          typeof result === "object" && result !== null
+            ? { ...(result as Record<string, unknown>) }
+            : {};
+        if (cmd.type === "desk-end" && rep.state === "ended" && !rep.endedBy) {
+          rep.endedBy = "admin";
+        }
+        this.noteDeskReport(rec, rep);
+      }
+    }
+    if (cmd.type === "desk-frame") {
+      // A frame result only advances the live record's counter;
+      // it can never open or close a session in the ledger.
+      const rec = this.getHeadlessMachine(account, machineId);
+      const cur = rec?.deskSession;
+      if (rec && cur && cur.state === "live") {
+        const frames = (result as { framesServed?: unknown } | null)
+          ?.framesServed;
+        if (typeof frames === "number" && frames > cur.framesServed) {
+          cur.framesServed = Math.floor(frames);
+        }
+      }
+    }
+    // View results feed the view ledger exactly the way desk
+    // results feed the desk ledger, independently of it.
+    if (cmd.type === "view-open" || cmd.type === "view-end") {
+      const rec = this.getHeadlessMachine(account, machineId);
+      if (rec) {
+        const rep =
+          typeof result === "object" && result !== null
+            ? { ...(result as Record<string, unknown>) }
+            : {};
+        if (cmd.type === "view-end" && rep.state === "ended" && !rep.endedBy) {
+          rep.endedBy = "admin";
+        }
+        this.noteViewReport(rec, rep);
+      }
+    }
+    if (cmd.type === "view-frame") {
+      const rec = this.getHeadlessMachine(account, machineId);
+      const cur = rec?.viewSession;
+      if (rec && cur && cur.state === "live") {
+        const frames = (result as { framesServed?: unknown } | null)
+          ?.framesServed;
+        if (typeof frames === "number" && frames > cur.framesServed) {
+          cur.framesServed = Math.floor(frames);
+        }
+      }
+    }
+    return true;
+  }
+
+  getHeadlessCommand(
+    account: string,
+    commandId: string
+  ): HeadlessCommand | undefined {
+    const cmd = this.headlessCommands.get(commandId);
+    if (!cmd || cmd.account !== account) return undefined;
+    return cmd;
   }
 
   // -----------------------------------------------------------------

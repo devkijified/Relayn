@@ -8,6 +8,10 @@
 //   * mover account isolation: a second account sees zero moves, 404s
 //   * mover console: 404 without/with wrong key, 404 when the key env
 //     is unset, pair creation, both role configs share the account ID,
+//   * headless track: enroll + machine secret auth (failures included),
+//     heartbeat, console machine list (account-scoped, no secret),
+//     scan/browse/paths command queueing and clearing, result storage,
+//     signed start commands (HMAC recomputed in the test),
 //     ready build is ONE exe with the config inbuilt (base exe bytes a
 //     strict prefix, overlay tail parses back to the exact config),
 //     the merged artifact boots paired in an empty dir (config=inbuilt,
@@ -16,7 +20,7 @@
 // =========================================================================
 
 import { spawn } from "node:child_process";
-import { createHash, randomBytes } from "node:crypto";
+import { createHash, createHmac, randomBytes } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -586,6 +590,784 @@ async function main() {
         bootProof.out.includes("role=admin") &&
         !bootProof.out.includes("account.id missing or invalid"),
       bootProof.out.slice(0, 300)
+    );
+
+    // ---- headless machines ----------------------------------------
+    console.log("headless machines");
+    check(
+      "console page carries the headless Machines section with a confirmation step",
+      html.includes("Machines (headless)") &&
+        html.includes('id="loadMachines"') &&
+        html.includes('id="machineList"') &&
+        html.includes('id="confirmStart"')
+    );
+    const HL_ACC = pair.accountId;
+    const HL_MID = "retire-laptop-01";
+    const summaryFixture = {
+      totalBytes: 11,
+      totalFiles: 2,
+      groups: [
+        { key: "files", label: "files", category: "files", count: 2, bytes: 11 }
+      ],
+      diagnostics: {}
+    };
+
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ machineId: HL_MID, name: "RETIRE-ME" })
+    });
+    check("headless enroll without account -> 401", r.status === 401, `got ${r.status}`);
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": HL_ACC, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: HL_MID,
+        name: "RETIRE-ME",
+        os: "Windows 10 Pro",
+        profiles: ["USER"],
+        capabilities: { desktop: false }
+      })
+    });
+    const enrolled = await r.json();
+    check(
+      "headless enroll returns a per-machine secret",
+      r.status === 200 &&
+        /^[0-9a-f]{64}$/.test(enrolled.machineSecret ?? "") &&
+        enrolled.machineId === HL_MID,
+      JSON.stringify(enrolled)
+    );
+    const SECRET = enrolled.machineSecret;
+    const beat = (headers, body) =>
+      fetch(`${a}/api/headless/heartbeat`, {
+        method: "POST",
+        headers: { "content-type": "application/json", ...headers },
+        body: JSON.stringify(body ?? { state: "idle" })
+      });
+    r = await beat({ "x-account-id": HL_ACC });
+    check("heartbeat without machine headers -> 401", r.status === 401);
+    r = await beat({
+      "x-account-id": HL_ACC,
+      "x-machine-id": HL_MID,
+      "x-machine-secret": "deadbeef".repeat(8)
+    });
+    check("heartbeat with wrong secret -> 401", r.status === 401);
+    const MAUTH = {
+      "x-account-id": HL_ACC,
+      "x-machine-id": HL_MID,
+      "x-machine-secret": SECRET
+    };
+    r = await beat(MAUTH, { state: "idle", jobId: "", progress: null });
+    check(
+      "heartbeat with the enrolled secret -> 200",
+      r.status === 200 && (await r.json()).ok === "true"
+    );
+    r = await beat({ ...MAUTH, "x-account-id": "otheracct999" });
+    check("machine secret does not authenticate under another account", r.status === 401);
+
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    check(
+      "command poll starts empty",
+      r.status === 200 && (await r.json()).commands?.length === 0
+    );
+
+    r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`);
+    check("console machines list without key -> 404", r.status === 404);
+    r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const machineList = await r.json();
+    check(
+      "console lists the enrolled machine (online, no secret leaked)",
+      r.status === 200 &&
+        machineList.machines?.length === 1 &&
+        machineList.machines[0].machineId === HL_MID &&
+        machineList.machines[0].name === "RETIRE-ME" &&
+        machineList.machines[0].online === true &&
+        machineList.machines[0].capabilities?.desktop === false &&
+        !JSON.stringify(machineList).includes(SECRET),
+      JSON.stringify(machineList).slice(0, 200)
+    );
+    r = await fetch(`${a}/mover/console/api/machines?accountId=otheracct999`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    check(
+      "console machine list is account-scoped",
+      r.status === 200 && (await r.json()).machines?.length === 0
+    );
+
+    r = await fetch(`${a}/mover/console/api/machines/${HL_MID}/scan`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: HL_ACC })
+    });
+    const scanQueued = await r.json();
+    check(
+      "console scan queues a command",
+      r.status === 200 && /^cmd-[0-9a-f]{20}$/.test(scanQueued.commandId ?? ""),
+      JSON.stringify(scanQueued)
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    const polled = await r.json();
+    check(
+      "machine polls the scan command (unsigned)",
+      polled.commands?.length === 1 &&
+        polled.commands[0].id === scanQueued.commandId &&
+        polled.commands[0].type === "scan" &&
+        !("signature" in polled.commands[0])
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    check("command poll clears the queue", (await r.json()).commands?.length === 0);
+    r = await fetch(`${a}/api/headless/commands/${scanQueued.commandId}/result`, {
+      method: "POST",
+      headers: { ...MAUTH, "content-type": "application/json" },
+      body: JSON.stringify({ result: summaryFixture })
+    });
+    check("machine posts the scan result", r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${HL_MID}/result/${scanQueued.commandId}?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const scanResult = await r.json();
+    check(
+      "console reads the stored scan result",
+      r.status === 200 &&
+        scanResult.status === "done" &&
+        scanResult.result?.totalFiles === 2 &&
+        scanResult.result?.groups?.length === 1,
+      JSON.stringify(scanResult).slice(0, 200)
+    );
+    r = await fetch(`${a}/api/headless/commands/cmd-nope/result`, {
+      method: "POST",
+      headers: MAUTH,
+      body: JSON.stringify({ result: {} })
+    });
+    check("result for an unknown command -> 404", r.status === 404);
+
+    const queueConsole = async (action, body) => {
+      const res = await fetch(`${a}/mover/console/api/machines/${HL_MID}/${action}`, {
+        method: "POST",
+        headers: KH,
+        body: JSON.stringify({ accountId: HL_ACC, ...body })
+      });
+      return { status: res.status, data: await res.json() };
+    };
+    const browseQ = await queueConsole("browse", { prefix: "files" });
+    const pathsQ = await queueConsole("paths", { prefix: "files" });
+    check(
+      "console queues browse + paths commands",
+      browseQ.status === 200 && pathsQ.status === 200
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    const cmds2 = (await r.json()).commands ?? [];
+    check(
+      "browse + paths arrive with their payloads",
+      cmds2.length === 2 &&
+        cmds2.find((c) => c.id === browseQ.data.commandId)?.type === "browse" &&
+        cmds2.find((c) => c.id === browseQ.data.commandId)?.payload?.prefix === "files" &&
+        cmds2.find((c) => c.id === pathsQ.data.commandId)?.type === "paths" &&
+        cmds2.find((c) => c.id === pathsQ.data.commandId)?.payload?.prefix === "files",
+      JSON.stringify(cmds2).slice(0, 200)
+    );
+
+    const startBody = {
+      accountId: HL_ACC,
+      moveName: "Retire RETIRE-ME",
+      paths: ["files/a.txt", "files/b.bin"]
+    };
+    r = await fetch(`${a}/mover/console/api/machines/${HL_MID}/start`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ ...startBody, paths: [] })
+    });
+    check(
+      "start with an empty path list -> 400 (no verified selection, no start)",
+      r.status === 400,
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/mover/console/api/machines/${HL_MID}/start`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify(startBody)
+    });
+    const startQueued = await r.json();
+    check(
+      "console start queues a signed command",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(startQueued.signature ?? ""),
+      JSON.stringify(startQueued)
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    const startCmd = ((await r.json()).commands ?? [])[0];
+    const expectedSig = createHmac("sha256", SECRET)
+      .update(
+        JSON.stringify(
+          canon({
+            id: startQueued.commandId,
+            type: "start",
+            payload: { moveName: startBody.moveName, paths: startBody.paths }
+          })
+        )
+      )
+      .digest("hex");
+    check(
+      "start signature verifies against canonical JSON + machine secret",
+      !!startCmd &&
+        startCmd.id === startQueued.commandId &&
+        startCmd.type === "start" &&
+        startCmd.signature === expectedSig &&
+        startCmd.signature === startQueued.signature,
+      JSON.stringify(startCmd)
+    );
+    r = await fetch(`${a}/mover/console/api/machines/ghost-01/scan`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: HL_ACC })
+    });
+    check("console command for an unknown machine -> 404", r.status === 404);
+
+    // Re-enroll semantics: "pending" means NEVER DELIVERED only.
+    // Queue two commands and deliver both via the poll, queue a
+    // third and never deliver it, then re-enroll (fresh secret).
+    // The undelivered third must be gone; the two delivered ones are
+    // in flight and must still accept results posted with the NEW
+    // secret, readable back through the console result endpoint.
+    const reScanQ = await queueConsole("scan", {});
+    const reBrowseQ = await queueConsole("browse", { prefix: "files" });
+    check(
+      "re-enroll scenario: two more commands queued",
+      reScanQ.status === 200 && reBrowseQ.status === 200
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    const rePolled = (await r.json()).commands ?? [];
+    check(
+      "re-enroll scenario: both commands delivered by poll",
+      rePolled.length === 2 &&
+        rePolled.some((c) => c.id === reScanQ.data.commandId) &&
+        rePolled.some((c) => c.id === reBrowseQ.data.commandId),
+      JSON.stringify(rePolled).slice(0, 200)
+    );
+    const rePendingQ = await queueConsole("paths", { prefix: "files" });
+    check(
+      "re-enroll scenario: third command queued but never delivered",
+      rePendingQ.status === 200
+    );
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": HL_ACC, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: HL_MID,
+        name: "RETIRE-ME",
+        os: "Windows 10 Pro",
+        profiles: ["USER"],
+        capabilities: { desktop: false }
+      })
+    });
+    const reEnrolled = await r.json();
+    check(
+      "re-enroll mints a fresh secret",
+      r.status === 200 &&
+        /^[0-9a-f]{64}$/.test(reEnrolled.machineSecret ?? "") &&
+        reEnrolled.machineSecret !== SECRET,
+      JSON.stringify(reEnrolled)
+    );
+    const SECRET2 = reEnrolled.machineSecret;
+    const MAUTH2 = {
+      "x-account-id": HL_ACC,
+      "x-machine-id": HL_MID,
+      "x-machine-secret": SECRET2
+    };
+    r = await beat(MAUTH, { state: "idle" });
+    check("old secret stops working after re-enroll", r.status === 401);
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH2 });
+    check(
+      "after re-enroll the poll is empty (undelivered dropped, delivered not re-sent)",
+      r.status === 200 && (await r.json()).commands?.length === 0
+    );
+    r = await fetch(
+      `${a}/api/headless/commands/${rePendingQ.data.commandId}/result`,
+      {
+        method: "POST",
+        headers: { ...MAUTH2, "content-type": "application/json" },
+        body: JSON.stringify({ result: { prefix: "files", paths: [] } })
+      }
+    );
+    check(
+      "never-delivered command is gone after re-enroll (result -> 404)",
+      r.status === 404
+    );
+    r = await fetch(
+      `${a}/mover/console/api/machines/${HL_MID}/result/${rePendingQ.data.commandId}?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    check("console also reads the dropped command as 404", r.status === 404);
+    const reScanResult = { ...summaryFixture, totalFiles: 7 };
+    r = await fetch(
+      `${a}/api/headless/commands/${reScanQ.data.commandId}/result`,
+      {
+        method: "POST",
+        headers: { ...MAUTH2, "content-type": "application/json" },
+        body: JSON.stringify({ result: reScanResult })
+      }
+    );
+    check(
+      "delivered command still accepts its result after re-enroll (new secret)",
+      r.status === 200
+    );
+    const reBrowseResult = {
+      prefix: "files",
+      count: 1,
+      bytes: 5,
+      total: 1,
+      offset: 0,
+      limit: 200,
+      children: [
+        { kind: "file", name: "a.txt", path: "files/a.txt", size: 5 }
+      ]
+    };
+    r = await fetch(
+      `${a}/api/headless/commands/${reBrowseQ.data.commandId}/result`,
+      {
+        method: "POST",
+        headers: { ...MAUTH2, "content-type": "application/json" },
+        body: JSON.stringify({ result: reBrowseResult })
+      }
+    );
+    check(
+      "second delivered command also accepts its result after re-enroll",
+      r.status === 200
+    );
+    r = await fetch(
+      `${a}/mover/console/api/machines/${HL_MID}/result/${reScanQ.data.commandId}?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const reScanRead = await r.json();
+    check(
+      "console reads back the post-re-enroll result (scan)",
+      r.status === 200 &&
+        reScanRead.status === "done" &&
+        reScanRead.result?.totalFiles === 7,
+      JSON.stringify(reScanRead).slice(0, 200)
+    );
+    r = await fetch(
+      `${a}/mover/console/api/machines/${HL_MID}/result/${reBrowseQ.data.commandId}?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const reBrowseRead = await r.json();
+    check(
+      "console reads back the post-re-enroll result (browse)",
+      r.status === 200 &&
+        reBrowseRead.status === "done" &&
+        reBrowseRead.result?.children?.[0]?.path === "files/a.txt",
+      JSON.stringify(reBrowseRead).slice(0, 200)
+    );
+
+    // ---- Background Admin (desk) ----------------------------------
+    console.log("background admin (desk)");
+    check(
+      "generated pair configs carry the headless + desk blocks",
+      moverCfg.cfg.headless?.enroll === true &&
+        moverCfg.cfg.desk?.desktopName === "RelaynDesk" &&
+        moverCfg.cfg.desk?.idleTtlSec === 900,
+      JSON.stringify(moverCfg.cfg.desk ?? {})
+    );
+    check(
+      "console page offers Open background desktop",
+      html.includes("Open background desktop")
+    );
+    const DESK_MID = "desk-host-01";
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": HL_ACC, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: DESK_MID,
+        name: "DESK-HOST",
+        os: "Windows 11 Pro",
+        profiles: ["USER"],
+        capabilities: { desktop: true, backgroundDesktop: true }
+      })
+    });
+    const deskEnrolled = await r.json();
+    const DSECRET = deskEnrolled.machineSecret;
+    const DAUTH = {
+      "x-account-id": HL_ACC,
+      "x-machine-id": DESK_MID,
+      "x-machine-secret": DSECRET
+    };
+    check(
+      "desk host enrolls with the backgroundDesktop capability",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(DSECRET ?? "")
+    );
+
+    // The operator channel (account header, no machine secret):
+    // this is the door the console and the Viewer app use.
+    r = await fetch(`${a}/api/headless/machines`);
+    check("operator machines list without account -> 401", r.status === 401);
+    r = await fetch(`${a}/api/headless/machines`, {
+      headers: { "x-account-id": HL_ACC }
+    });
+    const opList = await r.json();
+    check(
+      "operator channel lists machines with a null desk session",
+      r.status === 200 &&
+        opList.machines?.some(
+          (m) => m.machineId === DESK_MID && m.deskSession === null
+        ),
+      JSON.stringify(opList).slice(0, 200)
+    );
+    const opQueue = async (type, payload) => {
+      const res = await fetch(`${a}/api/headless/commands`, {
+        method: "POST",
+        headers: {
+          "x-account-id": HL_ACC,
+          "x-machine-id": DESK_MID,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ type, payload })
+      });
+      return { status: res.status, data: await res.json() };
+    };
+    const postResult = async (commandId, result) =>
+      fetch(`${a}/api/headless/commands/${commandId}/result`, {
+        method: "POST",
+        headers: { ...DAUTH, "content-type": "application/json" },
+        body: JSON.stringify({ result })
+      });
+    const pollCmds = async () =>
+      ((await (await fetch(`${a}/api/headless/commands`, { headers: DAUTH })).json()).commands ?? []);
+
+    const deskOpenQ = await opQueue("desk-open", { width: 640, height: 400 });
+    check("operator queues desk-open", deskOpenQ.status === 200 && !!deskOpenQ.data.commandId);
+    let wire = await pollCmds();
+    check(
+      "desk-open is delivered unsigned (only start and desk-end are signed)",
+      wire.length === 1 && wire[0].type === "desk-open" && !wire[0].signature,
+      JSON.stringify(wire).slice(0, 200)
+    );
+    const SID = "desk-test-session-1";
+    r = await postResult(deskOpenQ.data.commandId, {
+      sessionId: SID, state: "live", openedAt: "2026-10-27T00:00:00Z", framesServed: 0
+    });
+    check("desk-open result posts", r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${DESK_MID}/desk-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const sess1 = await r.json();
+    check(
+      "session ledger shows the live session",
+      r.status === 200 && sess1.deskSession?.state === "live" && sess1.deskSession?.sessionId === SID,
+      JSON.stringify(sess1).slice(0, 200)
+    );
+    r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const listWithDesk = await r.json();
+    check(
+      "console machines list carries the live-session record (badge data)",
+      listWithDesk.machines?.find((m) => m.machineId === DESK_MID)?.deskSession?.state === "live"
+    );
+
+    const deskFrameQ = await opQueue("desk-frame", {});
+    wire = await pollCmds();
+    r = await postResult(deskFrameQ.data.commandId, {
+      data: "AAAA", seq: 1, width: 640, height: 400, framesServed: 3
+    });
+    check("desk-frame round trip posts", wire.length === 1 && r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${DESK_MID}/desk-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    check(
+      "frame results advance the ledger counter",
+      (await r.json()).deskSession?.framesServed === 3
+    );
+
+    // The end fence: desk-end queued from the console is signed;
+    // the signature verifies against the machine secret.
+    const deskEndRes = await fetch(`${a}/mover/console/api/machines/${DESK_MID}/desk-end`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: HL_ACC })
+    });
+    const deskEndQ = { status: deskEndRes.status, data: await deskEndRes.json() };
+    check(
+      "console desk-end queues a signed command",
+      deskEndQ.status === 200 && /^[0-9a-f]{64}$/.test(deskEndQ.data.signature ?? ""),
+      JSON.stringify(deskEndQ.data)
+    );
+    wire = await pollCmds();
+    const endCmd = wire.find((c) => c.id === deskEndQ.data.commandId);
+    const expectedEndSig = createHmac("sha256", DSECRET)
+      .update(JSON.stringify(canon({ id: deskEndQ.data.commandId, type: "desk-end", payload: {} })))
+      .digest("hex");
+    check(
+      "desk-end signature verifies against canonical JSON + machine secret",
+      !!endCmd && endCmd.signature === expectedEndSig,
+      JSON.stringify(endCmd)
+    );
+    r = await postResult(deskEndQ.data.commandId, {
+      sessionId: SID, state: "ended", endedBy: "admin", framesServed: 3
+    });
+    r = await fetch(
+      `${a}/mover/console/api/machines/${DESK_MID}/desk-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const sessEnded = await r.json();
+    check(
+      "ledger records the admin end",
+      sessEnded.deskSession?.state === "ended" && sessEnded.deskSession?.endedBy === "admin",
+      JSON.stringify(sessEnded).slice(0, 200)
+    );
+
+    // Idle end: a second session the engine ends on its own is
+    // reported on a heartbeat and the ledger says "idle".
+    const deskOpen2Q = await opQueue("desk-open", {});
+    wire = await pollCmds();
+    const SID2 = "desk-test-session-2";
+    r = await postResult(deskOpen2Q.data.commandId, {
+      sessionId: SID2, state: "live", openedAt: "2026-10-27T01:00:00Z", framesServed: 0
+    });
+    r = await fetch(`${a}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: { ...DAUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        state: "idle",
+        desk: { sessionId: SID2, state: "ended", endedBy: "idle", endedAt: "2026-10-27T01:15:00Z", framesServed: 5 }
+      })
+    });
+    check("heartbeat carries the idle end report", r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${DESK_MID}/desk-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const sessIdle = await r.json();
+    check(
+      "ledger records the idle end",
+      sessIdle.deskSession?.state === "ended" &&
+        sessIdle.deskSession?.endedBy === "idle" &&
+        sessIdle.deskSession?.framesServed === 5,
+      JSON.stringify(sessIdle).slice(0, 200)
+    );
+
+    // The viewer page: gated like the console, carrying the viewer.
+    r = await fetch(`${a}/mover/console/desk/${DESK_MID}`);
+    check("desk viewer page without key -> 404", r.status === 404);
+    r = await fetch(`${a}/mover/console/desk/${DESK_MID}?key=${CONSOLE_KEY}&accountId=${HL_ACC}`);
+    const deskHtml = await r.text();
+    check(
+      "desk viewer page serves the viewer (frame, input, End session)",
+      r.status === 200 &&
+        deskHtml.includes("Background desktop") &&
+        deskHtml.includes("End session") &&
+        deskHtml.includes("desk-frame") &&
+        deskHtml.includes("desk-end"),
+      deskHtml.slice(0, 120)
+    );
+
+    // ---- View Screen (view) ---------------------------------------
+    console.log("view screen (view)");
+    check(
+      "generated pair configs carry the view block",
+      moverCfg.cfg.view?.enabled === true &&
+        moverCfg.cfg.view?.width === 1280 &&
+        moverCfg.cfg.view?.height === 720 &&
+        moverCfg.cfg.view?.idleTtlSec === 900,
+      JSON.stringify(moverCfg.cfg.view ?? {})
+    );
+    check(
+      "console page offers View screen",
+      html.includes("View screen")
+    );
+    const VIEW_MID = "view-host-01";
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: { "x-account-id": HL_ACC, "content-type": "application/json" },
+      body: JSON.stringify({
+        machineId: VIEW_MID,
+        name: "KIDS-LAPTOP",
+        os: "Windows 11 Home",
+        profiles: ["KID"],
+        capabilities: { desktop: true, backgroundDesktop: true, viewScreen: true },
+        interactiveUser: "Adaeze"
+      })
+    });
+    const viewEnrolled = await r.json();
+    const VSECRET = viewEnrolled.machineSecret;
+    const VAUTH = {
+      "x-account-id": HL_ACC,
+      "x-machine-id": VIEW_MID,
+      "x-machine-secret": VSECRET
+    };
+    check(
+      "view host enrolls naming its signed-in user",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(VSECRET ?? "")
+    );
+    r = await fetch(`${a}/api/headless/machines`, {
+      headers: { "x-account-id": HL_ACC }
+    });
+    const viewList = await r.json();
+    check(
+      "operator channel lists the machine with its user and a null view session",
+      r.status === 200 &&
+        viewList.machines?.some(
+          (m) =>
+            m.machineId === VIEW_MID &&
+            m.interactiveUser === "Adaeze" &&
+            m.viewSession === null
+        ),
+      JSON.stringify(viewList).slice(0, 300)
+    );
+    const opQueueV = async (type, payload) => {
+      const res = await fetch(`${a}/api/headless/commands`, {
+        method: "POST",
+        headers: {
+          "x-account-id": HL_ACC,
+          "x-machine-id": VIEW_MID,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ type, payload })
+      });
+      return { status: res.status, data: await res.json() };
+    };
+    const postResultV = async (commandId, result) =>
+      fetch(`${a}/api/headless/commands/${commandId}/result`, {
+        method: "POST",
+        headers: { ...VAUTH, "content-type": "application/json" },
+        body: JSON.stringify({ result })
+      });
+    const pollCmdsV = async () =>
+      ((await (await fetch(`${a}/api/headless/commands`, { headers: VAUTH })).json()).commands ?? []);
+
+    const viewOpenQ = await opQueueV("view-open", {});
+    check("operator queues view-open", viewOpenQ.status === 200 && !!viewOpenQ.data.commandId);
+    let vwire = await pollCmdsV();
+    check(
+      "view-open is delivered unsigned (only start, desk-end and view-end are signed)",
+      vwire.length === 1 && vwire[0].type === "view-open" && !vwire[0].signature,
+      JSON.stringify(vwire).slice(0, 200)
+    );
+    const VSID = "view-test-session-1";
+    r = await postResultV(viewOpenQ.data.commandId, {
+      sessionId: VSID, state: "live", openedAt: "2026-10-27T02:00:00Z",
+      user: "Adaeze", framesServed: 0
+    });
+    check("view-open result posts", r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${VIEW_MID}/view-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const vsess1 = await r.json();
+    check(
+      "view ledger shows the live view with its user",
+      r.status === 200 &&
+        vsess1.viewSession?.state === "live" &&
+        vsess1.viewSession?.sessionId === VSID &&
+        vsess1.viewSession?.user === "Adaeze" &&
+        vsess1.interactiveUser === "Adaeze",
+      JSON.stringify(vsess1).slice(0, 200)
+    );
+    const viewFrameQ = await opQueueV("view-frame", {});
+    vwire = await pollCmdsV();
+    r = await postResultV(viewFrameQ.data.commandId, {
+      data: "BBBB", seq: 1, width: 1280, height: 720, framesServed: 4, user: "Adaeze"
+    });
+    check("view-frame round trip posts", vwire.length === 1 && r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${VIEW_MID}/view-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    check(
+      "view frame results advance the view ledger counter",
+      (await r.json()).viewSession?.framesServed === 4
+    );
+
+    // The end fence: view-end queued from the console is signed;
+    // the signature verifies against the machine secret.
+    const viewEndRes = await fetch(`${a}/mover/console/api/machines/${VIEW_MID}/view-end`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: HL_ACC })
+    });
+    const viewEndQ = { status: viewEndRes.status, data: await viewEndRes.json() };
+    check(
+      "console view-end queues a signed command",
+      viewEndQ.status === 200 && /^[0-9a-f]{64}$/.test(viewEndQ.data.signature ?? ""),
+      JSON.stringify(viewEndQ.data)
+    );
+    vwire = await pollCmdsV();
+    const vendCmd = vwire.find((c) => c.id === viewEndQ.data.commandId);
+    const expectedViewEndSig = createHmac("sha256", VSECRET)
+      .update(JSON.stringify(canon({ id: viewEndQ.data.commandId, type: "view-end", payload: {} })))
+      .digest("hex");
+    check(
+      "view-end signature verifies against canonical JSON + machine secret",
+      !!vendCmd && vendCmd.signature === expectedViewEndSig,
+      JSON.stringify(vendCmd)
+    );
+    r = await postResultV(viewEndQ.data.commandId, {
+      sessionId: VSID, state: "ended", endedBy: "admin", framesServed: 4
+    });
+    r = await fetch(
+      `${a}/mover/console/api/machines/${VIEW_MID}/view-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const vsessEnded = await r.json();
+    check(
+      "view ledger records the admin end",
+      vsessEnded.viewSession?.state === "ended" && vsessEnded.viewSession?.endedBy === "admin",
+      JSON.stringify(vsessEnded).slice(0, 200)
+    );
+
+    // Session-gone: a second view the engine ends because the
+    // signed-in session went away is reported on a heartbeat and
+    // the ledger says "session-gone"; the user clears with it.
+    const viewOpen2Q = await opQueueV("view-open", {});
+    vwire = await pollCmdsV();
+    const VSID2 = "view-test-session-2";
+    r = await postResultV(viewOpen2Q.data.commandId, {
+      sessionId: VSID2, state: "live", openedAt: "2026-10-27T03:00:00Z",
+      user: "Adaeze", framesServed: 0
+    });
+    r = await fetch(`${a}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: { ...VAUTH, "content-type": "application/json" },
+      body: JSON.stringify({
+        state: "idle",
+        interactiveUser: "",
+        view: { sessionId: VSID2, state: "ended", endedBy: "session-gone", endedAt: "2026-10-27T03:10:00Z", framesServed: 7 }
+      })
+    });
+    check("heartbeat carries the session-gone end report", r.status === 200);
+    r = await fetch(
+      `${a}/mover/console/api/machines/${VIEW_MID}/view-session?accountId=${HL_ACC}`,
+      { headers: { "x-console-key": CONSOLE_KEY } }
+    );
+    const vsessGone = await r.json();
+    check(
+      "view ledger records the session-gone end and the user clears",
+      vsessGone.viewSession?.state === "ended" &&
+        vsessGone.viewSession?.endedBy === "session-gone" &&
+        vsessGone.viewSession?.framesServed === 7 &&
+        vsessGone.interactiveUser === "",
+      JSON.stringify(vsessGone).slice(0, 200)
+    );
+
+    // The view page: gated like the console, view-only by
+    // construction (no input protocol names anywhere in it).
+    r = await fetch(`${a}/mover/console/view/${VIEW_MID}`);
+    check("view page without key -> 404", r.status === 404);
+    r = await fetch(`${a}/mover/console/view/${VIEW_MID}?key=${CONSOLE_KEY}&accountId=${HL_ACC}`);
+    const viewHtml = await r.text();
+    check(
+      "view page serves the view-only viewer (note, frames, End view, no input routes)",
+      r.status === 200 &&
+        viewHtml.includes("You are only viewing this screen") &&
+        viewHtml.includes("End view") &&
+        viewHtml.includes("view-frame") &&
+        viewHtml.includes("view-end") &&
+        !viewHtml.includes("view-input") &&
+        !viewHtml.includes("desk-input"),
+      viewHtml.slice(0, 120)
     );
 
     // ---------------------------------------------------------------

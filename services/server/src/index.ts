@@ -25,6 +25,7 @@ import cors from "@fastify/cors";
 import { backupRoutes } from "./backup-routes.js";
 import { BackupStore } from "./backup-store.js";
 import { config } from "./config.js";
+import { headlessRoutes } from "./mover-headless.js";
 import { moverConsoleRoutes } from "./mover-console.js";
 import { moverRoutes } from "./mover-routes.js";
 import { MoverStore } from "./mover-store.js";
@@ -77,9 +78,15 @@ await app.register(backupRoutes, { backupStore });
 // chunk storage on disk under MOVER_DATA_DIR).
 await app.register(moverRoutes, { moverStore });
 
+// Relayn Mover headless track: machines with no signed-in user
+// enroll, heartbeat, poll for commands and post results. Starts are
+// signed by the console (see mover-console.ts) and verified by the
+// engine; the cloud only ever carries commands and results.
+await app.register(headlessRoutes, { moverStore });
+
 // Relayn Mover console: pair creation and config / ready-build
 // downloads for the owner. Inert (404) unless MOVER_CONSOLE_KEY is set.
-await app.register(moverConsoleRoutes);
+await app.register(moverConsoleRoutes, { moverStore });
 
 app.get("/", async () => {
   return {
