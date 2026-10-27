@@ -102,6 +102,11 @@ export class BackupStore {
         });
     }
 
+    /** How many backups are currently held (the console Overview reads this). */
+    size(): number {
+        return this.backups.size;
+    }
+
     delete(id: string, ip: string): boolean {
         const record = this.backups.get(id);
         if (!record) return false;

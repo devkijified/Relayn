@@ -8,6 +8,10 @@
 //   * mover account isolation: a second account sees zero moves, 404s
 //   * mover console: 404 without/with wrong key, 404 when the key env
 //     is unset, pair creation, both role configs share the account ID,
+//   * licenses + unified console: seeded licenses, issue/list, the
+//     tabbed page shell, host + viewer configs and build names,
+//     overview + cross-account moves, revoke blocking enroll and
+//     downloads with 403 LICENSE_REVOKED, restore reopening both
 //   * headless track: enroll + machine secret auth (failures included),
 //     heartbeat, console machine list (account-scoped, no secret),
 //     scan/browse/paths command queueing and clearing, result storage,
@@ -1368,6 +1372,314 @@ async function main() {
         !viewHtml.includes("view-input") &&
         !viewHtml.includes("desk-input"),
       viewHtml.slice(0, 120)
+    );
+
+    // ---- Licenses, unified console, host + viewer builds ---------
+    console.log("licenses + unified console");
+    const OWNER_ACC = "mv79ce74e43cc48d276ca0";
+    const ASSISTANT_ACC = "mv67c7c1a8916a988e0000";
+    const licApi = async (method, pathSuffix, body) => {
+      const res = await fetch(`${a}/mover/console/api/licenses${pathSuffix}`, {
+        method,
+        headers: KH,
+        body: body === undefined ? undefined : JSON.stringify(body)
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+
+    check(
+      "console page is the tabbed shell (Relayn Console, EXT, MOVER, ADMIN tabs)",
+      html.includes("<h1>Relayn Console</h1>") &&
+        html.includes('data-tab="overview"') &&
+        html.includes('data-tab="ext"') &&
+        html.includes('data-tab="mover"') &&
+        html.includes('data-tab="admin"') &&
+        html.includes(">EXT<") &&
+        html.includes(">MOVER<") &&
+        html.includes(">ADMIN<")
+    );
+    r = await fetch(`${a}/mover/console/api/licenses`);
+    check("licenses list without key -> 404", r.status === 404);
+    r = await fetch(`${a}/mover/console/api/overview`);
+    check("overview without key -> 404", r.status === 404);
+
+    const allLic = await licApi("GET", "");
+    const seededFor = (acct, product) =>
+      allLic.data.licenses?.find(
+        (l) => l.accountId === acct && l.product === product
+      );
+    check(
+      "seeded owner licenses are active for all three products",
+      allLic.status === 200 &&
+        ["ext", "mover", "admin"].every(
+          (p) =>
+            seededFor(OWNER_ACC, p)?.status === "active" &&
+            seededFor(OWNER_ACC, p)?.label === "Owner"
+        ),
+      JSON.stringify(allLic.data).slice(0, 200)
+    );
+    check(
+      "seeded assistant licenses are active for all three products",
+      ["ext", "mover", "admin"].every(
+        (p) =>
+          seededFor(ASSISTANT_ACC, p)?.status === "active" &&
+          seededFor(ASSISTANT_ACC, p)?.label === "Assistant test pair"
+      )
+    );
+    check(
+      "the console-created pair holds mover + admin licenses (Console pair)",
+      seededFor(pair.accountId, "mover")?.label === "Console pair" &&
+        seededFor(pair.accountId, "admin")?.label === "Console pair"
+    );
+    const extOnly = await licApi("GET", "?product=ext");
+    check(
+      "licenses list filters by product",
+      extOnly.status === 200 &&
+        extOnly.data.licenses?.length > 0 &&
+        extOnly.data.licenses.every((l) => l.product === "ext")
+    );
+
+    const issuedFresh = await licApi("POST", "", {
+      product: "ext",
+      label: "Fresh shop",
+      note: "issued by the test"
+    });
+    check(
+      "issuing without an account mints an mv account and returns the license",
+      issuedFresh.status === 200 &&
+        /^mv[0-9a-f]{20}$/.test(issuedFresh.data.accountId ?? "") &&
+        issuedFresh.data.product === "ext" &&
+        issuedFresh.data.status === "active" &&
+        issuedFresh.data.label === "Fresh shop",
+      JSON.stringify(issuedFresh.data)
+    );
+    const afterIssue = await licApi("GET", "?product=ext");
+    check(
+      "the freshly issued license shows in the list",
+      afterIssue.data.licenses?.some(
+        (l) => l.accountId === issuedFresh.data.accountId
+      )
+    );
+    const issuedNamed = await licApi("POST", "", {
+      product: "mover",
+      accountId: "mvfreshtest000001",
+      label: "Named account"
+    });
+    check(
+      "issuing for a named fresh account works",
+      issuedNamed.status === 200 &&
+        issuedNamed.data.accountId === "mvfreshtest000001" &&
+        issuedNamed.data.status === "active"
+    );
+
+    // Host and viewer builds: admin-side roles, empty feature set.
+    const hostCfg = await getConfig("host");
+    const viewerCfg = await getConfig("viewer");
+    check(
+      "host config: role host, empty features, headless + desk + view blocks",
+      hostCfg.status === 200 &&
+        hostCfg.cfg.role === "host" &&
+        hostCfg.cfg.features.move === false &&
+        hostCfg.cfg.features.inbox === false &&
+        hostCfg.cfg.features.import === false &&
+        hostCfg.cfg.headless?.enroll === true &&
+        hostCfg.cfg.desk?.enabled === true &&
+        hostCfg.cfg.view?.enabled === true,
+      JSON.stringify(hostCfg.cfg).slice(0, 200)
+    );
+    check(
+      "viewer config: role viewer, empty features",
+      viewerCfg.status === 200 &&
+        viewerCfg.cfg.role === "viewer" &&
+        viewerCfg.cfg.features.move === false &&
+        viewerCfg.cfg.features.inbox === false &&
+        viewerCfg.cfg.features.import === false
+    );
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: pair.accountId, role: "host" })
+    });
+    check(
+      "host build filename is relayn-host.exe",
+      r.status === 200 &&
+        (r.headers.get("content-disposition") ?? "").includes(
+          'filename="relayn-host.exe"'
+        ),
+      r.headers.get("content-disposition") ?? ""
+    );
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: pair.accountId, role: "viewer" })
+    });
+    check(
+      "viewer build filename is relayn-admin-viewer.exe",
+      r.status === 200 &&
+        (r.headers.get("content-disposition") ?? "").includes(
+          'filename="relayn-admin-viewer.exe"'
+        ),
+      r.headers.get("content-disposition") ?? ""
+    );
+
+    // Overview + moves across known accounts. Announce a move under
+    // the pair account (a known account) so it must show up.
+    const ovManifest = {
+      moveId: "move-console-overview-1",
+      name: "Overview move",
+      totalBytes: 5,
+      totalFiles: 1,
+      chunks: [{ index: 0, path: "files/a.txt", offset: 0, size: 5, sha256: "x" }]
+    };
+    r = await fetch(`${a}/api/moves`, {
+      method: "POST",
+      headers: {
+        "x-account-id": HL_ACC,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ moverName: "RETIRE-ME", manifest: ovManifest })
+    });
+    check("announce under the pair account ok", r.status === 200);
+    r = await fetch(`${a}/mover/console/api/moves`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const movesData = await r.json();
+    check(
+      "console moves lists moves across known accounts with the account field",
+      r.status === 200 &&
+        movesData.moves?.some(
+          (m) => m.moveId === ovManifest.moveId && m.account === HL_ACC
+        ),
+      JSON.stringify(movesData).slice(0, 200)
+    );
+    r = await fetch(`${a}/mover/console/api/overview`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const overview = await r.json();
+    check(
+      "overview carries licenses, counts, machines, moves, presence and ext activity",
+      r.status === 200 &&
+        Array.isArray(overview.licenses) &&
+        overview.licenseCounts?.ext?.active >= 2 &&
+        overview.licenseCounts?.mover?.active >= 2 &&
+        Array.isArray(overview.machines) &&
+        overview.machines.some((m) => m.account === HL_ACC) &&
+        overview.moves?.some((m) => m.moveId === ovManifest.moveId) &&
+        Array.isArray(overview.presence?.[HL_ACC]) &&
+        typeof overview.ext?.livePayloads === "number" &&
+        typeof overview.ext?.backups === "number" &&
+        Array.isArray(overview.ext?.accountShares?.[HL_ACC]),
+      JSON.stringify(overview).slice(0, 200)
+    );
+
+    // Revoke the assistant account everywhere: enroll and downloads
+    // for its products must block, then restore must open them again.
+    for (const p of ["ext", "mover", "admin"]) {
+      const rv = await licApi("POST", "/revoke", {
+        product: p,
+        accountId: ASSISTANT_ACC
+      });
+      check(
+        `revoke assistant ${p} license -> revoked`,
+        rv.status === 200 && rv.data.status === "revoked",
+        JSON.stringify(rv.data)
+      );
+    }
+    const revokeGhost = await licApi("POST", "/revoke", {
+      product: "ext",
+      accountId: "mvunknownacct01"
+    });
+    check(
+      "revoking an unknown license -> 404 LICENSE_NOT_FOUND",
+      revokeGhost.status === 404 &&
+        revokeGhost.data.error === "LICENSE_NOT_FOUND",
+      JSON.stringify(revokeGhost.data)
+    );
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: {
+        "x-account-id": ASSISTANT_ACC,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ machineId: "revoked-machine-01", name: "BLOCKED" })
+    });
+    const enrollBlocked = await r.json().catch(() => ({}));
+    check(
+      "enroll for a revoked account -> 403 LICENSE_REVOKED",
+      r.status === 403 && enrollBlocked.error === "LICENSE_REVOKED",
+      `got ${r.status} ${JSON.stringify(enrollBlocked)}`
+    );
+    r = await fetch(`${a}/mover/console/api/config`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: ASSISTANT_ACC, role: "mover" })
+    });
+    const cfgBlocked = await r.json().catch(() => ({}));
+    check(
+      "config download for revoked mover account -> 403 LICENSE_REVOKED",
+      r.status === 403 && cfgBlocked.error === "LICENSE_REVOKED",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: ASSISTANT_ACC, role: "admin" })
+    });
+    const pkgBlocked = await r.json().catch(() => ({}));
+    check(
+      "package download for revoked admin account -> 403 LICENSE_REVOKED",
+      r.status === 403 && pkgBlocked.error === "LICENSE_REVOKED",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: ASSISTANT_ACC, role: "host" })
+    });
+    check(
+      "host download is gated by the admin license too -> 403",
+      r.status === 403,
+      `got ${r.status}`
+    );
+
+    const restoreMover = await licApi("POST", "/restore", {
+      product: "mover",
+      accountId: ASSISTANT_ACC
+    });
+    check(
+      "restore mover license -> active",
+      restoreMover.status === 200 && restoreMover.data.status === "active"
+    );
+    r = await fetch(`${a}/mover/console/api/config`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: ASSISTANT_ACC, role: "mover" })
+    });
+    check(
+      "config download works again for the restored product",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    for (const p of ["ext", "admin"]) {
+      await licApi("POST", "/restore", {
+        product: p,
+        accountId: ASSISTANT_ACC
+      });
+    }
+    r = await fetch(`${a}/api/headless/enroll`, {
+      method: "POST",
+      headers: {
+        "x-account-id": ASSISTANT_ACC,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ machineId: "revoked-machine-01", name: "ALLOWED-AGAIN" })
+    });
+    const enrollAgain = await r.json().catch(() => ({}));
+    check(
+      "enroll succeeds again once every license is restored",
+      r.status === 200 &&
+        /^[0-9a-f]{64}$/.test(enrollAgain.machineSecret ?? ""),
+      `got ${r.status} ${JSON.stringify(enrollAgain)}`
     );
 
     // ---------------------------------------------------------------

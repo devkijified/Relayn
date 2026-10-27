@@ -25,6 +25,7 @@ import cors from "@fastify/cors";
 import { backupRoutes } from "./backup-routes.js";
 import { BackupStore } from "./backup-store.js";
 import { config } from "./config.js";
+import { LicenseStore } from "./license-store.js";
 import { headlessRoutes } from "./mover-headless.js";
 import { moverConsoleRoutes } from "./mover-console.js";
 import { moverRoutes } from "./mover-routes.js";
@@ -46,6 +47,10 @@ const app = Fastify({
 const shareStore = new ShareStore();
 const backupStore = new BackupStore();
 const moverStore = new MoverStore();
+// The owner license registry (in-memory, seeded with the owner and
+// assistant accounts). The console reads and changes it; the headless
+// enroll gate and the console download gates enforce revocations.
+const licenseStore = new LicenseStore();
 
 /*
  * CORS policy: empty CORS_ORIGIN disables CORS. "*" is development-only.
@@ -82,11 +87,17 @@ await app.register(moverRoutes, { moverStore });
 // enroll, heartbeat, poll for commands and post results. Starts are
 // signed by the console (see mover-console.ts) and verified by the
 // engine; the cloud only ever carries commands and results.
-await app.register(headlessRoutes, { moverStore });
+await app.register(headlessRoutes, { moverStore, licenseStore });
 
-// Relayn Mover console: pair creation and config / ready-build
-// downloads for the owner. Inert (404) unless MOVER_CONSOLE_KEY is set.
-await app.register(moverConsoleRoutes, { moverStore });
+// Relayn owner console: product tabs (EXT, MOVER, ADMIN), pair
+// creation, config / ready-build downloads and the license registry.
+// Inert (404) unless MOVER_CONSOLE_KEY is set.
+await app.register(moverConsoleRoutes, {
+  moverStore,
+  licenseStore,
+  shareStore,
+  backupStore
+});
 
 app.get("/", async () => {
   return {

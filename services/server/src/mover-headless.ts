@@ -52,6 +52,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import type { LicenseStore } from "./license-store.js";
 import {
   isValidHeadlessMachineId,
   type HeadlessMachineRecord,
@@ -86,9 +87,9 @@ function needAccount(
 
 export async function headlessRoutes(
   app: FastifyInstance,
-  options: { moverStore: MoverStore }
+  options: { moverStore: MoverStore; licenseStore?: LicenseStore }
 ): Promise<void> {
-  const { moverStore } = options;
+  const { moverStore, licenseStore } = options;
 
   // Same Go-style error shape as the mover routes plugin.
   app.setErrorHandler((error, _request, reply) => {
@@ -138,6 +139,16 @@ export async function headlessRoutes(
     async (request, reply) => {
       const acc = needAccount(request, reply);
       if (!acc) return;
+      // License gate: an account with any revoked license cannot
+      // enroll new machines. Machines and sessions already running
+      // are not touched; only this new enrollment is blocked.
+      if (licenseStore && licenseStore.hasRevoked(acc)) {
+        return reply.code(403).send({
+          error: "LICENSE_REVOKED",
+          message:
+            "This account has a revoked license, so new enrollments are blocked. Restore the license in the console to allow enrollments again."
+        });
+      }
       const body = (request.body ?? {}) as {
         machineId?: unknown;
         name?: unknown;
