@@ -166,6 +166,8 @@ export async function headlessRoutes(
         profiles?: unknown;
         capabilities?: unknown;
         interactiveUser?: unknown;
+        interactiveAway?: unknown;
+        sessions?: unknown;
         runMode?: unknown;
       };
       if (!isValidHeadlessMachineId(body.machineId)) {
@@ -181,6 +183,8 @@ export async function headlessRoutes(
         profiles: body.profiles ?? null,
         capabilities: body.capabilities ?? null,
         interactiveUser: body.interactiveUser,
+        interactiveAway: body.interactiveAway,
+        sessionsDiag: body.sessions,
         runMode: body.runMode
       });
       return { machineId: rec.machineId, machineSecret: rec.secret };
@@ -204,9 +208,15 @@ export async function headlessRoutes(
       desk?: unknown;
       view?: unknown;
       interactiveUser?: unknown;
+      interactiveAway?: unknown;
+      sessions?: unknown;
+      poll?: unknown;
       runMode?: unknown;
     };
-    moverStore.heartbeatHeadless(found.acc, found.machine.machineId, body);
+    moverStore.heartbeatHeadless(found.acc, found.machine.machineId, {
+      ...body,
+      sessionsDiag: body.sessions
+    });
     return { ok: "true" };
   });
 
@@ -286,16 +296,21 @@ export async function headlessRoutes(
   // ------------------------------------------------------------------
   // Command poll: returns this machine's pending commands in queue
   // order and clears the pending queue (they read as delivered).
+  //
+  // CONTRACT: the response body is the BARE ARRAY of commands.
+  // That is the documented protocol shape, what the Go cloud
+  // serves, and what the engine's poll decodes. This route once
+  // wrapped the array in an envelope ({"commands": [...]}): every
+  // poll against production then failed to decode on the engine,
+  // so no command (desk, view, files, start) ever executed while
+  // enroll and heartbeats kept the machine looking alive (the
+  // owner's dead Viewer, 2026-10-27). The engine now tolerates
+  // both shapes, and the test suite pins this route to the array.
   // ------------------------------------------------------------------
   app.get("/api/headless/commands", async (request, reply) => {
     const found = needMachine(request, reply);
     if (!found) return;
-    return {
-      commands: moverStore.takeHeadlessCommands(
-        found.acc,
-        found.machine.machineId
-      )
-    };
+    return moverStore.takeHeadlessCommands(found.acc, found.machine.machineId);
   });
 
   // ------------------------------------------------------------------

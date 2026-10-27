@@ -87,7 +87,62 @@ export interface HeadlessMachineRecord {
   deskSession: DeskSessionRecord | null; // Background Admin ledger
   viewSession: ViewSessionRecord | null; // View Screen ledger
   interactiveUser: string; // who is signed in at the console ("" = nobody)
+  interactiveAway: boolean; // the signed-in pick's session is not live (disconnected/idle)
+  sessionsDiag: SessionsDiag | null; // compact session evidence behind the signed-in claim
+  pollOk: boolean | null; // last command poll landed (null = unreported)
+  pollError: string; // short failure reason when the last poll failed
+  pollAt: string; // RFC3339 of the last poll outcome
   runMode: string; // how the guard is hosted: "service" | "foreground" | "" (unreported)
+}
+
+/**
+ * The compact session diagnostic the engine folds into
+ * enrollments and heartbeats: how many sessions carry a user,
+ * split by state class, which session the selection picked
+ * (0 when none), and whether that pick is away. It exists so a
+ * "no one is signed in" claim in the console is always backed
+ * by the counts behind it (the owner's server reported nobody
+ * while a disconnected admin session sat on it, 2026-10-27).
+ */
+export interface SessionsDiag {
+  users: number;
+  active: number;
+  connected: number;
+  disconnected: number;
+  other: number;
+  picked: number;
+  away: boolean;
+}
+
+/**
+ * Validate and clamp an engine-sent session diagnostic. The
+ * fields are counts the engine computed over its own session
+ * table; anything malformed folds to null (unreported), never
+ * to invented numbers.
+ */
+export function foldSessionsDiag(value: unknown): SessionsDiag | null {
+  if (typeof value !== "object" || value === null) return null;
+  const v = value as Record<string, unknown>;
+  const count = (x: unknown): number | null =>
+    typeof x === "number" && Number.isFinite(x) && x >= 0
+      ? Math.min(Math.floor(x), 100000)
+      : null;
+  const users = count(v.users);
+  const active = count(v.active);
+  const connected = count(v.connected);
+  const disconnected = count(v.disconnected);
+  const other = count(v.other);
+  const picked = count(v.picked);
+  if (
+    users === null || active === null || connected === null ||
+    disconnected === null || other === null || picked === null
+  ) {
+    return null;
+  }
+  return {
+    users, active, connected, disconnected, other, picked,
+    away: v.away === true
+  };
 }
 
 /**
@@ -140,6 +195,11 @@ export interface HeadlessMachineView {
   deskSession: DeskSessionRecord | null;
   viewSession: ViewSessionRecord | null;
   interactiveUser: string;
+  interactiveAway: boolean;
+  sessionsDiag: SessionsDiag | null;
+  pollOk: boolean | null;
+  pollError: string;
+  pollAt: string;
   runMode: string;
 }
 
@@ -238,6 +298,11 @@ function headlessMachineView(
     deskSession: rec.deskSession,
     viewSession: rec.viewSession,
     interactiveUser: rec.interactiveUser,
+    interactiveAway: rec.interactiveAway,
+    sessionsDiag: rec.sessionsDiag,
+    pollOk: rec.pollOk,
+    pollError: rec.pollError,
+    pollAt: rec.pollAt,
     runMode: rec.runMode
   };
 }
@@ -388,6 +453,8 @@ export class MoverStore {
       profiles: unknown;
       capabilities: unknown;
       interactiveUser?: unknown;
+      interactiveAway?: unknown;
+      sessionsDiag?: unknown;
       runMode?: unknown;
     }
   ): HeadlessMachineRecord {
@@ -408,6 +475,11 @@ export class MoverStore {
       viewSession: null,
       interactiveUser:
         typeof init.interactiveUser === "string" ? init.interactiveUser : "",
+      interactiveAway: init.interactiveAway === true,
+      sessionsDiag: foldSessionsDiag(init.sessionsDiag),
+      pollOk: null,
+      pollError: "",
+      pollAt: "",
       runMode: typeof init.runMode === "string" ? init.runMode : ""
     };
     let byId = this.headlessMachines.get(account);
@@ -417,11 +489,18 @@ export class MoverStore {
     }
     // The session ledgers survive a re-enroll (secret rotation
     // must not erase how a session ended); the engine's next
-    // heartbeat refreshes them either way.
+    // heartbeat refreshes them either way. The same goes for
+    // the poll health: enroll bodies say nothing about polls,
+    // so a re-enroll must not clear the last poll report (the
+    // Go cloud's enroll folds the same way, by not touching
+    // the fields).
     const prior = byId.get(init.machineId);
     if (prior) {
       rec.deskSession = prior.deskSession;
       rec.viewSession = prior.viewSession;
+      rec.pollOk = prior.pollOk;
+      rec.pollError = prior.pollError;
+      rec.pollAt = prior.pollAt;
     }
     byId.set(rec.machineId, rec);
     // Drop ONLY never-delivered commands ("pending" here means
@@ -481,6 +560,9 @@ export class MoverStore {
       desk?: unknown;
       view?: unknown;
       interactiveUser?: unknown;
+      interactiveAway?: unknown;
+      sessionsDiag?: unknown;
+      poll?: unknown;
       runMode?: unknown;
     }
   ): boolean {
@@ -492,6 +574,22 @@ export class MoverStore {
     if ("progress" in beat) rec.progress = beat.progress;
     if (typeof beat.interactiveUser === "string") {
       rec.interactiveUser = beat.interactiveUser;
+    }
+    if (typeof beat.interactiveAway === "boolean") {
+      rec.interactiveAway = beat.interactiveAway;
+    }
+    if (beat.sessionsDiag !== undefined) {
+      const sd = foldSessionsDiag(beat.sessionsDiag);
+      if (sd) rec.sessionsDiag = sd;
+    }
+    if (typeof beat.poll === "object" && beat.poll !== null) {
+      const p = beat.poll as Record<string, unknown>;
+      if (typeof p.ok === "boolean") {
+        rec.pollOk = p.ok;
+        rec.pollError =
+          typeof p.error === "string" ? p.error.slice(0, 200) : "";
+        rec.pollAt = typeof p.at === "string" ? p.at.slice(0, 40) : "";
+      }
     }
     if (typeof beat.runMode === "string") {
       rec.runMode = beat.runMode;

@@ -1921,12 +1921,35 @@ compiled in, nothing else to carry or place beside it.</p>
     machines.forEach(function (m, i) {
       var caps = m.capabilities && typeof m.capabilities === "object" ? m.capabilities : {};
       var capNames = Object.keys(caps).filter(function (k) { return caps[k]; });
+      // Signed-in wording follows the pick: a live pick names
+      // the user; an away pick (session exists, not live) says
+      // so, so the row never claims a bare "signed in" for a
+      // disconnected session or a bare "no one" over one.
+      var signedIn = m.interactiveUser
+        ? (m.interactiveAway
+          ? "last seen signed in as " + m.interactiveUser + " (session away)"
+          : m.interactiveUser)
+        : "no one";
+      // The session evidence, when the engine reported it:
+      // "sessions: 2 (1 active, 1 disconnected)".
+      var sessText = "";
+      if (m.sessionsDiag) {
+        var sd = m.sessionsDiag;
+        var parts = [sd.active + " active"];
+        if (sd.connected) parts.push(sd.connected + " connected");
+        parts.push(sd.disconnected + " disconnected");
+        if (sd.other) parts.push(sd.other + " other");
+        sessText = " · sessions: " + sd.users + " (" + parts.join(", ") + ")";
+      }
       html += '<div class="mrow"><div><span class="dot' + (m.online ? " on" : "") + '"></span><strong>' +
         esc(m.name || m.machineId) + "</strong> " + pill(m.online ? "online" : "offline", m.online ? "ok" : "mut") + "</div>" +
         '<div class="meta">' + esc(m.machineId) + " · state: " + esc(m.state || "idle") +
-        " · signed in: " + esc(m.interactiveUser || "no one") +
+        " · signed in: " + esc(signedIn) + esc(sessText) +
         (m.runMode ? " · run mode: " + esc(m.runMode === "foreground" ? "temporary (foreground)" : m.runMode) : "") +
         " · capabilities: " + esc(capNames.length ? capNames.join(", ") : "none reported") + "</div>" +
+        (m.pollOk === false
+          ? '<div class="meta" style="color:var(--err)">Cannot hear orders: ' + esc(m.pollError || "the last order check failed") + "</div>"
+          : "") +
         (m.runMode === "foreground"
           ? '<div class="meta">Temporary mode: this guard stops when its window closes. Run the Host as administrator once to plant it permanently.</div>'
           : "") +

@@ -705,9 +705,11 @@ async function main() {
     check("machine secret does not authenticate under another account", r.status === 401);
 
     r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    const pollBody0 = await r.json().catch(() => null);
     check(
-      "command poll starts empty",
-      r.status === 200 && (await r.json()).commands?.length === 0
+      "command poll starts empty, as a bare top-level array (the protocol contract)",
+      r.status === 200 && Array.isArray(pollBody0) && pollBody0.length === 0,
+      JSON.stringify(pollBody0).slice(0, 120)
     );
 
     r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`);
@@ -769,6 +771,62 @@ async function main() {
       JSON.stringify(rmRow ?? {}).slice(0, 200)
     );
 
+    // Session evidence + poll health: the heartbeat carries who
+    // is signed in, whether the pick is away, the compact
+    // session diagnostic, and the last command poll's outcome;
+    // the record folds all four and the console list serves
+    // them, so a deaf or away machine never reads as a bare
+    // "idle" with "no one" signed in.
+    r = await beat(MAUTH, {
+      state: "idle",
+      interactiveUser: "Administrator",
+      interactiveAway: true,
+      sessions: { users: 1, active: 0, connected: 0, disconnected: 1, other: 0, picked: 2, away: true },
+      poll: { ok: false, error: "the server does not know this machine", at: "2026-10-27T17:00:00Z" }
+    });
+    const sessBeatOk = r.status === 200;
+    r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const sessList = await r.json();
+    const sessRow = (sessList.machines ?? []).find((m) => m.machineId === HL_MID);
+    check(
+      "session evidence folds from heartbeat into the machines list",
+      sessBeatOk && !!sessRow &&
+        sessRow.interactiveUser === "Administrator" &&
+        sessRow.interactiveAway === true &&
+        sessRow.sessionsDiag?.users === 1 &&
+        sessRow.sessionsDiag?.disconnected === 1 &&
+        sessRow.sessionsDiag?.picked === 2 &&
+        sessRow.sessionsDiag?.away === true,
+      JSON.stringify(sessRow ?? {}).slice(0, 240)
+    );
+    check(
+      "poll health folds from heartbeat into the machines list",
+      !!sessRow && sessRow.pollOk === false &&
+        sessRow.pollError === "the server does not know this machine" &&
+        sessRow.pollAt === "2026-10-27T17:00:00Z",
+      JSON.stringify(sessRow ?? {}).slice(0, 240)
+    );
+    r = await beat(MAUTH, {
+      state: "idle",
+      interactiveUser: "Administrator",
+      interactiveAway: false,
+      sessions: { users: "many", active: -3 },
+      poll: { ok: true, error: "", at: "2026-10-27T17:01:00Z" }
+    });
+    r = await fetch(`${a}/mover/console/api/machines?accountId=${HL_ACC}`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const sessRow2 = ((await r.json()).machines ?? []).find((m) => m.machineId === HL_MID);
+    check(
+      "a malformed session diagnostic is refused (last good kept), away and poll clear",
+      !!sessRow2 && sessRow2.interactiveAway === false &&
+        sessRow2.sessionsDiag?.disconnected === 1 &&
+        sessRow2.pollOk === true && sessRow2.pollError === "",
+      JSON.stringify(sessRow2 ?? {}).slice(0, 240)
+    );
+
     r = await fetch(`${a}/mover/console/api/machines/${HL_MID}/scan`, {
       method: "POST",
       headers: KH,
@@ -784,13 +842,13 @@ async function main() {
     const polled = await r.json();
     check(
       "machine polls the scan command (unsigned)",
-      polled.commands?.length === 1 &&
-        polled.commands[0].id === scanQueued.commandId &&
-        polled.commands[0].type === "scan" &&
-        !("signature" in polled.commands[0])
+      polled.length === 1 &&
+        polled[0].id === scanQueued.commandId &&
+        polled[0].type === "scan" &&
+        !("signature" in polled[0])
     );
     r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
-    check("command poll clears the queue", (await r.json()).commands?.length === 0);
+    check("command poll clears the queue", (await r.json()).length === 0);
     r = await fetch(`${a}/api/headless/commands/${scanQueued.commandId}/result`, {
       method: "POST",
       headers: { ...MAUTH, "content-type": "application/json" },
@@ -832,7 +890,7 @@ async function main() {
       browseQ.status === 200 && pathsQ.status === 200
     );
     r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
-    const cmds2 = (await r.json()).commands ?? [];
+    const cmds2 = (await r.json()) ?? [];
     check(
       "browse + paths arrive with their payloads",
       cmds2.length === 2 &&
@@ -870,7 +928,7 @@ async function main() {
       JSON.stringify(startQueued)
     );
     r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
-    const startCmd = ((await r.json()).commands ?? [])[0];
+    const startCmd = ((await r.json()) ?? [])[0];
     const expectedSig = createHmac("sha256", SECRET)
       .update(
         JSON.stringify(
@@ -911,7 +969,7 @@ async function main() {
       reScanQ.status === 200 && reBrowseQ.status === 200
     );
     r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
-    const rePolled = (await r.json()).commands ?? [];
+    const rePolled = (await r.json()) ?? [];
     check(
       "re-enroll scenario: both commands delivered by poll",
       rePolled.length === 2 &&
@@ -954,7 +1012,7 @@ async function main() {
     r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH2 });
     check(
       "after re-enroll the poll is empty (undelivered dropped, delivered not re-sent)",
-      r.status === 200 && (await r.json()).commands?.length === 0
+      r.status === 200 && (await r.json()).length === 0
     );
     r = await fetch(
       `${a}/api/headless/commands/${rePendingQ.data.commandId}/result`,
@@ -1106,7 +1164,7 @@ async function main() {
         body: JSON.stringify({ result })
       });
     const pollCmds = async () =>
-      ((await (await fetch(`${a}/api/headless/commands`, { headers: DAUTH })).json()).commands ?? []);
+      ((await (await fetch(`${a}/api/headless/commands`, { headers: DAUTH })).json()) ?? []);
 
     const deskOpenQ = await opQueue("desk-open", { width: 640, height: 400 });
     check("operator queues desk-open", deskOpenQ.status === 200 && !!deskOpenQ.data.commandId);
@@ -1309,7 +1367,7 @@ async function main() {
         body: JSON.stringify({ result })
       });
     const pollCmdsV = async () =>
-      ((await (await fetch(`${a}/api/headless/commands`, { headers: VAUTH })).json()).commands ?? []);
+      ((await (await fetch(`${a}/api/headless/commands`, { headers: VAUTH })).json()) ?? []);
 
     const viewOpenQ = await opQueueV("view-open", {});
     check("operator queues view-open", viewOpenQ.status === 200 && !!viewOpenQ.data.commandId);
@@ -1511,8 +1569,7 @@ async function main() {
       return { status: res.status, data: await res.json().catch(() => ({})) };
     };
     const pollFiles = async () =>
-      ((await (await fetch(`${a}/api/headless/commands`, { headers: FAUTH })).json())
-        .commands ?? []);
+      ((await (await fetch(`${a}/api/headless/commands`, { headers: FAUTH })).json()) ?? []);
     const postFilesResult = (commandId, result) =>
       fetch(`${a}/api/headless/commands/${commandId}/result`, {
         method: "POST",
