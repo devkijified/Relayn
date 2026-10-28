@@ -20,6 +20,7 @@ import { randomBytes } from "node:crypto";
 
 import type { MoverStore } from "./mover-store.js";
 import type { StateDocs } from "./storage.js";
+import type { PartitionCatalog } from "./partition-catalog.js";
 
 export interface PartitionFileRef {
   packPath: string;
@@ -102,7 +103,7 @@ function baseName(packPath: string): string {
  * restart loses nothing that cannot be recomputed.
  */
 /** Shell-set prefixes the Partition auto-pull always pulls first. */
-const PARTITION_SHELL_PREFIXES = [
+export const PARTITION_SHELL_PREFIXES = [
   "files/Desktop",
   "appData/Roaming/Microsoft/Windows/Start Menu/Programs",
   "appData/Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar",
@@ -126,12 +127,24 @@ export class PartitionStore {
   private indexes = new Map<string, Map<string, MachineIndex>>(); // account -> machineId -> index
   private ledgers = new Map<string, PartitionMutateRecord[]>(); // account|machineId -> records
   private readonly docs: StateDocs;
+  // Catalog-first (doc 23): the standing catalog is the Partition
+  // listing source. Sealed-move rebuild CONFIRMS available rows + moveId
+  // into it. Optional so direct constructions (and old call sites) keep
+  // working; index.ts wires it in production.
+  private readonly catalog?: PartitionCatalog;
 
   constructor(
     private readonly moverStore: MoverStore,
-    docs?: StateDocs
+    docs?: StateDocs,
+    catalog?: PartitionCatalog
   ) {
     this.docs = docs ?? moverStore.docs;
+    this.catalog = catalog;
+  }
+
+  /** The catalog this store confirms available rows into (may be unset). */
+  getCatalog(): PartitionCatalog | undefined {
+    return this.catalog;
   }
 
   private accMap(account: string): Map<string, MachineIndex> {
@@ -287,6 +300,21 @@ export class PartitionStore {
     await this.loadLedger(account, machineId);
 
     const shellFileCount = shellFileCountOf(files);
+    // Catalog-first integration (ruling A): the rebuild confirms the
+    // sealed, hash-bearing rows into the standing catalog as `available`
+    // with their moveId bound. The catalog is the Partition listing
+    // source; this keeps it in step with the freshest sealed bytes.
+    if (this.catalog) {
+      const refs = Array.from(files.values()).map((ref) => ({
+        packPath: ref.packPath,
+        size: ref.size,
+        modTime: ref.modTime,
+        moveId: ref.moveId,
+        category: ref.category,
+        sha256: ref.sha256
+      }));
+      await this.catalog.confirmAvailableFromRefs(account, machineId, refs);
+    }
     return {
       machineId,
       fileCount: files.size,

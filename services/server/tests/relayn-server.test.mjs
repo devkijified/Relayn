@@ -3250,9 +3250,13 @@ async function main() {
     } catch {
       partFiles = ["<missing>"];
     }
+    // Catalog-first (doc 23): the partition dir now holds the standing
+    // catalog.json (state-class listing source) BESIDE ledger.json. Both
+    // are StateDocs JSON; neither is a bulk BYTE store. The guard still
+    // forbids any second byte store -- anything other than these two.
     check(
-      "partition disk holds only ledger.json (no second byte store)",
-      partFiles.join(",") === "ledger.json",
+      "partition disk holds only state JSON (catalog + ledger, no byte store)",
+      partFiles.slice().sort().join(",") === "catalog.json,ledger.json",
       JSON.stringify(partFiles)
     );
 

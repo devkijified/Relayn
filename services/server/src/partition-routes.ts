@@ -12,6 +12,15 @@
 //   GET  /api/partition/:machineId/pins
 //   POST /api/partition/:machineId/mutate   { op, path, newName?, confirmed }
 //   GET  /api/partition/:machineId/ledger
+//   GET  /api/partition/:machineId/catalog                 (catalog doc)
+//   GET  /api/partition/:machineId/catalog/browse?prefix=  (catalog ONLY)
+//   POST /api/partition/:machineId/catalog/refresh         (merge revision)
+//   GET  /api/partition/:machineId/seeder                  (server-held plan)
+//   POST /api/partition/:machineId/seeder/bump { path }    (on-demand)
+//
+// Catalog-first (doc 23): the Partition lists from the CATALOG ONLY
+// (ruling A). catalog/browse never merges a live Host browse. The legacy
+// /browse above stays as the sealed-move view (FALLBACK + Files use).
 //
 // Viewer talks to the cloud with X-Account-Id (+ X-Machine-Id naming the
 // Partition target). Never queues Host files-browse / desk-*. Source
@@ -22,8 +31,14 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import { isValidHeadlessMachineId, type MoverStore } from "./mover-store.js";
+import {
+  HEADLESS_ONLINE_MS,
+  isValidHeadlessMachineId,
+  type MoverStore
+} from "./mover-store.js";
 import type { PartitionStore } from "./partition-store.js";
+import type { PartitionCatalog } from "./partition-catalog.js";
+import type { PartitionSeeder } from "./partition-seeder.js";
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -57,9 +72,21 @@ function machineParam(request: FastifyRequest): string {
 
 export async function partitionRoutes(
   app: FastifyInstance,
-  options: { partitionStore: PartitionStore; moverStore: MoverStore }
+  options: {
+    partitionStore: PartitionStore;
+    moverStore: MoverStore;
+    catalog: PartitionCatalog;
+    seeder: PartitionSeeder;
+  }
 ): Promise<void> {
-  const { partitionStore, moverStore } = options;
+  const { partitionStore, moverStore, catalog, seeder } = options;
+
+  // Host-awake gate (same window the machine list uses). Seeding and the
+  // three-state vocabulary turn on this, NOT on any mechanism word.
+  function hostAwake(acc: string, machineId: string): boolean {
+    const rec = moverStore.getHeadlessMachine(acc, machineId);
+    return !!rec && Date.now() - rec.lastSeenMs <= HEADLESS_ONLINE_MS;
+  }
 
   app.setErrorHandler((error, _request, reply) => {
     const err = error as {
@@ -218,5 +245,118 @@ export async function partitionRoutes(
     const machineId = machineParam(request);
     if (!machineId) return reply.code(400).send({ error: "machineId required" });
     return { records: await partitionStore.listLedger(acc, machineId) };
+  });
+
+  // ---- catalog-first routes (doc 23) --------------------------------
+
+  app.get("/api/partition/:machineId/catalog", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    const machineId = machineParam(request);
+    if (!machineId) return reply.code(400).send({ error: "machineId required" });
+    const ledger = await partitionStore.listLedger(acc, machineId);
+    const doc = await catalog.load(acc, machineId);
+    const counts = await catalog.counts(acc, machineId, ledger);
+    // Ledger stays authoritative over the catalog (ruling F): report the
+    // live (ledger-overlaid) entries alongside the raw revision stamp.
+    const entries = await catalog.liveEntries(acc, machineId, ledger);
+    return {
+      machineId,
+      revisedAt: doc.revisedAt,
+      hostCatalogAt: doc.hostCatalogAt,
+      counts,
+      entries
+    };
+  });
+
+  app.get(
+    "/api/partition/:machineId/catalog/browse",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const q = request.query as {
+        prefix?: string;
+        offset?: string;
+        limit?: string;
+      };
+      const ledger = await partitionStore.listLedger(acc, machineId);
+      // RULING A: catalog ONLY. No live Host browse is merged here.
+      return catalog.browse(acc, machineId, q.prefix || "", ledger, {
+        offset: q.offset ? Number(q.offset) : 0,
+        limit: q.limit ? Number(q.limit) : 200
+      });
+    }
+  );
+
+  app.post(
+    "/api/partition/:machineId/catalog/refresh",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const body = (request.body ?? {}) as { entries?: unknown };
+      const raw = Array.isArray(body.entries) ? body.entries : [];
+      const incoming = raw
+        .map((row) => {
+          const r = (row ?? {}) as Record<string, unknown>;
+          const packPath =
+            typeof r.packPath === "string"
+              ? r.packPath
+              : typeof r.path === "string"
+                ? (r.path as string)
+                : "";
+          return {
+            packPath,
+            size: typeof r.size === "number" ? r.size : 0,
+            modTime: typeof r.modTime === "number" ? r.modTime : 0,
+            hash: typeof r.hash === "string" ? r.hash : undefined,
+            category: typeof r.category === "string" ? r.category : undefined
+          };
+        })
+        .filter((r) => r.packPath);
+      const doc = await catalog.mergeHostCatalog(acc, machineId, incoming);
+      const ledger = await partitionStore.listLedger(acc, machineId);
+      const counts = await catalog.counts(acc, machineId, ledger);
+      return { machineId, revisedAt: doc.revisedAt, counts };
+    }
+  );
+
+  app.get("/api/partition/:machineId/seeder", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    const machineId = machineParam(request);
+    if (!machineId) return reply.code(400).send({ error: "machineId required" });
+    const ledger = await partitionStore.listLedger(acc, machineId);
+    return seeder.plan(acc, machineId, hostAwake(acc, machineId), ledger);
+  });
+
+  app.post("/api/partition/:machineId/seeder/bump", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    const machineId = machineParam(request);
+    if (!machineId) return reply.code(400).send({ error: "machineId required" });
+    const body = (request.body ?? {}) as { path?: unknown };
+    const packPath =
+      typeof body.path === "string"
+        ? body.path.replace(/^\/+|\/+$/g, "")
+        : "";
+    if (!packPath) return reply.code(400).send({ error: "path required" });
+    const ledger = await partitionStore.listLedger(acc, machineId);
+    const result = await seeder.bump(
+      acc,
+      machineId,
+      packPath,
+      hostAwake(acc, machineId),
+      ledger
+    );
+    if (result.state === "unknown") {
+      return reply.code(404).send({ error: "path not in catalog" });
+    }
+    return { path: packPath, state: result.state };
   });
 }

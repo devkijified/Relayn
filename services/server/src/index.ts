@@ -31,7 +31,9 @@ import { headlessRoutes } from "./mover-headless.js";
 import { moverConsoleRoutes } from "./mover-console.js";
 import { moverRoutes } from "./mover-routes.js";
 import { MoverStore } from "./mover-store.js";
+import { PartitionCatalog } from "./partition-catalog.js";
 import { partitionRoutes } from "./partition-routes.js";
+import { PartitionSeeder } from "./partition-seeder.js";
 import { PartitionStore } from "./partition-store.js";
 import { shareRoutes } from "./share-routes.js";
 import { ShareStore } from "./share-store.js";
@@ -59,7 +61,16 @@ const shareStore = new ShareStore(moverStore.docs);
 await shareStore.init();
 const backupStore = new BackupStore(moverStore.docs);
 await backupStore.init();
-const partitionStore = new PartitionStore(moverStore, moverStore.docs);
+// Catalog-first (doc 23): the standing catalog is the Partition listing
+// source (StateDocs, state-class, never swept). The seeder is the
+// server-held pull plan. Whole-root auto-pull (doc 22) stays FALLBACK.
+const partitionCatalog = new PartitionCatalog(moverStore.docs);
+const partitionSeeder = new PartitionSeeder(partitionCatalog);
+const partitionStore = new PartitionStore(
+  moverStore,
+  moverStore.docs,
+  partitionCatalog
+);
 // The owner license registry (durable, seeded with the owner and
 // assistant accounts). The console reads and changes it; the headless
 // enroll gate and the console download gates enforce revocations.
@@ -99,7 +110,12 @@ await app.register(moverRoutes, { moverStore });
 
 // THE PARTITION: per-machine materialized view over sealed moves
 // (enumerations + file refs). Operator auth = X-Account-Id.
-await app.register(partitionRoutes, { partitionStore, moverStore });
+await app.register(partitionRoutes, {
+  partitionStore,
+  moverStore,
+  catalog: partitionCatalog,
+  seeder: partitionSeeder
+});
 
 // Relayn Mover headless track: machines with no signed-in user
 // enroll, heartbeat, poll for commands and post results. Starts are
@@ -145,6 +161,8 @@ const shutdown = async (signal: string) => {
   backupStore.shutdown();
   moverStore.shutdown();
   partitionStore.shutdown();
+  partitionCatalog.shutdown();
+  partitionSeeder.shutdown();
   await app.close();
   process.exit(0);
 };
