@@ -92,10 +92,18 @@ function boot(port, extraEnv) {
       CORS_ORIGIN: "",
       ...extraEnv
     },
-  "stdio": ["ignore", "pipe", "pipe"]
+  "stdio": ["ignore", "pipe", "pipe"],
+    // Own process group: tsx forks the real server as a grandchild,
+    // so a signal to the tsx wrapper alone orphans the server.
+    detached: true
   });
   child.stderr.on("data", (d) => process.stderr.write(`[srv ${port}] ${d}`));
   return child;
+}
+
+// Signal the whole group (tsx wrapper + the server it forked).
+function killTree(child, sig) {
+  try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} }
 }
 
 // Parse the Mover inbuilt-config overlay off the tail of a merged
@@ -3681,8 +3689,12 @@ async function main() {
     );
 
     // Kill R1 outright: durability must not depend on a clean exit.
-    r1child.kill("SIGKILL");
+    killTree(r1child, "SIGKILL");
     await new Promise((res) => setTimeout(res, 800));
+    check(
+      "R1 is really gone after SIGKILL (no orphaned server on its port)",
+      !(await fetch(`${r1}/health`).then(() => true, () => false))
+    );
 
     children.push(
       boot(R2, {
@@ -3807,7 +3819,7 @@ async function main() {
       `got ${r.status}`
     );
   } finally {
-    for (const child of children) child.kill("SIGTERM");
+    for (const child of children) killTree(child, "SIGTERM");
   }
 
   console.log(`\n${passed} passed, ${failed} failed`);
