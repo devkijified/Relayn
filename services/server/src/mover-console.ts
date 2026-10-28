@@ -3619,7 +3619,7 @@ const DESK_VIEWER_HTML = `<!doctype html>
 ${SHARED_CSS}
 
   body { max-width: 1100px; margin-top: 2rem; }
-  #frame { width: 100%; max-width: 100%; height: auto; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; cursor: crosshair; }
+  #frame { width: 100%; max-width: 100%; max-height: 70vh; height: auto; object-fit: contain; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; cursor: crosshair; }
   #frame:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
   .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin: 0.8rem 0; }
   #status { white-space: pre-wrap; }
@@ -3669,8 +3669,8 @@ ${SHARED_CSS}
   <span style="flex:1"></span>
   <button type="button" id="end">End session</button>
 </div>
-<p class="meta">Click the picture to click on the private desktop. Type while the
-picture has focus to type there. Scrolling over the picture scrolls there.
+<p class="meta">Click the live desk to click on the private desktop. Type while the
+desk has focus to type there. Scrolling over the desk scrolls there.
 Ending the session here is final: the desktop and everything open on it closes.</p>
 <script>
   var qs = new URLSearchParams(location.search);
