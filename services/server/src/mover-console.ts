@@ -3619,7 +3619,7 @@ const DESK_VIEWER_HTML = `<!doctype html>
 ${SHARED_CSS}
 
   body { max-width: 1100px; margin-top: 2rem; }
-  #frame { width: 100%; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; cursor: crosshair; }
+  #frame { width: 100%; max-width: 100%; height: auto; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; cursor: crosshair; }
   #frame:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
   .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin: 0.8rem 0; }
 </style>
@@ -3798,7 +3798,7 @@ const VIEW_VIEWER_HTML = `<!doctype html>
 ${SHARED_CSS}
 
   body { max-width: 1100px; margin-top: 2rem; }
-  #frame { width: 100%; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; }
+  #frame { width: 100%; max-width: 100%; height: auto; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; }
   .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin: 0.8rem 0; }
 </style>
 </head>
