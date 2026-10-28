@@ -3247,6 +3247,140 @@ async function main() {
       JSON.stringify(partFiles)
     );
 
+    // ---- owner bug 2026-10-28: refresh must merge every bound move --
+    // The owner pulled 123.txt + Hostinger.txt, then lufixsender, and
+    // the refresh showed only lufixsender. The view is a UNION of all
+    // bound moves (newest wins per path); a rebuild must never drop
+    // an older move's files. These pins name that exact shape.
+    const R_MID = "merge-pc-173";
+    const R_NAME = "MERGE-173";
+    r = await fetch(`${pd}/api/headless/enroll`, {
+      method: "POST",
+      headers: PH,
+      body: JSON.stringify({ machineId: R_MID, name: R_NAME, os: "Windows 11 Pro" })
+    });
+    check("partition merge: second machine enrolled", r.status === 200, `got ${r.status}`);
+    const RMOVE_A = "move-merge-0001";
+    r = await announceMove(PH, R_NAME, {
+      moveId: RMOVE_A,
+      name: "Merge pull A",
+      sourceName: R_NAME,
+      files: [
+        pf("files/Desktop/123.txt", 10, 1000, "sha-123"),
+        pf("files/Desktop/Hostinger.txt", 20, 1000, "sha-hostinger")
+      ],
+      chunks: [],
+      totalBytes: 30,
+      totalFiles: 2
+    });
+    check("partition merge: move A announced", r.status === 200, `got ${r.status}`);
+    const RMOVE_B = "move-merge-0002";
+    r = await announceMove(PH, R_NAME, {
+      moveId: RMOVE_B,
+      name: "Merge pull B",
+      sourceName: R_MID,
+      files: [pf("files/Desktop/lufixsenderv1.exe", 30, 2000, "sha-lufix")],
+      chunks: [],
+      totalBytes: 30,
+      totalFiles: 1
+    });
+    check("partition merge: move B announced", r.status === 200, `got ${r.status}`);
+    r = await ppost(P_ACC, R_MID, "rebuild");
+    const rbuilt = await r.json().catch(() => ({}));
+    check(
+      "partition merge: rebuild unions both moves (3 files, 2 moves)",
+      r.status === 200 &&
+        rbuilt.fileCount === 3 &&
+        rbuilt.moveIds?.length === 2 &&
+        rbuilt.moveIds.includes(RMOVE_A) &&
+        rbuilt.moveIds.includes(RMOVE_B),
+      JSON.stringify(rbuilt)
+    );
+    r = await pget(P_ACC, R_MID, "desktop-icons");
+    const ricons = await r.json().catch(() => ({}));
+    check(
+      "partition merge: desktop shows every pulled file together",
+      r.status === 200 &&
+        ricons.children?.map((c) => c.name).sort().join(",") ===
+          "123.txt,Hostinger.txt,lufixsenderv1.exe",
+      JSON.stringify(ricons)
+    );
+    // A second rebuild (the owner's refresh) must not drop older moves.
+    r = await ppost(P_ACC, R_MID, "rebuild");
+    const rbuilt2 = await r.json().catch(() => ({}));
+    check(
+      "partition merge: second rebuild keeps all three files",
+      r.status === 200 && rbuilt2.fileCount === 3,
+      JSON.stringify(rbuilt2)
+    );
+    r = await pget(P_ACC, R_MID, "desktop-icons");
+    const ricons2 = await r.json().catch(() => ({}));
+    check(
+      "partition merge: icons unchanged after refresh",
+      ricons2.children?.map((c) => c.name).sort().join(",") ===
+        "123.txt,Hostinger.txt,lufixsenderv1.exe",
+      JSON.stringify(ricons2)
+    );
+    // Same-path conflict: the newer move's version wins, shown once.
+    const RMOVE_C = "move-merge-0003";
+    r = await announceMove(PH, R_NAME, {
+      moveId: RMOVE_C,
+      name: "Merge pull C",
+      sourceName: R_MID,
+      files: [pf("files/Desktop/123.txt", 99, 3000, "sha-123-new")],
+      chunks: [],
+      totalBytes: 99,
+      totalFiles: 1
+    });
+    check("partition merge: move C announced", r.status === 200, `got ${r.status}`);
+    r = await ppost(P_ACC, R_MID, "rebuild");
+    const rbuilt3 = await r.json().catch(() => ({}));
+    check(
+      "partition merge: conflict keeps fileCount at 3",
+      r.status === 200 && rbuilt3.fileCount === 3,
+      JSON.stringify(rbuilt3)
+    );
+    r = await pget(P_ACC, R_MID, "document?path=" + encodeURIComponent("files/Desktop/123.txt"));
+    const rdoc = await r.json().catch(() => ({}));
+    check(
+      "partition merge: newer move wins the same path (once, C's ref)",
+      r.status === 200 &&
+        rdoc.moveId === RMOVE_C &&
+        rdoc.size === 99 &&
+        rdoc.sha256 === "sha-123-new",
+      JSON.stringify(rdoc)
+    );
+    // Ledger on top of the merged view: delete hides, rename shows once.
+    r = await ppost(P_ACC, R_MID, "mutate", {
+      op: "delete",
+      path: "files/Desktop/Hostinger.txt",
+      confirmed: true
+    });
+    check("partition merge: delete Hostinger -> 200", r.status === 200, `got ${r.status}`);
+    r = await pget(P_ACC, R_MID, "desktop-icons");
+    const ricons3 = await r.json().catch(() => ({}));
+    check(
+      "partition merge: deleted file drops, other moves stay",
+      ricons3.children?.map((c) => c.name).sort().join(",") ===
+        "123.txt,lufixsenderv1.exe",
+      JSON.stringify(ricons3)
+    );
+    r = await ppost(P_ACC, R_MID, "mutate", {
+      op: "rename",
+      path: "files/Desktop/lufixsenderv1.exe",
+      newName: "lufixsender.exe",
+      confirmed: true
+    });
+    check("partition merge: rename lufix -> 200", r.status === 200, `got ${r.status}`);
+    r = await pget(P_ACC, R_MID, "desktop-icons");
+    const ricons4 = await r.json().catch(() => ({}));
+    check(
+      "partition merge: renamed file shows under the new name only",
+      ricons4.children?.map((c) => c.name).sort().join(",") ===
+        "123.txt,lufixsender.exe",
+      JSON.stringify(ricons4)
+    );
+
     // ---- machineId hygiene --------------------------------------------
     // The ledger lives at <dataDir>/<account>/_partition/<machineId>/,
     // so a machineId carrying path segments must never reach the store:
