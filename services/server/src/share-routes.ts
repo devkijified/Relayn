@@ -239,7 +239,7 @@ export async function shareRoutes(
       keyB64 = body.key as string;
     }
 
-    const record = shareStore.create(
+    const record = await shareStore.create(
       body.blob,
       body.cookieCount as number,
       body.siteCount as number,
@@ -283,7 +283,7 @@ export async function shareRoutes(
       });
     }
 
-    const result = shareStore.consume(id);
+    const result = await shareStore.consume(id);
 
     if (result === undefined) {
       return reply.code(404).send({
@@ -351,7 +351,7 @@ export async function shareRoutes(
       });
     }
 
-    const result = shareStore.getAccountShare(accountId, shareId);
+    const result = await shareStore.getAccountShare(accountId, shareId);
     if (result === undefined) {
       return reply.code(404).send({
         error: "SHARE_NOT_FOUND",

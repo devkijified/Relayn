@@ -381,7 +381,7 @@ export async function extConsoleRoutes(
       createdAt: new Date().toISOString()
     };
     pairs.push(pair);
-    licenseStore?.issue("ext", pair.accountId, "Console EXT pair", "");
+    await licenseStore?.issue("ext", pair.accountId, "Console EXT pair", "");
     return pair;
   });
 

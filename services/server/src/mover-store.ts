@@ -10,33 +10,39 @@
 // data directory until the Admin pulls them. The server never sees
 // plaintext and never sees a pack key.
 //
-// Every lookup resolves inside <dataDir>/<accountId>/ only, so one
-// pair can never list, fetch or stream another pair's moves.
-// Possession of the account ID IS the authorization — the standing
-// Relayn account model (see share-store.ts).
+// Every lookup resolves inside <accountId>/ only, so one pair can
+// never list, fetch or stream another pair's moves. Possession of
+// the account ID IS the authorization — the standing Relayn account
+// model (see share-store.ts).
 //
-// Layout on disk:
-//   <dataDir>/<accountId>/<moveId>/meta.json      (MoveMeta)
-//   <dataDir>/<accountId>/<moveId>/manifest.json  (the pack manifest)
-//   <dataDir>/<accountId>/<moveId>/chunks/<n>     (one sealed chunk)
+// Layout in the object store (storage.ts; the LOCAL backend maps
+// keys to files under <dataDir>, the R2 backend to bucket objects):
+//   <accountId>/<moveId>/meta.json      (MoveMeta)          BULK
+//   <accountId>/<moveId>/manifest.json  (the pack manifest) BULK
+//   <accountId>/<moveId>/chunks/<n>     (one sealed chunk)  BULK
 //
 // Presence (machines) is held in memory only, exactly like the Go
 // server: a restart clears it and the apps re-register on heartbeat.
 //
-// Configuration (env, defaults match the Go cloud config):
-//   MOVER_DATA_DIR          ./mover-data
-//   MOVER_RETENTION_HOURS   168   (move dirs older than this are swept;
-//                                  0 keeps everything forever)
-//   MOVER_CLEANUP_EVERY_MIN 60
+// Configuration (env):
+//   MOVER_DATA_DIR          ./mover-data (the LOCAL backend's root;
+//                                  with R2 selected it is unused for
+//                                  data but still names the fallback)
+//   MOVER_BULK_WINDOW_DAYS  14    (bulk idle window, from LAST USE;
+//                                  0 keeps bulk forever)
+//   MOVER_BULK_WINDOW_MS    0     (millisecond override of the
+//                                  window; tests use it)
 //   MOVER_MAX_CHUNK_MB      64    (per-chunk upload cap; 0 = no cap)
 // =========================================================================
 
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { promises as fs } from "node:fs";
-import path from "node:path";
 
-import { loadStateFile, saveStateFile } from "./state-file.js";
+import {
+  StateDocs,
+  bulkUnitOf,
+  createObjectStorage,
+  type ObjectStorage
+} from "./storage.js";
 
 export interface MoverMachine {
   account: string;
@@ -72,8 +78,8 @@ export interface MoveMeta {
 // Headless state is DURABLE: enrollments (secret included),
 // queued and delivered commands with their results, and the
 // Files and anchor ledgers are written through to JSON files
-// under <dataDir>/state/ on every mutation and reloaded at
-// boot (see state-file.ts). A restart or redeploy therefore
+// under state/ on the object store on every mutation and
+// reloaded at boot (see storage.ts). A restart or redeploy therefore
 // keeps machines enrolled (their secrets and the signatures on
 // still-queued signed commands stay valid), keeps commands in
 // flight, and keeps the ledgers. lastSeenMs persists with each
@@ -243,7 +249,7 @@ export function foldAnchorState(value: unknown): AnchorState | null {
  * an anchor command result, folded from the result's "anchor"
  * object and stamped with the reporting machine and the server
  * receipt time. The Files ledger's twin: durable, persisted
- * under <dataDir>/state/ and reloaded at boot.
+ * under state/ on the object store and reloaded at boot.
  */
 export interface AnchorLedgerRecord {
   accountId: string;
@@ -306,7 +312,7 @@ export interface HeadlessCommand {
  * ({ direction, path, size, outcome }) plus who reported it and
  * when the server received the report ("at", RFC3339 UTC). The
  * ledger is durable, like the headless registry: it persists
- * under <dataDir>/state/ and reloads at boot.
+ * under state/ on the object store and reloads at boot.
  */
 export interface FilesTransferRecord {
   accountId: string;
@@ -397,8 +403,8 @@ function headlessMachineView(
 
 export interface MoverCloudConfig {
   dataDir: string;
-  retentionHours: number;
-  cleanupEveryMin: number;
+  /** Bulk idle window in milliseconds; 0 keeps bulk forever. */
+  bulkWindowMs: number;
   maxChunkMB: number;
   /** Effective per-chunk cap in bytes; 0 means no explicit cap. */
   maxChunkBytes: number;
@@ -420,10 +426,17 @@ export function loadMoverConfig(
   env: NodeJS.ProcessEnv = process.env
 ): MoverCloudConfig {
   const maxChunkMB = envInt(env.MOVER_MAX_CHUNK_MB, 64, 0, 4096);
+  const windowMsOverride = envInt(
+    env.MOVER_BULK_WINDOW_MS,
+    0,
+    0,
+    1_000_000_000_000
+  );
+  const windowDays = envInt(env.MOVER_BULK_WINDOW_DAYS, 14, 0, 3650);
   return {
     dataDir: env.MOVER_DATA_DIR?.trim() || "./mover-data",
-    retentionHours: envInt(env.MOVER_RETENTION_HOURS, 168, 0, 24 * 365),
-    cleanupEveryMin: envInt(env.MOVER_CLEANUP_EVERY_MIN, 60, 1, 24 * 60),
+    bulkWindowMs:
+      windowMsOverride > 0 ? windowMsOverride : windowDays * 86_400_000,
     maxChunkMB,
     maxChunkBytes: maxChunkMB > 0 ? maxChunkMB * 1024 * 1024 : 0
   };
@@ -446,21 +459,12 @@ function rfc3339Now(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
 
-async function writeFileJSON(file: string, value: unknown): Promise<void> {
-  await fs.writeFile(file, JSON.stringify(value, null, 2), "utf8");
-}
-
-async function readFileJSON<T>(file: string): Promise<T | undefined> {
-  try {
-    const raw = await fs.readFile(file, "utf8");
-    return JSON.parse(raw) as T;
-  } catch {
-    return undefined;
-  }
-}
-
 export class MoverStore {
   readonly config: MoverCloudConfig;
+  /** The object store every byte below rides on (storage.ts). */
+  readonly storage: ObjectStorage;
+  /** State documents on that store; the other stores share it. */
+  readonly docs: StateDocs;
   private machines = new Map<string, MoverMachine[]>();
   private headlessMachines = new Map<
     string,
@@ -469,21 +473,35 @@ export class MoverStore {
   private headlessCommands = new Map<string, HeadlessCommand>();
   private filesTransfers: FilesTransferRecord[] = [];
   private anchorTransfers: AnchorLedgerRecord[] = [];
+  /** "<account>/<moveId>" -> last use (epoch ms); durable via state/bulk-use.json. */
+  private bulkUse = new Map<string, number>();
   private sweepTimer?: NodeJS.Timeout;
 
-  constructor(config: MoverCloudConfig = loadMoverConfig()) {
+  constructor(
+    config: MoverCloudConfig = loadMoverConfig(),
+    storage?: ObjectStorage
+  ) {
     this.config = config;
-    mkdirSync(this.config.dataDir, { recursive: true });
-    this.loadHeadlessState();
-    // Retention sweep (Go cleanupLoop): move directories whose mtime
-    // is older than the retention window are deleted. Zero retention
-    // keeps everything forever.
-    if (this.config.retentionHours > 0) {
+    this.storage = storage ?? createObjectStorage(config.dataDir);
+    this.docs = new StateDocs(this.storage);
+  }
+
+  /**
+   * Boot: reload durable headless state, seed the bulk last-use
+   * index from whatever bulk already rests in the store, run the
+   * bulk window sweep once, then daily. Called once from index.ts
+   * before routes are registered.
+   */
+  async init(): Promise<void> {
+    await this.loadHeadlessState();
+    await this.loadBulkUse();
+    if (this.config.bulkWindowMs > 0) {
+      await this.sweepBulkWindow();
       this.sweepTimer = setInterval(
         () => {
-          void this.sweepExpired();
+          void this.sweepBulkWindow();
         },
-        this.config.cleanupEveryMin * 60_000
+        24 * 60 * 60_000
       );
       this.sweepTimer.unref();
     }
@@ -494,26 +512,26 @@ export class MoverStore {
   }
 
   // -----------------------------------------------------------------
-  // Headless durability: write-through state files under
-  // <dataDir>/state/. Every mutation below persists before it
-  // returns; loads happen once, here, at construction.
+  // Headless durability: write-through state documents under
+  // state/ on the object store. Every mutation below persists
+  // before it returns; loads happen once, in init(), at boot.
   // -----------------------------------------------------------------
 
-  private headlessMachinesFile(): string {
-    return path.join(this.config.dataDir, "state", "headless-machines.json");
+  private headlessMachinesKey(): string {
+    return "state/headless-machines.json";
   }
 
-  private headlessCommandsFile(): string {
-    return path.join(this.config.dataDir, "state", "headless-commands.json");
+  private headlessCommandsKey(): string {
+    return "state/headless-commands.json";
   }
 
-  private headlessLedgersFile(): string {
-    return path.join(this.config.dataDir, "state", "headless-ledgers.json");
+  private headlessLedgersKey(): string {
+    return "state/headless-ledgers.json";
   }
 
-  private loadHeadlessState(): void {
-    const machines = loadStateFile<HeadlessMachineRecord[]>(
-      this.headlessMachinesFile()
+  private async loadHeadlessState(): Promise<void> {
+    const machines = await this.docs.loadJSON<HeadlessMachineRecord[]>(
+      this.headlessMachinesKey()
     );
     if (Array.isArray(machines)) {
       let dropped = 0;
@@ -540,12 +558,12 @@ export class MoverStore {
       }
       if (dropped > 0) {
         console.error(
-          `[relayn] headless machines state file ${this.headlessMachinesFile()}: dropped ${dropped} malformed record(s) at load.`
+          `[relayn] headless machines state doc ${this.headlessMachinesKey()}: dropped ${dropped} malformed record(s) at load.`
         );
       }
     }
-    const commands = loadStateFile<HeadlessCommand[]>(
-      this.headlessCommandsFile()
+    const commands = await this.docs.loadJSON<HeadlessCommand[]>(
+      this.headlessCommandsKey()
     );
     if (Array.isArray(commands)) {
       let dropped = 0;
@@ -569,14 +587,14 @@ export class MoverStore {
       }
       if (dropped > 0) {
         console.error(
-          `[relayn] headless commands state file ${this.headlessCommandsFile()}: dropped ${dropped} malformed record(s) at load.`
+          `[relayn] headless commands state doc ${this.headlessCommandsKey()}: dropped ${dropped} malformed record(s) at load.`
         );
       }
     }
-    const ledgers = loadStateFile<{
+    const ledgers = await this.docs.loadJSON<{
       files?: unknown;
       anchor?: unknown;
-    }>(this.headlessLedgersFile());
+    }>(this.headlessLedgersKey());
     if (ledgers && typeof ledgers === "object") {
       if (Array.isArray(ledgers.files)) {
         this.filesTransfers = ledgers.files as FilesTransferRecord[];
@@ -587,23 +605,23 @@ export class MoverStore {
     }
   }
 
-  private persistHeadlessMachines(): void {
+  private async persistHeadlessMachines(): Promise<void> {
     const all: HeadlessMachineRecord[] = [];
     for (const byId of this.headlessMachines.values()) {
       for (const rec of byId.values()) all.push(rec);
     }
-    saveStateFile(this.headlessMachinesFile(), all);
+    await this.docs.saveJSON(this.headlessMachinesKey(), all);
   }
 
-  private persistHeadlessCommands(): void {
-    saveStateFile(
-      this.headlessCommandsFile(),
+  private async persistHeadlessCommands(): Promise<void> {
+    await this.docs.saveJSON(
+      this.headlessCommandsKey(),
       [...this.headlessCommands.values()]
     );
   }
 
-  private persistHeadlessLedgers(): void {
-    saveStateFile(this.headlessLedgersFile(), {
+  private async persistHeadlessLedgers(): Promise<void> {
+    await this.docs.saveJSON(this.headlessLedgersKey(), {
       files: this.filesTransfers,
       anchor: this.anchorTransfers
     });
@@ -628,7 +646,7 @@ export class MoverStore {
 
   // -----------------------------------------------------------------
   // Headless machines (durable: enrollments, commands, results and
-  // ledgers persist under <dataDir>/state/ and reload at boot)
+  // ledgers persist under state/ on the object store and reload at boot)
   // -----------------------------------------------------------------
 
   /**
@@ -650,7 +668,7 @@ export class MoverStore {
    * keeping delivered commands server-side is safe. Commands with a
    * stored result (status "done") also survive.
    */
-  enrollHeadlessMachine(
+  async enrollHeadlessMachine(
     account: string,
     init: {
       machineId: string;
@@ -665,7 +683,7 @@ export class MoverStore {
       buildStamp?: unknown;
       anchor?: unknown;
     }
-  ): HeadlessMachineRecord {
+  ): Promise<HeadlessMachineRecord> {
     const rec: HeadlessMachineRecord = {
       account,
       machineId: init.machineId,
@@ -736,8 +754,8 @@ export class MoverStore {
         this.headlessCommands.delete(id);
       }
     }
-    this.persistHeadlessMachines();
-    this.persistHeadlessCommands();
+    await this.persistHeadlessMachines();
+    await this.persistHeadlessCommands();
     return rec;
   }
 
@@ -773,7 +791,7 @@ export class MoverStore {
   }
 
   /** Heartbeat: always refreshes lastSeen; fields update when present. */
-  heartbeatHeadless(
+  async heartbeatHeadless(
     account: string,
     machineId: string,
     beat: {
@@ -793,7 +811,7 @@ export class MoverStore {
       buildStamp?: unknown;
       anchor?: unknown;
     }
-  ): boolean {
+  ): Promise<boolean> {
     const rec = this.getHeadlessMachine(account, machineId);
     if (!rec) return false;
     rec.lastSeenMs = Date.now();
@@ -844,7 +862,7 @@ export class MoverStore {
     if (beat.view !== undefined && beat.view !== null) {
       this.noteViewReport(rec, beat.view);
     }
-    this.persistHeadlessMachines();
+    await this.persistHeadlessMachines();
     return true;
   }
 
@@ -942,11 +960,11 @@ export class MoverStore {
    * Heartbeats never carry transfers: results only. Returns how
    * many entries were folded.
    */
-  noteFilesTransfers(
+  async noteFilesTransfers(
     account: string,
     machineId: string,
     transfers: unknown
-  ): number {
+  ): Promise<number> {
     if (!Array.isArray(transfers)) return 0;
     let folded = 0;
     for (const entry of transfers) {
@@ -967,7 +985,7 @@ export class MoverStore {
       });
       folded++;
     }
-    if (folded > 0) this.persistHeadlessLedgers();
+    if (folded > 0) await this.persistHeadlessLedgers();
     return folded;
   }
 
@@ -996,11 +1014,11 @@ export class MoverStore {
    * account, the reporting machine and the server receipt time.
    * Returns whether a deed was folded.
    */
-  noteAnchorTransfer(
+  async noteAnchorTransfer(
     account: string,
     machineId: string,
     anchor: unknown
-  ): boolean {
+  ): Promise<boolean> {
     const deed = foldAnchorState(anchor);
     if (!deed) return false;
     this.anchorTransfers.push({
@@ -1016,8 +1034,8 @@ export class MoverStore {
     });
     const rec = this.getHeadlessMachine(account, machineId);
     if (rec) rec.anchorLast = deed;
-    this.persistHeadlessLedgers();
-    this.persistHeadlessMachines();
+    await this.persistHeadlessLedgers();
+    await this.persistHeadlessMachines();
     return true;
   }
 
@@ -1047,12 +1065,12 @@ export class MoverStore {
    * any of them without a valid signature.
    * Undefined when the machine is not enrolled under this account.
    */
-  queueHeadlessCommand(
+  async queueHeadlessCommand(
     account: string,
     machineId: string,
     type: string,
     payload: Record<string, unknown>
-  ): HeadlessCommand | undefined {
+  ): Promise<HeadlessCommand | undefined> {
     const rec = this.getHeadlessMachine(account, machineId);
     if (!rec) return undefined;
     const cmd: HeadlessCommand = {
@@ -1077,7 +1095,7 @@ export class MoverStore {
       cmd.signature = headlessCommandSignature(rec.secret, cmd);
     }
     this.headlessCommands.set(cmd.id, cmd);
-    this.persistHeadlessCommands();
+    await this.persistHeadlessCommands();
     return cmd;
   }
 
@@ -1086,15 +1104,15 @@ export class MoverStore {
    * queue order and marked delivered, so the pending queue is clear.
    * The records stay for result posting and console reads.
    */
-  takeHeadlessCommands(
+  async takeHeadlessCommands(
     account: string,
     machineId: string
-  ): Array<{
+  ): Promise<Array<{
     id: string;
     type: string;
     payload: Record<string, unknown>;
     signature?: string;
-  }> {
+  }>> {
     const out: HeadlessCommand[] = [];
     for (const cmd of this.headlessCommands.values()) {
       if (
@@ -1106,7 +1124,7 @@ export class MoverStore {
         out.push(cmd);
       }
     }
-    if (out.length > 0) this.persistHeadlessCommands();
+    if (out.length > 0) await this.persistHeadlessCommands();
     out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
     return out.map((cmd) => {
       const wire: {
@@ -1121,12 +1139,12 @@ export class MoverStore {
   }
 
   /** Store a command result posted by the machine that owns it. */
-  storeHeadlessResult(
+  async storeHeadlessResult(
     account: string,
     machineId: string,
     commandId: string,
     result: unknown
-  ): boolean {
+  ): Promise<boolean> {
     const cmd = this.headlessCommands.get(commandId);
     if (!cmd || cmd.account !== account || cmd.machineId !== machineId) {
       return false;
@@ -1198,7 +1216,7 @@ export class MoverStore {
       const transfers = (result as { transfers?: unknown } | null)
         ?.transfers;
       if (Array.isArray(transfers)) {
-        this.noteFilesTransfers(account, machineId, transfers);
+        await this.noteFilesTransfers(account, machineId, transfers);
       }
     }
     // Anchor results feed the anchor ledger: an anchor-update or
@@ -1207,11 +1225,11 @@ export class MoverStore {
     if (cmd.type === "anchor-update" || cmd.type === "anchor-deliver") {
       const deed = (result as { anchor?: unknown } | null)?.anchor;
       if (deed !== undefined) {
-        this.noteAnchorTransfer(account, machineId, deed);
+        await this.noteAnchorTransfer(account, machineId, deed);
       }
     }
-    this.persistHeadlessCommands();
-    this.persistHeadlessMachines();
+    await this.persistHeadlessCommands();
+    await this.persistHeadlessMachines();
     return true;
   }
 
@@ -1228,17 +1246,168 @@ export class MoverStore {
   // Moves
   // -----------------------------------------------------------------
 
-  private moveDir(account: string, moveId: string): string {
-    return path.join(this.config.dataDir, account, moveId);
+  // -----------------------------------------------------------------
+  // Moves
+  // -----------------------------------------------------------------
+
+  private movePrefix(account: string, moveId: string): string {
+    return `${account}/${moveId}`;
+  }
+
+  private metaKey(account: string, moveId: string): string {
+    return `${account}/${moveId}/meta.json`;
+  }
+
+  private manifestKey(account: string, moveId: string): string {
+    return `${account}/${moveId}/manifest.json`;
+  }
+
+  private chunkKey(account: string, moveId: string, n: number): string {
+    return `${account}/${moveId}/chunks/${n}`;
+  }
+
+  /** Read + parse a bulk JSON object; undefined when absent/corrupt. */
+  private async readBulkJSON<T>(key: string): Promise<T | undefined> {
+    const raw = await this.storage.get(key);
+    if (raw === undefined) return undefined;
+    try {
+      return JSON.parse(raw.toString("utf8")) as T;
+    } catch {
+      return undefined;
+    }
+  }
+
+  private async writeBulkJSON(key: string, value: unknown): Promise<void> {
+    await this.storage.put(
+      key,
+      Buffer.from(JSON.stringify(value, null, 2), "utf8")
+    );
+  }
+
+  // -----------------------------------------------------------------
+  // Bulk last-use index + the 14-day window sweep.
+  //
+  // Bulk (move trees) expires after config.bulkWindowMs measured
+  // from LAST USE: every read and write of a move refreshes its
+  // entry here. The index itself is a STATE document
+  // (state/bulk-use.json) and never expires. State documents and
+  // Partition ledgers are never swept; only whole move trees idle
+  // past the window are deleted. The sweep runs at boot (init)
+  // and daily.
+  // -----------------------------------------------------------------
+
+  private bulkUseKey(): string {
+    return "state/bulk-use.json";
+  }
+
+  private async loadBulkUse(): Promise<void> {
+    const saved = await this.docs.loadJSON<Record<string, unknown>>(
+      this.bulkUseKey()
+    );
+    if (saved && typeof saved === "object") {
+      for (const [unit, ms] of Object.entries(saved)) {
+        if (typeof ms === "number" && Number.isFinite(ms) && ms > 0) {
+          this.bulkUse.set(unit, ms);
+        }
+      }
+    }
+    // Seed entries for moves already resting in the store (e.g.
+    // written before this index existed): their last use reads as
+    // their announce time, so nothing dies early for having been
+    // pulled before the window existed.
+    let seeded = false;
+    for (const unit of await this.discoverBulkUnits()) {
+      if (this.bulkUse.has(unit)) continue;
+      const [account, moveId] = unit.split("/");
+      const meta = await this.readBulkJSON<MoveMeta>(
+        this.metaKey(account, moveId)
+      );
+      const created = meta ? Date.parse(meta.createdAt) : NaN;
+      this.bulkUse.set(
+        unit,
+        Number.isFinite(created) ? created : Date.now()
+      );
+      seeded = true;
+    }
+    if (seeded) await this.persistBulkUse();
+  }
+
+  private async persistBulkUse(): Promise<void> {
+    await this.docs.saveJSON(
+      this.bulkUseKey(),
+      Object.fromEntries(this.bulkUse)
+    );
+  }
+
+  /**
+   * Refresh last-use for the given bulk units ("<account>/<moveId>").
+   * Persists at most the moves whose entry actually advanced by
+   * more than a second, so hot read paths do not rewrite the index
+   * for nothing.
+   */
+  private async touchBulk(units: string[]): Promise<void> {
+    const now = Date.now();
+    let changed = false;
+    for (const unit of units) {
+      const prev = this.bulkUse.get(unit) ?? 0;
+      if (now - prev > 1000 || prev === 0) {
+        this.bulkUse.set(unit, now);
+        changed = true;
+      }
+    }
+    if (changed) await this.persistBulkUse();
+  }
+
+  /** Every bulk unit ("<account>/<moveId>") present in the store. */
+  private async discoverBulkUnits(): Promise<string[]> {
+    const keys = await this.storage.list("");
+    const units = new Set<string>();
+    for (const key of keys) {
+      const unit = bulkUnitOf(key);
+      if (unit) units.add(unit);
+    }
+    return [...units];
+  }
+
+  /**
+   * Delete every move tree idle past the bulk window. State
+   * documents (including this index) and Partition ledgers are
+   * structurally out of reach: only units discovered from bulk
+   * keys are ever deleted.
+   */
+  async sweepBulkWindow(now: number = Date.now()): Promise<void> {
+    if (this.config.bulkWindowMs <= 0) return;
+    const units = new Set<string>([
+      ...(await this.discoverBulkUnits()),
+      ...this.bulkUse.keys()
+    ]);
+    let changed = false;
+    for (const unit of units) {
+      const lastUse = this.bulkUse.get(unit);
+      if (lastUse === undefined) continue; // just seeded at load
+      if (now - lastUse <= this.config.bulkWindowMs) continue;
+      const keys = await this.storage.list(`${unit}/`);
+      for (const key of keys) {
+        try {
+          await this.storage.del(key);
+        } catch {
+          // Raced with a writer or a previous sweep: next round retries.
+        }
+      }
+      this.bulkUse.delete(unit);
+      changed = true;
+      console.log(
+        `[relayn] bulk window sweep: deleted idle move tree ${unit} ` +
+          `(last use ${new Date(lastUse).toISOString()})`
+      );
+    }
+    if (changed) await this.persistBulkUse();
   }
 
   async moveExists(account: string, moveId: string): Promise<boolean> {
-    try {
-      await fs.stat(path.join(this.moveDir(account, moveId), "meta.json"));
-      return true;
-    } catch {
-      return false;
-    }
+    return (
+      (await this.storage.stat(this.metaKey(account, moveId))) !== undefined
+    );
   }
 
   async announce(
@@ -1260,30 +1429,37 @@ export class MoverStore {
       status: "announced",
       createdAt: rfc3339Now()
     };
-    const dir = this.moveDir(account, meta.moveId);
-    await fs.mkdir(path.join(dir, "chunks"), { recursive: true });
-    await writeFileJSON(path.join(dir, "manifest.json"), manifest);
-    await writeFileJSON(path.join(dir, "meta.json"), meta);
+    await this.writeBulkJSON(
+      this.manifestKey(account, meta.moveId),
+      manifest
+    );
+    await this.writeBulkJSON(this.metaKey(account, meta.moveId), meta);
+    await this.touchBulk([this.movePrefix(account, meta.moveId)]);
     return meta;
   }
 
   async listMoves(account: string): Promise<MoveMeta[]> {
-    const accDir = path.join(this.config.dataDir, account);
-    let entries;
-    try {
-      entries = await fs.readdir(accDir, { withFileTypes: true });
-    } catch {
-      return [];
+    const keys = await this.storage.list(`${account}/`);
+    const moveIds = new Set<string>();
+    for (const key of keys) {
+      const parts = key.split("/");
+      // <account>/<moveId>/meta.json only: Partition ledger keys
+      // sit one level deeper and never end in meta.json.
+      if (parts.length === 3 && parts[2] === "meta.json") {
+        moveIds.add(parts[1]);
+      }
     }
     const out: MoveMeta[] = [];
-    for (const entry of entries) {
-      if (!entry.isDirectory()) continue;
-      const meta = await readFileJSON<MoveMeta>(
-        path.join(accDir, entry.name, "meta.json")
+    for (const moveId of moveIds) {
+      const meta = await this.readBulkJSON<MoveMeta>(
+        this.metaKey(account, moveId)
       );
       if (meta) out.push(meta);
     }
     out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
+    if (out.length > 0) {
+      await this.touchBulk(out.map((m) => this.movePrefix(account, m.moveId)));
+    }
     return out;
   }
 
@@ -1291,18 +1467,26 @@ export class MoverStore {
     account: string,
     moveId: string
   ): Promise<Record<string, unknown> | undefined> {
-    return readFileJSON<Record<string, unknown>>(
-      path.join(this.moveDir(account, moveId), "manifest.json")
+    const manifest = await this.readBulkJSON<Record<string, unknown>>(
+      this.manifestKey(account, moveId)
     );
+    if (manifest) {
+      await this.touchBulk([this.movePrefix(account, moveId)]);
+    }
+    return manifest;
   }
 
   async getMeta(
     account: string,
     moveId: string
   ): Promise<MoveMeta | undefined> {
-    return readFileJSON<MoveMeta>(
-      path.join(this.moveDir(account, moveId), "meta.json")
+    const meta = await this.readBulkJSON<MoveMeta>(
+      this.metaKey(account, moveId)
     );
+    if (meta) {
+      await this.touchBulk([this.movePrefix(account, moveId)]);
+    }
+    return meta;
   }
 
   async setStatus(
@@ -1313,10 +1497,7 @@ export class MoverStore {
     const meta = await this.getMeta(account, moveId);
     if (!meta) return undefined;
     meta.status = status;
-    await writeFileJSON(
-      path.join(this.moveDir(account, moveId), "meta.json"),
-      meta
-    );
+    await this.writeBulkJSON(this.metaKey(account, moveId), meta);
     return meta;
   }
 
@@ -1328,16 +1509,13 @@ export class MoverStore {
     account: string,
     moveId: string
   ): Promise<number[]> {
-    const chunksDir = path.join(this.moveDir(account, moveId), "chunks");
-    let entries;
-    try {
-      entries = await fs.readdir(chunksDir);
-    } catch {
-      return [];
-    }
+    const keys = await this.storage.list(
+      `${this.movePrefix(account, moveId)}/chunks/`
+    );
     const present: number[] = [];
-    for (const name of entries) {
-      // Plain integer names only — in-flight "<n>.tmp" writes are skipped.
+    for (const key of keys) {
+      const name = key.slice(key.lastIndexOf("/") + 1);
+      // Plain integer names only: write mechanics never match.
       if (/^\d+$/.test(name)) present.push(Number(name));
     }
     present.sort((a, b) => a - b);
@@ -1350,12 +1528,8 @@ export class MoverStore {
     n: number,
     sealed: Buffer
   ): Promise<void> {
-    const chunksDir = path.join(this.moveDir(account, moveId), "chunks");
-    await fs.mkdir(chunksDir, { recursive: true });
-    const target = path.join(chunksDir, String(n));
-    const tmp = `${target}.tmp`;
-    await fs.writeFile(tmp, sealed);
-    await fs.rename(tmp, target);
+    await this.storage.put(this.chunkKey(account, moveId, n), sealed);
+    await this.touchBulk([this.movePrefix(account, moveId)]);
   }
 
   async getChunk(
@@ -1363,50 +1537,10 @@ export class MoverStore {
     moveId: string,
     n: number
   ): Promise<Buffer | undefined> {
-    try {
-      return await fs.readFile(
-        path.join(this.moveDir(account, moveId), "chunks", String(n))
-      );
-    } catch {
-      return undefined;
+    const sealed = await this.storage.get(this.chunkKey(account, moveId, n));
+    if (sealed !== undefined) {
+      await this.touchBulk([this.movePrefix(account, moveId)]);
     }
-  }
-
-  // -----------------------------------------------------------------
-  // Retention
-  // -----------------------------------------------------------------
-
-  private async sweepExpired(): Promise<void> {
-    const cutoff = Date.now() - this.config.retentionHours * 60 * 60 * 1000;
-    let accounts;
-    try {
-      accounts = await fs.readdir(this.config.dataDir, {
-        withFileTypes: true
-      });
-    } catch {
-      return;
-    }
-    for (const acc of accounts) {
-      if (!acc.isDirectory()) continue;
-      const accDir = path.join(this.config.dataDir, acc.name);
-      let moves;
-      try {
-        moves = await fs.readdir(accDir, { withFileTypes: true });
-      } catch {
-        continue;
-      }
-      for (const mv of moves) {
-        if (!mv.isDirectory()) continue;
-        const dir = path.join(accDir, mv.name);
-        try {
-          const info = await fs.stat(dir);
-          if (info.mtimeMs < cutoff) {
-            await fs.rm(dir, { recursive: true, force: true });
-          }
-        } catch {
-          // Raced with a writer or a previous sweep — next round retries.
-        }
-      }
-    }
+    return sealed;
   }
 }

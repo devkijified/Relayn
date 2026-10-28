@@ -2,8 +2,8 @@
 // RELAYN: Partition store (TypeScript)
 // -------------------------------------------------------------------------
 // THE PARTITION slice-1: a per-account, per-machine MATERIALIZED VIEW over
-// the sealed move store. Sealed moves under
-//   <dataDir>/<accountId>/<moveId>/{meta,manifest,chunks/}
+// the sealed move store. Sealed moves at
+//   <accountId>/<moveId>/{meta,manifest,chunks/} in the object store
 // remain the bytes' home. This store holds enumerations, fetched-file
 // refs (moveId + packPath + size + modTime), and a Partition-side
 // mutate ledger (Delete + Rename only). It never copies sealed chunks
@@ -17,11 +17,9 @@
 // =========================================================================
 
 import { randomBytes } from "node:crypto";
-import { promises as fs } from "node:fs";
-import path from "node:path";
 
 import type { MoverStore } from "./mover-store.js";
-import { saveTextFileAtomic } from "./state-file.js";
+import type { StateDocs } from "./storage.js";
 
 export interface PartitionFileRef {
   packPath: string;
@@ -94,14 +92,14 @@ function baseName(packPath: string): string {
 
 /**
  * PartitionStore builds and serves the Partition tree as a view over
- * MoverStore sealed moves. Disk layout for the ledger only:
- *   <dataDir>/<accountId>/_partition/<machineId>/ledger.json
- * File bytes are NEVER written here. Ledger writes are atomic (a
- * temp sibling renamed over the target, see state-file.ts), and a
- * corrupt ledger logs loudly and starts empty instead of crashing
- * the read. The per-machine index stays in memory by design: it is
- * a derived view, rebuilt from the sealed moves on disk whenever
- * it is cold, so a restart loses nothing that cannot be recomputed.
+ * MoverStore sealed moves. Object layout for the ledger only:
+ *   <accountId>/_partition/<machineId>/ledger.json
+ * File bytes are NEVER written here. Ledger writes are atomic
+ * (single-object writes, see storage.ts), and a corrupt ledger
+ * logs loudly and starts empty instead of crashing the read. The
+ * per-machine index stays in memory by design: it is a derived
+ * view, rebuilt from the sealed moves whenever it is cold, so a
+ * restart loses nothing that cannot be recomputed.
  */
 /** Shell-set prefixes the Partition auto-pull always pulls first. */
 const PARTITION_SHELL_PREFIXES = [
@@ -127,13 +125,13 @@ function shellFileCountOf(files: Map<string, PartitionFileRef>): number {
 export class PartitionStore {
   private indexes = new Map<string, Map<string, MachineIndex>>(); // account -> machineId -> index
   private ledgers = new Map<string, PartitionMutateRecord[]>(); // account|machineId -> records
-  private readonly dataDir: string;
+  private readonly docs: StateDocs;
 
   constructor(
     private readonly moverStore: MoverStore,
-    dataDir?: string
+    docs?: StateDocs
   ) {
-    this.dataDir = dataDir || moverStore.config.dataDir;
+    this.docs = docs ?? moverStore.docs;
   }
 
   private accMap(account: string): Map<string, MachineIndex> {
@@ -149,14 +147,8 @@ export class PartitionStore {
     return account + "|" + machineId;
   }
 
-  private ledgerPath(account: string, machineId: string): string {
-    return path.join(
-      this.dataDir,
-      account,
-      "_partition",
-      machineId,
-      "ledger.json"
-    );
+  private ledgerObjectKey(account: string, machineId: string): string {
+    return `${account}/_partition/${machineId}/ledger.json`;
   }
 
   async loadLedger(
@@ -167,12 +159,9 @@ export class PartitionStore {
     const cached = this.ledgers.get(key);
     if (cached) return cached;
     let records: PartitionMutateRecord[] = [];
-    let raw: string | undefined;
-    try {
-      raw = await fs.readFile(this.ledgerPath(account, machineId), "utf8");
-    } catch {
-      raw = undefined; // a missing ledger is the normal first-run case
-    }
+    const raw = await this.docs.loadText(
+      this.ledgerObjectKey(account, machineId)
+    );
     if (raw !== undefined) {
       try {
         const parsed = JSON.parse(raw) as unknown;
@@ -188,7 +177,7 @@ export class PartitionStore {
         }
       } catch (err) {
         console.error(
-          `[relayn] PARTITION LEDGER CORRUPT: ${this.ledgerPath(account, machineId)} ` +
+          `[relayn] PARTITION LEDGER CORRUPT: ${this.ledgerObjectKey(account, machineId)} ` +
             `could not be parsed (${(err as Error).message}). Starting that ` +
             `machine's ledger empty; the sealed moves are untouched.`
         );
@@ -206,8 +195,8 @@ export class PartitionStore {
   ): Promise<void> {
     const key = this.ledgerKey(account, machineId);
     this.ledgers.set(key, records);
-    await saveTextFileAtomic(
-      this.ledgerPath(account, machineId),
+    await this.docs.saveText(
+      this.ledgerObjectKey(account, machineId),
       JSON.stringify(records, null, 2)
     );
   }

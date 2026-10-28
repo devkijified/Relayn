@@ -2698,8 +2698,8 @@ export async function moverConsoleRoutes(
     // A fresh pair starts licensed for both of its products, so the
     // owner sees it in the registry and can revoke it from day one.
     if (licenseStore) {
-      licenseStore.issue("mover", pair.accountId, "Console pair", "");
-      licenseStore.issue("admin", pair.accountId, "Console pair", "");
+      await licenseStore.issue("mover", pair.accountId, "Console pair", "");
+      await licenseStore.issue("admin", pair.accountId, "Console pair", "");
     }
     return pair;
   });
@@ -2823,7 +2823,7 @@ export async function moverConsoleRoutes(
         message: "accountId must be 8-64 URL-safe characters."
       });
     }
-    const lic = ls.issue(
+    const lic = await ls.issue(
       body.product,
       accountId,
       typeof body.label === "string" ? body.label : "",
@@ -2852,10 +2852,9 @@ export async function moverConsoleRoutes(
           message: "accountId must be 8-64 URL-safe characters."
         });
       }
-      const lic =
-        kind === "revoke"
-          ? ls.revoke(body.product, accountId)
-          : ls.restore(body.product, accountId);
+      const lic = await (kind === "revoke"
+        ? ls.revoke(body.product, accountId)
+        : ls.restore(body.product, accountId));
       if (!lic) {
         return reply.code(404).send({
           error: "LICENSE_NOT_FOUND",
@@ -3018,7 +3017,7 @@ export async function moverConsoleRoutes(
   });
 
   /** Queue one command for a machine; 404 when it is not enrolled. */
-  function queueFor(
+  async function queueFor(
     reply: FastifyReply,
     st: MoverStore,
     acc: string,
@@ -3027,7 +3026,7 @@ export async function moverConsoleRoutes(
     payload: Record<string, unknown>
   ) {
     const cmd = isValidHeadlessMachineId(rawMachineId)
-      ? st.queueHeadlessCommand(acc, rawMachineId, type, payload)
+      ? await st.queueHeadlessCommand(acc, rawMachineId, type, payload)
       : undefined;
     if (!cmd) return machineNotFound(reply);
     return { commandId: cmd.id };
@@ -3150,7 +3149,7 @@ export async function moverConsoleRoutes(
           : "Headless move";
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "start", {
+        ? await st.queueHeadlessCommand(acc, params.machineId, "start", {
             moveName,
             paths
           })
@@ -3248,7 +3247,7 @@ export async function moverConsoleRoutes(
       if (!acc) return;
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "desk-end", {})
+        ? await st.queueHeadlessCommand(acc, params.machineId, "desk-end", {})
         : undefined;
       if (!cmd) return machineNotFound(reply);
       return { commandId: cmd.id, signature: cmd.signature };
@@ -3331,7 +3330,7 @@ export async function moverConsoleRoutes(
       if (!acc) return;
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "view-end", {})
+        ? await st.queueHeadlessCommand(acc, params.machineId, "view-end", {})
         : undefined;
       if (!cmd) return machineNotFound(reply);
       return { commandId: cmd.id, signature: cmd.signature };
@@ -3444,7 +3443,7 @@ export async function moverConsoleRoutes(
           : "Files fetch";
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "files-fetch", {
+        ? await st.queueHeadlessCommand(acc, params.machineId, "files-fetch", {
             moveName,
             paths
           })
@@ -3478,7 +3477,7 @@ export async function moverConsoleRoutes(
       if (!filesLicenseGate(reply, acc)) return;
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "files-push", {
+        ? await st.queueHeadlessCommand(acc, params.machineId, "files-push", {
             moveId: body.moveId,
             destDir: body.destDir
           })
@@ -3541,7 +3540,7 @@ export async function moverConsoleRoutes(
       if (!anchorLicenseGate(reply, acc)) return;
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "anchor-update", {
+        ? await st.queueHeadlessCommand(acc, params.machineId, "anchor-update", {
             stamp
           })
         : undefined;
@@ -3588,7 +3587,7 @@ export async function moverConsoleRoutes(
       if (stamp) payload.stamp = stamp;
       const params = request.params as { machineId: string };
       const cmd = isValidHeadlessMachineId(params.machineId)
-        ? st.queueHeadlessCommand(acc, params.machineId, "anchor-deliver", payload)
+        ? await st.queueHeadlessCommand(acc, params.machineId, "anchor-deliver", payload)
         : undefined;
       if (!cmd) return machineNotFound(reply);
       return { commandId: cmd.id, signature: cmd.signature };

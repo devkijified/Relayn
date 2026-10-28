@@ -182,7 +182,7 @@ export async function backupRoutes(
             });
         }
 
-        const record = backupStore.create(body.blob, siteDomain, cookieCount, ip);
+        const record = await backupStore.create(body.blob, siteDomain, cookieCount, ip);
 
         return reply.code(201).send({
             id: record.id,
@@ -219,7 +219,7 @@ export async function backupRoutes(
             });
         }
 
-        const result = backupStore.get(id);
+        const result = await backupStore.get(id);
 
         if (result === undefined) {
             return reply.code(404).send({
@@ -235,7 +235,7 @@ export async function backupRoutes(
             });
         }
 
-        backupStore.recordDownload(result, ip);
+        await backupStore.recordDownload(result, ip);
 
         return {
             id: result.id,
@@ -262,7 +262,7 @@ export async function backupRoutes(
             });
         }
 
-        const deleted = backupStore.delete(id, ip);
+        const deleted = await backupStore.delete(id, ip);
 
         if (!deleted) {
             return reply.code(404).send({

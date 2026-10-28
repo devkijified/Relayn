@@ -13,8 +13,9 @@
 // mover-headless.ts and mover-console.ts). It does not end machines
 // or sessions that are already running, and restore() undoes it.
 //
-// DURABLE: constructed with a state file (index.ts passes
-// <MOVER_DATA_DIR>/state/licenses.json), the registry is written
+// DURABLE: constructed with a state doc (index.ts passes the
+// shared StateDocs and the key state/licenses.json), the registry
+// is written
 // through on every change and reloaded at boot, so revocations
 // survive restarts and redeploys. The seeds below are the floor:
 // records in the state file override them, and any seed missing
@@ -22,7 +23,7 @@
 // memory-only (the shape unit-style callers used before).
 // =========================================================================
 
-import { loadStateFile, saveStateFile } from "./state-file.js";
+import type { StateDocs } from "./storage.js";
 
 export type LicenseProduct = "ext" | "mover" | "admin";
 export type LicenseStatus = "active" | "revoked";
@@ -60,10 +61,12 @@ const SEEDED_NOTE =
 
 export class LicenseStore {
   private licenses = new Map<string, License>();
-  private readonly stateFile?: string;
+  private readonly docs?: StateDocs;
+  private readonly docKey: string;
 
-  constructor(stateFile?: string) {
-    this.stateFile = stateFile;
+  constructor(docs?: StateDocs, docKey = "state/licenses.json") {
+    this.docs = docs;
+    this.docKey = docKey;
     const issuedAt = new Date().toISOString();
     for (const seed of SEEDED_ACCOUNTS) {
       for (const product of LICENSE_PRODUCTS) {
@@ -77,44 +80,52 @@ export class LicenseStore {
         });
       }
     }
-    if (this.stateFile) {
-      const saved = loadStateFile<License[]>(this.stateFile);
-      if (Array.isArray(saved)) {
-        let dropped = 0;
-        for (const lic of saved) {
-          if (
-            lic &&
-            typeof lic === "object" &&
-            isLicenseProduct(lic.product) &&
-            typeof lic.accountId === "string" &&
-            lic.accountId !== "" &&
-            (lic.status === "active" || lic.status === "revoked")
-          ) {
-            this.licenses.set(this.key(lic.product, lic.accountId), {
-              product: lic.product,
-              accountId: lic.accountId,
-              label: typeof lic.label === "string" ? lic.label : "",
-              status: lic.status,
-              issuedAt: typeof lic.issuedAt === "string" ? lic.issuedAt : issuedAt,
-              note: typeof lic.note === "string" ? lic.note : ""
-            });
-          } else {
-            dropped++;
-          }
+  }
+
+  /**
+   * Boot load: records in the state doc override the seeds, and
+   * any seed missing from the doc is backfilled (the constructor
+   * already laid the seeds down, so applying the doc is enough).
+   */
+  async init(): Promise<void> {
+    if (!this.docs) return;
+    const issuedAt = new Date().toISOString();
+    const saved = await this.docs.loadJSON<License[]>(this.docKey);
+    if (Array.isArray(saved)) {
+      let dropped = 0;
+      for (const lic of saved) {
+        if (
+          lic &&
+          typeof lic === "object" &&
+          isLicenseProduct(lic.product) &&
+          typeof lic.accountId === "string" &&
+          lic.accountId !== "" &&
+          (lic.status === "active" || lic.status === "revoked")
+        ) {
+          this.licenses.set(this.key(lic.product, lic.accountId), {
+            product: lic.product,
+            accountId: lic.accountId,
+            label: typeof lic.label === "string" ? lic.label : "",
+            status: lic.status,
+            issuedAt: typeof lic.issuedAt === "string" ? lic.issuedAt : issuedAt,
+            note: typeof lic.note === "string" ? lic.note : ""
+          });
+        } else {
+          dropped++;
         }
-        if (dropped > 0) {
-          console.error(
-            `[relayn] licenses state file ${this.stateFile}: dropped ${dropped} malformed record(s) at load.`
-          );
-        }
+      }
+      if (dropped > 0) {
+        console.error(
+          `[relayn] licenses state doc ${this.docKey}: dropped ${dropped} malformed record(s) at load.`
+        );
       }
     }
   }
 
-  /** Write the whole registry through to the state file, if any. */
-  private persist(): void {
-    if (!this.stateFile) return;
-    saveStateFile(this.stateFile, [...this.licenses.values()]);
+  /** Write the whole registry through to the state doc, if any. */
+  private async persist(): Promise<void> {
+    if (!this.docs) return;
+    await this.docs.saveJSON(this.docKey, [...this.licenses.values()]);
   }
 
   private key(product: LicenseProduct, accountId: string): string {
@@ -140,12 +151,12 @@ export class LicenseStore {
    * are replaced when the caller passes new ones, and issuedAt is
    * refreshed so the console shows when it last became active.
    */
-  issue(
+  async issue(
     product: LicenseProduct,
     accountId: string,
     label = "",
     note = ""
-  ): License {
+  ): Promise<License> {
     const existing = this.get(product, accountId);
     const lic: License = {
       product,
@@ -156,31 +167,31 @@ export class LicenseStore {
       note: note !== "" ? note : (existing?.note ?? "")
     };
     this.licenses.set(this.key(product, accountId), lic);
-    this.persist();
+    await this.persist();
     return lic;
   }
 
   /** Mark a license revoked. Undefined when there is no such license. */
-  revoke(
+  async revoke(
     product: LicenseProduct,
     accountId: string
-  ): License | undefined {
+  ): Promise<License | undefined> {
     const lic = this.get(product, accountId);
     if (!lic) return undefined;
     lic.status = "revoked";
-    this.persist();
+    await this.persist();
     return lic;
   }
 
   /** Mark a license active again. Undefined when there is no such license. */
-  restore(
+  async restore(
     product: LicenseProduct,
     accountId: string
-  ): License | undefined {
+  ): Promise<License | undefined> {
     const lic = this.get(product, accountId);
     if (!lic) return undefined;
     lic.status = "active";
-    this.persist();
+    await this.persist();
     return lic;
   }
 

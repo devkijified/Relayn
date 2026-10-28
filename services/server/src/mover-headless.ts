@@ -204,7 +204,7 @@ export async function headlessRoutes(
             "machineId must be 1-128 URL-safe characters starting alphanumeric"
         });
       }
-      const rec = moverStore.enrollHeadlessMachine(acc, {
+      const rec = await moverStore.enrollHeadlessMachine(acc, {
         machineId: body.machineId,
         name: typeof body.name === "string" ? body.name : "",
         os: typeof body.os === "string" ? body.os : "",
@@ -248,7 +248,7 @@ export async function headlessRoutes(
       buildStamp?: unknown;
       anchor?: unknown;
     };
-    moverStore.heartbeatHeadless(found.acc, found.machine.machineId, {
+    await moverStore.heartbeatHeadless(found.acc, found.machine.machineId, {
       ...body,
       sessionsDiag: body.sessions
     });
@@ -299,7 +299,7 @@ export async function headlessRoutes(
         !Array.isArray(body.payload)
           ? (body.payload as Record<string, unknown>)
           : {};
-      const cmd = moverStore.queueHeadlessCommand(
+      const cmd = await moverStore.queueHeadlessCommand(
         acc,
         machineId,
         body.type,
@@ -345,7 +345,7 @@ export async function headlessRoutes(
   app.get("/api/headless/commands", async (request, reply) => {
     const found = needMachine(request, reply);
     if (!found) return;
-    return moverStore.takeHeadlessCommands(found.acc, found.machine.machineId);
+    return await moverStore.takeHeadlessCommands(found.acc, found.machine.machineId);
   });
 
   // ------------------------------------------------------------------
@@ -368,7 +368,7 @@ export async function headlessRoutes(
         body && typeof body === "object" && "result" in body
           ? body.result
           : (body ?? null);
-      const stored = moverStore.storeHeadlessResult(
+      const stored = await moverStore.storeHeadlessResult(
         found.acc,
         found.machine.machineId,
         String(params.id || ""),

@@ -42,6 +42,7 @@
 // =========================================================================
 
 import { spawn } from "node:child_process";
+import { createServer } from "node:http";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
 import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -3818,6 +3819,542 @@ async function main() {
       r.status === 403,
       `got ${r.status}`
     );
+
+    // ---------------------------------------------------------------
+    // Instances S1..S5: THE R2 OBJECT STORE + THE 14-DAY BULK
+    // WINDOW. An in-process stub implements the S3 subset the R2
+    // backend uses (PUT/GET/DELETE/HEAD + ListObjectsV2 with
+    // continuation tokens, page size 2 on purpose; SigV4 is NOT
+    // verified by the stub) over an in-memory map, so the R2 path
+    // is genuinely exercised with no credentials. S1 writes one of
+    // each kind against the stub with a throwaway local data dir,
+    // is KILLED, and S2 boots on the same bucket with a DIFFERENT
+    // empty local dir and must read it all back: the data lives in
+    // the bucket, not on the disk. Then the window pins: a bulk
+    // unit idle 15 days dies in the boot sweep, a fresh unit and
+    // every state doc survive the same sweep, a bulk read on day
+    // 13 refreshes last-use so the unit survives day 15, and once
+    // it is idle 15 days past that read it dies.
+    // ---------------------------------------------------------------
+    console.log("R2 object store + bulk window (stub S3)");
+    const stubObjects = new Map(); // "<bucket>/<key>" -> Buffer
+    const xmlEsc = (s) =>
+      s
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    const stub = createServer((req, res) => {
+      const u = new URL(req.url, "http://127.0.0.1");
+      const parts = u.pathname
+        .split("/")
+        .filter((p) => p !== "")
+        .map((p) => decodeURIComponent(p));
+      const bucket = parts[0] ?? "";
+      const key = parts.slice(1).join("/");
+      if (req.method === "GET" && u.searchParams.get("list-type") === "2") {
+        const prefix = u.searchParams.get("prefix") ?? "";
+        const token = u.searchParams.get("continuation-token");
+        const all = [...stubObjects.keys()]
+          .filter((k) => k.startsWith(`${bucket}/${prefix}`))
+          .map((k) => k.slice(bucket.length + 1))
+          .sort();
+        const startAt = token ? Number(token) : 0;
+        const page = all.slice(startAt, startAt + 2);
+        const truncated = startAt + page.length < all.length;
+        const contents = page
+          .map(
+            (k) =>
+              `<Contents><Key>${xmlEsc(k)}</Key><Size>${stubObjects.get(`${bucket}/${k}`).length}</Size></Contents>`
+          )
+          .join("");
+        const next = truncated
+          ? `<NextContinuationToken>${startAt + page.length}</NextContinuationToken>`
+          : "";
+        res.writeHead(200, { "content-type": "application/xml" });
+        res.end(
+          `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${xmlEsc(bucket)}</Name><Prefix>${xmlEsc(prefix)}</Prefix><KeyCount>${page.length}</KeyCount><MaxKeys>2</MaxKeys><IsTruncated>${truncated}</IsTruncated>${contents}${next}</ListBucketResult>`
+        );
+        return;
+      }
+      const mapKey = `${bucket}/${key}`;
+      if (req.method === "PUT") {
+        const chunksIn = [];
+        req.on("data", (c) => chunksIn.push(c));
+        req.on("end", () => {
+          stubObjects.set(mapKey, Buffer.concat(chunksIn));
+          res.writeHead(200);
+          res.end();
+        });
+        return;
+      }
+      if (req.method === "GET" || req.method === "HEAD") {
+        const body = stubObjects.get(mapKey);
+        if (!body) {
+          res.writeHead(404, { "content-type": "application/xml" });
+          res.end("<Error><Code>NoSuchKey</Code></Error>");
+          return;
+        }
+        res.writeHead(200, { "content-length": body.length });
+        res.end(req.method === "HEAD" ? undefined : body);
+        return;
+      }
+      if (req.method === "DELETE") {
+        stubObjects.delete(mapKey);
+        res.writeHead(204);
+        res.end();
+        return;
+      }
+      res.writeHead(400);
+      res.end();
+    });
+    await new Promise((res) => stub.listen(4490, "127.0.0.1", res));
+
+    const R2_ENV = {
+      R2_ACCOUNT_ID: "stubacct",
+      R2_BUCKET: "stub-bucket",
+      R2_ACCESS_KEY_ID: "stubkey",
+      R2_SECRET_ACCESS_KEY: "stubsecret",
+      R2_ENDPOINT: "http://127.0.0.1:4490",
+      MOVER_CONSOLE_KEY: CONSOLE_KEY
+    };
+    const BU_KEY = "stub-bucket/state/bulk-use.json";
+    const backdateBulkUse = (unit, msAgo) => {
+      const doc = JSON.parse(stubObjects.get(BU_KEY).toString("utf8"));
+      doc[unit] = Date.now() - msAgo;
+      stubObjects.set(BU_KEY, Buffer.from(JSON.stringify(doc)));
+    };
+    const bulkUseOf = (unit) =>
+      JSON.parse(stubObjects.get(BU_KEY).toString("utf8"))[unit];
+    const dirTop = (p) => {
+      try {
+        return readdirSync(p);
+      } catch {
+        return [];
+      }
+    };
+    const DAY = 86400000;
+    const S_ACC = "r2acct00000001";
+    const S_MID = "r2-host-01";
+    const SH = {
+      "x-account-id": S_ACC,
+      "content-type": "application/json"
+    };
+    const sManifest = (moveId, size) => ({
+      moveId,
+      name: "R2 test move",
+      sourceName: "R2-HOST",
+      createdAt: "2026-10-28T00:00:00Z",
+      categories: { files: 1 },
+      files: [
+        {
+          path: "files/Desktop/r2-note.bin",
+          category: "files",
+          size,
+          sha256: "x",
+          chunks: 1
+        }
+      ],
+      chunks: [
+        {
+          index: 0,
+          path: "files/Desktop/r2-note.bin",
+          offset: 0,
+          size,
+          sha256: "x"
+        }
+      ],
+      totalBytes: size,
+      totalFiles: 1
+    });
+
+    // ---- S1: write one of each kind against the stub. ----
+    const S1 = 4426;
+    const s1child = boot(S1, {
+      ...R2_ENV,
+      MOVER_DATA_DIR: `${dataDir}-r2a`
+    });
+    children.push(s1child);
+    check("R2 instance S1 boots on the stub backend", await waitHealth(S1));
+    const s1 = `http://127.0.0.1:${S1}`;
+    const sBlob = {
+      iv: randomBytes(12).toString("base64"),
+      data: randomBytes(128).toString("base64")
+    };
+    const sSharePost = (body) =>
+      fetch(`${s1}/api/share`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    r = await sSharePost({ blob: sBlob, cookieCount: 4, siteCount: 2 });
+    const sSpent = (await r.json()).id;
+    r = await fetch(`${s1}/api/share/${sSpent}`);
+    check("R2 setup: anon share consumed on S1", r.status === 200, `got ${r.status}`);
+    const sKey = randomBytes(32).toString("base64");
+    r = await sSharePost({
+      blob: sBlob,
+      cookieCount: 4,
+      siteCount: 2,
+      accountId: S_ACC,
+      key: sKey
+    });
+    const sAcctShare = (await r.json()).id;
+    check("R2 setup: account share created on S1", !!sAcctShare);
+    const sBakBlob = {
+      salt: randomBytes(16).toString("base64"),
+      iv: randomBytes(12).toString("base64"),
+      iterations: 100000,
+      data: randomBytes(64).toString("base64")
+    };
+    r = await fetch(`${s1}/api/backups`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        blob: sBakBlob,
+        siteDomain: "example.com",
+        cookieCount: 3
+      })
+    });
+    const sBak = await r.json().catch(() => ({}));
+    check(
+      "R2 setup: backup created on S1",
+      r.status === 201 && !!sBak.id,
+      `got ${r.status}`
+    );
+    r = await fetch(`${s1}/api/headless/enroll`, {
+      method: "POST",
+      headers: SH,
+      body: JSON.stringify({
+        machineId: S_MID,
+        name: "R2-HOST",
+        os: "Windows Server 2022"
+      })
+    });
+    const sEnroll = await r.json().catch(() => ({}));
+    check(
+      "R2 setup: machine enrolls on S1",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(sEnroll.machineSecret ?? ""),
+      JSON.stringify(sEnroll)
+    );
+    const S_AUTH = {
+      "x-account-id": S_ACC,
+      "x-machine-id": S_MID,
+      "x-machine-secret": sEnroll.machineSecret,
+      "content-type": "application/json"
+    };
+    r = await fetch(`${s1}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: S_AUTH,
+      body: JSON.stringify({ state: "idle" })
+    });
+    check("R2 setup: heartbeat accepted on S1", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${s1}/api/headless/commands`, {
+      method: "POST",
+      headers: {
+        "x-account-id": S_ACC,
+        "x-machine-id": S_MID,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ type: "scan", payload: {} })
+    });
+    const sCmd = await r.json().catch(() => ({}));
+    check(
+      "R2 setup: command queued on S1 (never polled)",
+      r.status === 200 && !!sCmd.commandId,
+      JSON.stringify(sCmd)
+    );
+    const sChunk = randomBytes(4096);
+    r = await fetch(`${s1}/api/moves`, {
+      method: "POST",
+      headers: SH,
+      body: JSON.stringify({
+        moverName: "R2-HOST",
+        manifest: sManifest("move-r2-1", sChunk.length)
+      })
+    });
+    check("R2 setup: move announced on S1", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${s1}/api/moves/move-r2-1/chunks/0`, {
+      method: "PUT",
+      headers: {
+        "x-account-id": S_ACC,
+        "content-type": "application/octet-stream"
+      },
+      body: sChunk
+    });
+    check("R2 setup: chunk uploaded on S1", r.status === 200, `got ${r.status}`);
+    const sLicPost = (sub, body) =>
+      fetch(`${s1}/mover/console/api/licenses${sub}`, {
+        method: "POST",
+        headers: KH,
+        body: JSON.stringify(body)
+      });
+    r = await sLicPost("", { product: "mover", accountId: S_ACC });
+    check("R2 setup: mover license issued on S1", r.status === 200, `got ${r.status}`);
+    r = await sLicPost("", { product: "ext", accountId: S_ACC });
+    check("R2 setup: ext license issued on S1", r.status === 200, `got ${r.status}`);
+    r = await sLicPost("/revoke", { product: "ext", accountId: S_ACC });
+    check("R2 setup: ext license revoked on S1", r.status === 200, `got ${r.status}`);
+    check(
+      "state docs live in the bucket, not on the local disk",
+      stubObjects.has("stub-bucket/state/shares.json") &&
+        stubObjects.has("stub-bucket/state/licenses.json") &&
+        stubObjects.has("stub-bucket/state/headless-machines.json") &&
+        stubObjects.has(
+          `stub-bucket/${S_ACC}/move-r2-1/chunks/0`
+        ) &&
+        dirTop(`${dataDir}-r2a`).length === 0,
+      [...stubObjects.keys()].join(",")
+    );
+
+    killTree(s1child, "SIGKILL");
+    await new Promise((res) => setTimeout(res, 800));
+    check(
+      "S1 is really gone after SIGKILL",
+      !(await fetch(`${s1}/health`).then(() => true, () => false))
+    );
+
+    // ---- S2: same bucket, DIFFERENT empty local dir. ----
+    const S2 = 4427;
+    children.push(boot(S2, { ...R2_ENV, MOVER_DATA_DIR: `${dataDir}-r2b` }));
+    check("R2 instance S2 boots on the same bucket", await waitHealth(S2));
+    const s2 = `http://127.0.0.1:${S2}`;
+    r = await fetch(`${s2}/api/share/${sSpent}`);
+    check(
+      "R2: spent single-use share stays spent across instances",
+      r.status === 404,
+      `got ${r.status}`
+    );
+    r = await fetch(`${s2}/api/account/${S_ACC}/shares/${sAcctShare}`);
+    const sAcctGot = await r.json().catch(() => ({}));
+    check(
+      "R2: account share survives (blob + key)",
+      r.status === 200 &&
+        sAcctGot.key === sKey &&
+        sAcctGot.blob?.data === sBlob.data,
+      `got ${r.status}`
+    );
+    r = await fetch(`${s2}/api/backups/${sBak.id}`);
+    const sBakGot = await r.json().catch(() => ({}));
+    check(
+      "R2: backup survives (blob round trip)",
+      r.status === 200 && sBakGot.blob?.data === sBakBlob.data,
+      `got ${r.status}`
+    );
+    r = await fetch(`${s2}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: S_AUTH,
+      body: JSON.stringify({ state: "idle" })
+    });
+    check(
+      "R2: the S1 machine secret still verifies on S2",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await fetch(`${s2}/api/headless/commands`, { headers: S_AUTH });
+    const sPoll = await r.json().catch(() => ({}));
+    check(
+      "R2: the queued command is delivered once on S2",
+      r.status === 200 &&
+        Array.isArray(sPoll) &&
+        sPoll.some((c) => c.id === sCmd.commandId && c.type === "scan"),
+      JSON.stringify(sPoll).slice(0, 200)
+    );
+    r = await fetch(`${s2}/api/headless/commands`, { headers: S_AUTH });
+    const sPoll2 = await r.json().catch(() => ({}));
+    check(
+      "R2: the delivered command is not delivered twice",
+      r.status === 200 && Array.isArray(sPoll2) && sPoll2.length === 0,
+      JSON.stringify(sPoll2).slice(0, 200)
+    );
+    r = await fetch(`${s2}/api/moves/move-r2-1/chunks/0`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    const sDown = Buffer.from(await r.arrayBuffer());
+    check(
+      "R2: chunk bytes are identical after the instance swap",
+      r.status === 200 && sDown.equals(sChunk),
+      `got ${r.status}`
+    );
+    r = await fetch(`${s2}/api/headless/enroll`, {
+      method: "POST",
+      headers: SH,
+      body: JSON.stringify({
+        machineId: "r2-host-02",
+        name: "R2-HOST-2",
+        os: "Windows"
+      })
+    });
+    check(
+      "R2: the revoked license still gates enroll on S2",
+      r.status === 403,
+      `got ${r.status}`
+    );
+    // A fresh bulk unit on S2: it must survive the S3 boot sweep.
+    const sFreshChunk = randomBytes(1024);
+    r = await fetch(`${s2}/api/moves`, {
+      method: "POST",
+      headers: SH,
+      body: JSON.stringify({
+        moverName: "R2-HOST",
+        manifest: sManifest("move-r2-fresh", sFreshChunk.length)
+      })
+    });
+    r = await fetch(`${s2}/api/moves/move-r2-fresh/chunks/0`, {
+      method: "PUT",
+      headers: {
+        "x-account-id": S_ACC,
+        "content-type": "application/octet-stream"
+      },
+      body: sFreshChunk
+    });
+    check(
+      "R2 setup: fresh move chunk uploaded on S2",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    // Age move-r2-1 to 15 idle days in the shared last-use index,
+    // then stop S2 without any further move traffic (an in-memory
+    // touch would rewrite the index).
+    backdateBulkUse(`${S_ACC}/move-r2-1`, 15 * DAY);
+    const s2child = children[children.length - 1];
+    killTree(s2child, "SIGKILL");
+    await new Promise((res) => setTimeout(res, 800));
+    check(
+      "S2 is really gone after SIGKILL",
+      !(await fetch(`${s2}/health`).then(() => true, () => false))
+    );
+
+    // ---- S3: the boot sweep runs; then the read-refresh pin. ----
+    const S3P = 4428;
+    const s3child = boot(S3P, {
+      ...R2_ENV,
+      MOVER_DATA_DIR: `${dataDir}-r2c`
+    });
+    children.push(s3child);
+    check("R2 instance S3 boots (boot sweep runs)", await waitHealth(S3P));
+    const s3 = `http://127.0.0.1:${S3P}`;
+    r = await fetch(`${s3}/api/moves/move-r2-1/chunks/0`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    const sweptChunk = r.status;
+    r = await fetch(`${s3}/api/moves/move-r2-1/manifest`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    check(
+      "window: bulk idle 15 days is deleted by the boot sweep",
+      sweptChunk === 404 && r.status === 404,
+      `chunk ${sweptChunk} manifest ${r.status}`
+    );
+    r = await fetch(`${s3}/api/moves/move-r2-fresh/chunks/0`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    const sFreshDown = Buffer.from(await r.arrayBuffer());
+    check(
+      "window: recently used bulk survives the same sweep",
+      r.status === 200 && sFreshDown.equals(sFreshChunk),
+      `got ${r.status}`
+    );
+    r = await fetch(`${s3}/api/account/${S_ACC}/shares/${sAcctShare}`);
+    check(
+      "window: state is never swept (account share + headless registry intact)",
+      r.status === 200 &&
+        stubObjects.has("stub-bucket/state/headless-machines.json") &&
+        stubObjects.has("stub-bucket/state/licenses.json"),
+      `got ${r.status}`
+    );
+    // Read-refresh: age a unit to day 13 in the index, restart so
+    // the server loads that age, read the chunk, and the index
+    // must move to now before the response returns.
+    const sChunk3 = randomBytes(2048);
+    r = await fetch(`${s3}/api/moves`, {
+      method: "POST",
+      headers: SH,
+      body: JSON.stringify({
+        moverName: "R2-HOST",
+        manifest: sManifest("move-r2-3", sChunk3.length)
+      })
+    });
+    r = await fetch(`${s3}/api/moves/move-r2-3/chunks/0`, {
+      method: "PUT",
+      headers: {
+        "x-account-id": S_ACC,
+        "content-type": "application/octet-stream"
+      },
+      body: sChunk3
+    });
+    backdateBulkUse(`${S_ACC}/move-r2-3`, 13 * DAY);
+    killTree(s3child, "SIGKILL");
+    await new Promise((res) => setTimeout(res, 800));
+    check(
+      "S3 is really gone after SIGKILL",
+      !(await fetch(`${s3}/health`).then(() => true, () => false))
+    );
+    const S3B = 4430;
+    const s3bchild = boot(S3B, {
+      ...R2_ENV,
+      MOVER_DATA_DIR: `${dataDir}-r2c2`
+    });
+    children.push(s3bchild);
+    check(
+      "R2 instance S3b boots (unit at day 13 survives the boot sweep)",
+      await waitHealth(S3B)
+    );
+    const s3b = `http://127.0.0.1:${S3B}`;
+    r = await fetch(`${s3b}/api/moves/move-r2-3/chunks/0`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    const refreshed = bulkUseOf(`${S_ACC}/move-r2-3`);
+    check(
+      "window: a bulk read refreshes last-use (day 13 read lands in the index)",
+      r.status === 200 && Date.now() - refreshed < 60000,
+      `index age ${Date.now() - refreshed}ms`
+    );
+    // Age the refreshed entry by only 2 more days: at the next
+    // boot the unit is 15 days past its WRITE but 2 days past its
+    // last READ, so it must survive.
+    backdateBulkUse(`${S_ACC}/move-r2-3`, 2 * DAY);
+    killTree(s3bchild, "SIGKILL");
+    await new Promise((res) => setTimeout(res, 800));
+
+    // ---- S4: day 15 from the write, day 2 from the read. ----
+    const S4 = 4429;
+    const s4child = boot(S4, {
+      ...R2_ENV,
+      MOVER_DATA_DIR: `${dataDir}-r2d`
+    });
+    children.push(s4child);
+    check("R2 instance S4 boots", await waitHealth(S4));
+    const s4 = `http://127.0.0.1:${S4}`;
+    r = await fetch(`${s4}/api/moves/move-r2-3/chunks/0`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    const s3Down = Buffer.from(await r.arrayBuffer());
+    check(
+      "window: bulk read on day 13 survives day 15",
+      r.status === 200 && s3Down.equals(sChunk3),
+      `got ${r.status}`
+    );
+    backdateBulkUse(`${S_ACC}/move-r2-3`, 15 * DAY);
+    killTree(s4child, "SIGKILL");
+    await new Promise((res) => setTimeout(res, 800));
+    check(
+      "S4 is really gone after SIGKILL",
+      !(await fetch(`${s4}/health`).then(() => true, () => false))
+    );
+
+    // ---- S5: 15 idle days past the last read: swept. ----
+    children.push(boot(S4, { ...R2_ENV, MOVER_DATA_DIR: `${dataDir}-r2e` }));
+    check("R2 instance S5 boots", await waitHealth(S4));
+    r = await fetch(`${s4}/api/moves/move-r2-3/chunks/0`, {
+      headers: { "x-account-id": S_ACC }
+    });
+    check(
+      "window: bulk idle 15 days past its last read is swept",
+      r.status === 404,
+      `got ${r.status}`
+    );
+    stub.close();
   } finally {
     for (const child of children) killTree(child, "SIGTERM");
   }

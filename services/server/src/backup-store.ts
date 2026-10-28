@@ -12,8 +12,9 @@
 // and uploader/downloader IPs. No approval step: possession of the
 // unguessable backup ID plus the passphrase IS the authorization.
 //
-// DURABLE: constructed with a state file (index.ts passes
-// <MOVER_DATA_DIR>/state/backups.json), every mutation, audit
+// DURABLE: constructed with a state doc (index.ts passes the
+// shared StateDocs and the key state/backups.json), every
+// mutation, audit
 // events included, is written through and the backups are
 // reloaded at boot, so a restart or redeploy no longer wipes
 // them. Records are stored in exactly the form this store
@@ -25,7 +26,7 @@
 import { randomUUID } from "node:crypto";
 
 import { config } from "./config.js";
-import { loadStateFile, saveStateFile } from "./state-file.js";
+import type { StateDocs } from "./storage.js";
 
 export interface BackupBlob {
     salt: string;       // base64
@@ -55,55 +56,60 @@ const SWEEP_INTERVAL_MS = 60_000;
 export class BackupStore {
     private backups = new Map<string, BackupRecord>();
     private sweepTimer: NodeJS.Timeout;
-    private readonly stateFile?: string;
+    private readonly docs?: StateDocs;
+    private readonly docKey: string;
 
-    constructor(stateFile?: string) {
-        this.stateFile = stateFile;
-        if (this.stateFile) {
-            const saved = loadStateFile<BackupRecord[]>(this.stateFile);
-            if (Array.isArray(saved)) {
-                let dropped = 0;
-                for (const rec of saved) {
-                    if (
-                        rec &&
-                        typeof rec === "object" &&
-                        typeof rec.id === "string" &&
-                        rec.id !== "" &&
-                        typeof rec.expiresAt === "number" &&
-                        rec.blob &&
-                        typeof rec.blob === "object"
-                    ) {
-                        if (!Array.isArray(rec.audit)) rec.audit = [];
-                        this.backups.set(rec.id, rec);
-                    } else {
-                        dropped++;
-                    }
-                }
-                if (dropped > 0) {
-                    console.error(
-                        `[relayn] backups state file ${this.stateFile}: dropped ${dropped} malformed record(s) at load.`
-                    );
-                }
-            }
-        }
+    constructor(docs?: StateDocs, docKey = "state/backups.json") {
+        this.docs = docs;
+        this.docKey = docKey;
         this.sweepTimer = setInterval(() => {
-            this.sweepExpired();
+            void this.sweepExpired();
         }, SWEEP_INTERVAL_MS);
         this.sweepTimer.unref();
     }
 
-    /** Write every held backup through to the state file, if any. */
-    private persist(): void {
-        if (!this.stateFile) return;
-        saveStateFile(this.stateFile, [...this.backups.values()]);
+    /** Boot load: held backups reload from the state doc, if any. */
+    async init(): Promise<void> {
+        if (!this.docs) return;
+        const saved = await this.docs.loadJSON<BackupRecord[]>(this.docKey);
+        if (Array.isArray(saved)) {
+            let dropped = 0;
+            for (const rec of saved) {
+                if (
+                    rec &&
+                    typeof rec === "object" &&
+                    typeof rec.id === "string" &&
+                    rec.id !== "" &&
+                    typeof rec.expiresAt === "number" &&
+                    rec.blob &&
+                    typeof rec.blob === "object"
+                ) {
+                    if (!Array.isArray(rec.audit)) rec.audit = [];
+                    this.backups.set(rec.id, rec);
+                } else {
+                    dropped++;
+                }
+            }
+            if (dropped > 0) {
+                console.error(
+                    `[relayn] backups state doc ${this.docKey}: dropped ${dropped} malformed record(s) at load.`
+                );
+            }
+        }
     }
 
-    create(
+    /** Write every held backup through to the state doc, if any. */
+    private async persist(): Promise<void> {
+        if (!this.docs) return;
+        await this.docs.saveJSON(this.docKey, [...this.backups.values()]);
+    }
+
+    async create(
         blob: BackupBlob,
         siteDomain: string,
         cookieCount: number,
         ip: string
-    ): BackupRecord {
+    ): Promise<BackupRecord> {
         const now = Date.now();
         const record: BackupRecord = {
             id: randomUUID(),
@@ -115,14 +121,16 @@ export class BackupStore {
             audit: [{ t: new Date(now).toISOString(), event: "BACKUP_UPLOADED", ip }]
         };
         this.backups.set(record.id, record);
-        this.persist();
+        await this.persist();
         return record;
     }
 
     /**
      * Returns the record, "expired" (and deletes it), or undefined.
      */
-    get(id: string): BackupRecord | "expired" | undefined {
+    async get(
+        id: string
+    ): Promise<BackupRecord | "expired" | undefined> {
         const record = this.backups.get(id);
         if (!record) return undefined;
         if (Date.now() >= record.expiresAt) {
@@ -132,19 +140,19 @@ export class BackupStore {
                 ip: "-"
             });
             this.backups.delete(id);
-            this.persist();
+            await this.persist();
             return "expired";
         }
         return record;
     }
 
-    recordDownload(record: BackupRecord, ip: string): void {
+    async recordDownload(record: BackupRecord, ip: string): Promise<void> {
         record.audit.push({
             t: new Date().toISOString(),
             event: "BACKUP_DOWNLOADED",
             ip
         });
-        this.persist();
+        await this.persist();
     }
 
     /** How many backups are currently held (the console Overview reads this). */
@@ -152,7 +160,7 @@ export class BackupStore {
         return this.backups.size;
     }
 
-    delete(id: string, ip: string): boolean {
+    async delete(id: string, ip: string): Promise<boolean> {
         const record = this.backups.get(id);
         if (!record) return false;
         record.audit.push({
@@ -161,11 +169,11 @@ export class BackupStore {
             ip
         });
         const deleted = this.backups.delete(id);
-        if (deleted) this.persist();
+        if (deleted) await this.persist();
         return deleted;
     }
 
-    private sweepExpired(): void {
+    private async sweepExpired(): Promise<void> {
         const now = Date.now();
         let changed = false;
         for (const [id, record] of this.backups) {
@@ -179,7 +187,7 @@ export class BackupStore {
                 changed = true;
             }
         }
-        if (changed) this.persist();
+        if (changed) await this.persist();
     }
 
     shutdown(): void {

@@ -21,7 +21,6 @@ import "dotenv/config";
 
 import Fastify from "fastify";
 import cors from "@fastify/cors";
-import path from "node:path";
 
 import { backupRoutes } from "./backup-routes.js";
 import { BackupStore } from "./backup-store.js";
@@ -49,19 +48,23 @@ const app = Fastify({
 });
 
 const moverStore = new MoverStore();
-// Durable state: one JSON document per store under
-// <MOVER_DATA_DIR>/state/, written through on every mutation and
-// reloaded at boot (see state-file.ts), so shares, backups,
-// licenses and the headless registry survive restarts and
-// redeploys for exactly as long as MOVER_DATA_DIR itself does.
-const stateDir = path.join(moverStore.config.dataDir, "state");
-const shareStore = new ShareStore(path.join(stateDir, "shares.json"));
-const backupStore = new BackupStore(path.join(stateDir, "backups.json"));
-const partitionStore = new PartitionStore(moverStore);
+await moverStore.init();
+// Durable state: one JSON document per store under state/ on the
+// object store (storage.ts: LOCAL files under MOVER_DATA_DIR by
+// default, or the private R2 bucket when the R2 env is set),
+// written through on every mutation and reloaded at boot, so
+// shares, backups, licenses and the headless registry survive
+// restarts and redeploys for exactly as long as the store does.
+const shareStore = new ShareStore(moverStore.docs);
+await shareStore.init();
+const backupStore = new BackupStore(moverStore.docs);
+await backupStore.init();
+const partitionStore = new PartitionStore(moverStore, moverStore.docs);
 // The owner license registry (durable, seeded with the owner and
 // assistant accounts). The console reads and changes it; the headless
 // enroll gate and the console download gates enforce revocations.
-const licenseStore = new LicenseStore(path.join(stateDir, "licenses.json"));
+const licenseStore = new LicenseStore(moverStore.docs);
+await licenseStore.init();
 
 /*
  * CORS policy: empty CORS_ORIGIN disables CORS. "*" is development-only.
@@ -86,12 +89,12 @@ await app.register(cors, {
 await app.register(shareRoutes, { shareStore });
 
 // Durable encrypted cookie backups (ciphertext only, ID + passphrase auth).
-// Persisted under MOVER_DATA_DIR/state: a restart keeps live backups.
+// Persisted as a state document: a restart keeps live backups.
 await app.register(backupRoutes, { backupStore });
 
 // Relayn Mover cloud coordination: account-scoped presence, moves
 // inbox and sealed-chunk relay (metadata + ciphertext chunks only,
-// chunk storage on disk under MOVER_DATA_DIR).
+// chunk storage on the object store).
 await app.register(moverRoutes, { moverStore });
 
 // THE PARTITION: per-machine materialized view over sealed moves

@@ -18,8 +18,9 @@
 //     Multi-use within the TTL, long TTL (ACCOUNT_SHARE_TTL_MS, default
 //     48 hours). Possession of the account ID IS the authorization.
 //
-// DURABLE: constructed with a state file (index.ts passes
-// <MOVER_DATA_DIR>/state/shares.json), every mutation is written
+// DURABLE: constructed with a state doc (index.ts passes the
+// shared StateDocs and the key state/shares.json), every mutation
+// is written
 // through and the live shares are reloaded at boot, so a restart
 // or redeploy no longer wipes pending shares. The single-use
 // delete is persisted BEFORE consume() returns, so a spent share
@@ -34,7 +35,7 @@
 import { randomBytes } from "node:crypto";
 
 import { config } from "./config.js";
-import { loadStateFile, saveStateFile } from "./state-file.js";
+import type { StateDocs } from "./storage.js";
 
 export interface ShareBlob {
   iv: string;   // base64, 12-byte AES-GCM IV
@@ -70,54 +71,59 @@ function isExpired(record: ShareRecord, now: number): boolean {
 export class ShareStore {
   private shares = new Map<string, ShareRecord>();
   private sweepTimer: NodeJS.Timeout;
-  private readonly stateFile?: string;
+  private readonly docs?: StateDocs;
+  private readonly docKey: string;
 
-  constructor(stateFile?: string) {
-    this.stateFile = stateFile;
-    if (this.stateFile) {
-      const saved = loadStateFile<ShareRecord[]>(this.stateFile);
-      if (Array.isArray(saved)) {
-        let dropped = 0;
-        for (const rec of saved) {
-          if (
-            rec &&
-            typeof rec === "object" &&
-            typeof rec.id === "string" &&
-            rec.id !== "" &&
-            typeof rec.expiresAt === "number" &&
-            rec.blob &&
-            typeof rec.blob === "object"
-          ) {
-            this.shares.set(rec.id, rec);
-          } else {
-            dropped++;
-          }
-        }
-        if (dropped > 0) {
-          console.error(
-            `[relayn] shares state file ${this.stateFile}: dropped ${dropped} malformed record(s) at load.`
-          );
-        }
-      }
-    }
+  constructor(docs?: StateDocs, docKey = "state/shares.json") {
+    this.docs = docs;
+    this.docKey = docKey;
     this.sweepTimer = setInterval(() => {
-      this.sweepExpired();
+      void this.sweepExpired();
     }, SWEEP_INTERVAL_MS);
     this.sweepTimer.unref();
   }
 
-  /** Write every live share through to the state file, if any. */
-  private persist(): void {
-    if (!this.stateFile) return;
-    saveStateFile(this.stateFile, [...this.shares.values()]);
+  /** Boot load: live shares reload from the state doc, if any. */
+  async init(): Promise<void> {
+    if (!this.docs) return;
+    const saved = await this.docs.loadJSON<ShareRecord[]>(this.docKey);
+    if (Array.isArray(saved)) {
+      let dropped = 0;
+      for (const rec of saved) {
+        if (
+          rec &&
+          typeof rec === "object" &&
+          typeof rec.id === "string" &&
+          rec.id !== "" &&
+          typeof rec.expiresAt === "number" &&
+          rec.blob &&
+          typeof rec.blob === "object"
+        ) {
+          this.shares.set(rec.id, rec);
+        } else {
+          dropped++;
+        }
+      }
+      if (dropped > 0) {
+        console.error(
+          `[relayn] shares state doc ${this.docKey}: dropped ${dropped} malformed record(s) at load.`
+        );
+      }
+    }
   }
 
-  create(
+  /** Write every live share through to the state doc, if any. */
+  private async persist(): Promise<void> {
+    if (!this.docs) return;
+    await this.docs.saveJSON(this.docKey, [...this.shares.values()]);
+  }
+
+  async create(
     blob: ShareBlob,
     cookieCount: number,
     siteCount: number,
     opts?: { accountId?: string; keyB64?: string }
-  ): ShareRecord {
+  ): Promise<ShareRecord> {
     const now = Date.now();
     const accountId = opts?.accountId;
     const record: ShareRecord = {
@@ -133,7 +139,7 @@ export class ShareStore {
       record.keyB64 = opts?.keyB64;
     }
     this.shares.set(record.id, record);
-    this.persist();
+    await this.persist();
     return record;
   }
 
@@ -143,19 +149,21 @@ export class ShareStore {
    * Account shares: multi-use within their TTL.
    * Returns "expired" (and deletes) when the TTL has passed.
    */
-  consume(id: string): ShareRecord | "expired" | undefined {
+  async consume(
+    id: string
+  ): Promise<ShareRecord | "expired" | undefined> {
     const record = this.shares.get(id);
     if (!record) return undefined;
     if (isExpired(record, Date.now())) {
       this.shares.delete(id);
-      this.persist();
+      await this.persist();
       return "expired";
     }
     if (!record.accountId) {
       // Single-use: the delete is durable before the caller can
       // act on the record, so no restart can bring this share back.
       this.shares.delete(id);
-      this.persist();
+      await this.persist();
     }
     return record;
   }
@@ -184,12 +192,15 @@ export class ShareStore {
    * Full account share (blob + key) for one-tap import. The record must
    * belong to the account and be live; otherwise undefined.
    */
-  getAccountShare(accountId: string, id: string): ShareRecord | "expired" | undefined {
+  async getAccountShare(
+    accountId: string,
+    id: string
+  ): Promise<ShareRecord | "expired" | undefined> {
     const record = this.shares.get(id);
     if (!record || record.accountId !== accountId) return undefined;
     if (isExpired(record, Date.now())) {
       this.shares.delete(id);
-      this.persist();
+      await this.persist();
       return "expired";
     }
     return record;
@@ -199,7 +210,7 @@ export class ShareStore {
     return this.shares.size;
   }
 
-  private sweepExpired(): void {
+  private async sweepExpired(): Promise<void> {
     const now = Date.now();
     let changed = false;
     for (const [id, record] of this.shares) {
@@ -208,7 +219,7 @@ export class ShareStore {
         changed = true;
       }
     }
-    if (changed) this.persist();
+    if (changed) await this.persist();
   }
 
   shutdown(): void {
