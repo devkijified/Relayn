@@ -3776,7 +3776,7 @@ Ending the session here is final: the desktop and everything open on it closes.<
   async function start() {
     try {
       clearDiagnose();
-      var id = await queue("desk-open", { width: 1280, height: 800 });
+      var id = await queue("desk-open", { width: 1280, height: 800, launch: ["explorer.exe"] });
       var res = await waitResult(id);
       if (res && res.error) throw new Error(res.error);
       session = res;
