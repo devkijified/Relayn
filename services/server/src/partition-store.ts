@@ -59,6 +59,10 @@ export interface PartitionMachineView {
   moveIds: string[];
   updatedAt: string;
   gaps: string[];
+  /** Files under the shell-set prefixes (Desktop, Start Menu, TaskBar pins, wallpaper). */
+  shellFileCount?: number;
+  /** True when fileCount===0 or shellFileCount===0 (Viewer also gates shell-empty on online). */
+  stale?: boolean;
 }
 
 interface MachineIndex {
@@ -99,6 +103,27 @@ function baseName(packPath: string): string {
  * a derived view, rebuilt from the sealed moves on disk whenever
  * it is cold, so a restart loses nothing that cannot be recomputed.
  */
+/** Shell-set prefixes the Partition auto-pull always pulls first. */
+const PARTITION_SHELL_PREFIXES = [
+  "files/Desktop",
+  "appData/Roaming/Microsoft/Windows/Start Menu/Programs",
+  "appData/Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar",
+  "setup/wallpaper"
+];
+
+function shellFileCountOf(files: Map<string, PartitionFileRef>): number {
+  let n = 0;
+  for (const packPath of files.keys()) {
+    for (const pref of PARTITION_SHELL_PREFIXES) {
+      if (packPath === pref || packPath.startsWith(pref + "/")) {
+        n++;
+        break;
+      }
+    }
+  }
+  return n;
+}
+
 export class PartitionStore {
   private indexes = new Map<string, Map<string, MachineIndex>>(); // account -> machineId -> index
   private ledgers = new Map<string, PartitionMutateRecord[]>(); // account|machineId -> records
@@ -255,7 +280,7 @@ export class PartitionStore {
     }
     if (moveIds.size === 0) {
       gaps.push(
-        "No sealed moves bound to this machine yet. Partition Explorer shows an empty tree until a move whose sourceName or moverName matches this machine is present. Continuous Host pull is not in this pack (named gap)."
+        "No sealed moves bound to this machine yet. Partition Explorer shows an empty tree until a move whose sourceName or moverName matches this machine is present. Opening Partition starts an automatic pull from the Host when the machine is online."
       );
     }
     gaps.push(
@@ -272,12 +297,15 @@ export class PartitionStore {
     // Apply ledger on top for serving.
     await this.loadLedger(account, machineId);
 
+    const shellFileCount = shellFileCountOf(files);
     return {
       machineId,
       fileCount: files.size,
       moveIds: Array.from(moveIds),
       updatedAt,
-      gaps
+      gaps,
+      shellFileCount,
+      stale: files.size === 0 || shellFileCount === 0
     };
   }
 
@@ -349,12 +377,15 @@ export class PartitionStore {
         "No sealed moves bound to this machine yet. Partition shows an empty desktop until a move whose sourceName or moverName matches this machine is present."
       );
     }
+    const shellFileCount = shellFileCountOf(live);
     return {
       machineId,
       fileCount: live.size,
       moveIds: Array.from(idx.moveIds),
       updatedAt: idx.updatedAt,
-      gaps
+      gaps,
+      shellFileCount,
+      stale: live.size === 0 || shellFileCount === 0
     };
   }
 
