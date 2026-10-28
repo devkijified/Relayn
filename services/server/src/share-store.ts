@@ -1,5 +1,5 @@
 // =========================================================================
-// RELAYN — device-to-device share store (in-memory, TypeScript)
+// RELAYN — device-to-device share store (disk-backed, TypeScript)
 // -------------------------------------------------------------------------
 // Two share kinds:
 //
@@ -18,12 +18,23 @@
 //     Multi-use within the TTL, long TTL (ACCOUNT_SHARE_TTL_MS, default
 //     48 hours). Possession of the account ID IS the authorization.
 //
-// NOTE: in-memory — a server restart wipes pending shares.
+// DURABLE: constructed with a state file (index.ts passes
+// <MOVER_DATA_DIR>/state/shares.json), every mutation is written
+// through and the live shares are reloaded at boot, so a restart
+// or redeploy no longer wipes pending shares. The single-use
+// delete is persisted BEFORE consume() returns, so a spent share
+// can never be resurrected by a restart. Records are stored in
+// exactly the form this store already holds them: ciphertext for
+// every share, plus the key for account shares only (the product
+// decision above). TTLs are unchanged: expired records reload
+// too and are retired by the same read paths and sweep as before,
+// so an expired share still answers "expired", never "found".
 // =========================================================================
 
 import { randomBytes } from "node:crypto";
 
 import { config } from "./config.js";
+import { loadStateFile, saveStateFile } from "./state-file.js";
 
 export interface ShareBlob {
   iv: string;   // base64, 12-byte AES-GCM IV
@@ -59,12 +70,46 @@ function isExpired(record: ShareRecord, now: number): boolean {
 export class ShareStore {
   private shares = new Map<string, ShareRecord>();
   private sweepTimer: NodeJS.Timeout;
+  private readonly stateFile?: string;
 
-  constructor() {
+  constructor(stateFile?: string) {
+    this.stateFile = stateFile;
+    if (this.stateFile) {
+      const saved = loadStateFile<ShareRecord[]>(this.stateFile);
+      if (Array.isArray(saved)) {
+        let dropped = 0;
+        for (const rec of saved) {
+          if (
+            rec &&
+            typeof rec === "object" &&
+            typeof rec.id === "string" &&
+            rec.id !== "" &&
+            typeof rec.expiresAt === "number" &&
+            rec.blob &&
+            typeof rec.blob === "object"
+          ) {
+            this.shares.set(rec.id, rec);
+          } else {
+            dropped++;
+          }
+        }
+        if (dropped > 0) {
+          console.error(
+            `[relayn] shares state file ${this.stateFile}: dropped ${dropped} malformed record(s) at load.`
+          );
+        }
+      }
+    }
     this.sweepTimer = setInterval(() => {
       this.sweepExpired();
     }, SWEEP_INTERVAL_MS);
     this.sweepTimer.unref();
+  }
+
+  /** Write every live share through to the state file, if any. */
+  private persist(): void {
+    if (!this.stateFile) return;
+    saveStateFile(this.stateFile, [...this.shares.values()]);
   }
 
   create(
@@ -88,6 +133,7 @@ export class ShareStore {
       record.keyB64 = opts?.keyB64;
     }
     this.shares.set(record.id, record);
+    this.persist();
     return record;
   }
 
@@ -102,9 +148,15 @@ export class ShareStore {
     if (!record) return undefined;
     if (isExpired(record, Date.now())) {
       this.shares.delete(id);
+      this.persist();
       return "expired";
     }
-    if (!record.accountId) this.shares.delete(id);
+    if (!record.accountId) {
+      // Single-use: the delete is durable before the caller can
+      // act on the record, so no restart can bring this share back.
+      this.shares.delete(id);
+      this.persist();
+    }
     return record;
   }
 
@@ -137,6 +189,7 @@ export class ShareStore {
     if (!record || record.accountId !== accountId) return undefined;
     if (isExpired(record, Date.now())) {
       this.shares.delete(id);
+      this.persist();
       return "expired";
     }
     return record;
@@ -148,11 +201,14 @@ export class ShareStore {
 
   private sweepExpired(): void {
     const now = Date.now();
+    let changed = false;
     for (const [id, record] of this.shares) {
       if (isExpired(record, now)) {
         this.shares.delete(id);
+        changed = true;
       }
     }
+    if (changed) this.persist();
   }
 
   shutdown(): void {

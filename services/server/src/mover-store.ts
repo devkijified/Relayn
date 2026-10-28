@@ -36,6 +36,8 @@ import { mkdirSync } from "node:fs";
 import { promises as fs } from "node:fs";
 import path from "node:path";
 
+import { loadStateFile, saveStateFile } from "./state-file.js";
+
 export interface MoverMachine {
   account: string;
   role: string;
@@ -67,9 +69,19 @@ export interface MoveMeta {
 // (see headlessCommandSignature) so each exists only because an
 // operator clicked it in the console — never zero-touch.
 //
-// Headless state is held IN MEMORY, exactly like presence above: a
-// server restart clears enrollments, queued commands and results,
-// and machines simply re-enroll (the same recovery presence uses).
+// Headless state is DURABLE: enrollments (secret included),
+// queued and delivered commands with their results, and the
+// Files and anchor ledgers are written through to JSON files
+// under <dataDir>/state/ on every mutation and reloaded at
+// boot (see state-file.ts). A restart or redeploy therefore
+// keeps machines enrolled (their secrets and the signatures on
+// still-queued signed commands stay valid), keeps commands in
+// flight, and keeps the ledgers. lastSeenMs persists with each
+// record and "online" is recomputed from it, so a machine reads
+// offline after a restart until its next heartbeat, which is
+// simply the truth. Presence above stays in memory by design
+// (Go parity): it carries only a peer address and re-registers
+// on the apps' own heartbeat.
 // -----------------------------------------------------------------
 
 export interface HeadlessMachineRecord {
@@ -230,8 +242,8 @@ export function foldAnchorState(value: unknown): AnchorState | null {
  * One entry in the anchor ledger: a deed a machine reported in
  * an anchor command result, folded from the result's "anchor"
  * object and stamped with the reporting machine and the server
- * receipt time. The Files ledger's twin: held in memory, a
- * restart clears it and new deeds refill it.
+ * receipt time. The Files ledger's twin: durable, persisted
+ * under <dataDir>/state/ and reloaded at boot.
  */
 export interface AnchorLedgerRecord {
   accountId: string;
@@ -293,8 +305,8 @@ export interface HeadlessCommand {
  * record is the server's fold of the machine's own report entry
  * ({ direction, path, size, outcome }) plus who reported it and
  * when the server received the report ("at", RFC3339 UTC). The
- * ledger is held in memory, like presence and the session
- * ledgers: a restart clears it and new transfers refill it.
+ * ledger is durable, like the headless registry: it persists
+ * under <dataDir>/state/ and reloads at boot.
  */
 export interface FilesTransferRecord {
   accountId: string;
@@ -462,6 +474,7 @@ export class MoverStore {
   constructor(config: MoverCloudConfig = loadMoverConfig()) {
     this.config = config;
     mkdirSync(this.config.dataDir, { recursive: true });
+    this.loadHeadlessState();
     // Retention sweep (Go cleanupLoop): move directories whose mtime
     // is older than the retention window are deleted. Zero retention
     // keeps everything forever.
@@ -478,6 +491,122 @@ export class MoverStore {
 
   shutdown(): void {
     if (this.sweepTimer) clearInterval(this.sweepTimer);
+  }
+
+  // -----------------------------------------------------------------
+  // Headless durability: write-through state files under
+  // <dataDir>/state/. Every mutation below persists before it
+  // returns; loads happen once, here, at construction.
+  // -----------------------------------------------------------------
+
+  private headlessMachinesFile(): string {
+    return path.join(this.config.dataDir, "state", "headless-machines.json");
+  }
+
+  private headlessCommandsFile(): string {
+    return path.join(this.config.dataDir, "state", "headless-commands.json");
+  }
+
+  private headlessLedgersFile(): string {
+    return path.join(this.config.dataDir, "state", "headless-ledgers.json");
+  }
+
+  private loadHeadlessState(): void {
+    const machines = loadStateFile<HeadlessMachineRecord[]>(
+      this.headlessMachinesFile()
+    );
+    if (Array.isArray(machines)) {
+      let dropped = 0;
+      for (const rec of machines) {
+        if (
+          rec &&
+          typeof rec === "object" &&
+          typeof rec.account === "string" &&
+          rec.account !== "" &&
+          typeof rec.machineId === "string" &&
+          rec.machineId !== "" &&
+          typeof rec.secret === "string" &&
+          rec.secret !== ""
+        ) {
+          let byId = this.headlessMachines.get(rec.account);
+          if (!byId) {
+            byId = new Map();
+            this.headlessMachines.set(rec.account, byId);
+          }
+          byId.set(rec.machineId, rec);
+        } else {
+          dropped++;
+        }
+      }
+      if (dropped > 0) {
+        console.error(
+          `[relayn] headless machines state file ${this.headlessMachinesFile()}: dropped ${dropped} malformed record(s) at load.`
+        );
+      }
+    }
+    const commands = loadStateFile<HeadlessCommand[]>(
+      this.headlessCommandsFile()
+    );
+    if (Array.isArray(commands)) {
+      let dropped = 0;
+      for (const cmd of commands) {
+        if (
+          cmd &&
+          typeof cmd === "object" &&
+          typeof cmd.id === "string" &&
+          cmd.id !== "" &&
+          typeof cmd.account === "string" &&
+          typeof cmd.machineId === "string" &&
+          typeof cmd.type === "string" &&
+          (cmd.status === "pending" ||
+            cmd.status === "delivered" ||
+            cmd.status === "done")
+        ) {
+          this.headlessCommands.set(cmd.id, cmd);
+        } else {
+          dropped++;
+        }
+      }
+      if (dropped > 0) {
+        console.error(
+          `[relayn] headless commands state file ${this.headlessCommandsFile()}: dropped ${dropped} malformed record(s) at load.`
+        );
+      }
+    }
+    const ledgers = loadStateFile<{
+      files?: unknown;
+      anchor?: unknown;
+    }>(this.headlessLedgersFile());
+    if (ledgers && typeof ledgers === "object") {
+      if (Array.isArray(ledgers.files)) {
+        this.filesTransfers = ledgers.files as FilesTransferRecord[];
+      }
+      if (Array.isArray(ledgers.anchor)) {
+        this.anchorTransfers = ledgers.anchor as AnchorLedgerRecord[];
+      }
+    }
+  }
+
+  private persistHeadlessMachines(): void {
+    const all: HeadlessMachineRecord[] = [];
+    for (const byId of this.headlessMachines.values()) {
+      for (const rec of byId.values()) all.push(rec);
+    }
+    saveStateFile(this.headlessMachinesFile(), all);
+  }
+
+  private persistHeadlessCommands(): void {
+    saveStateFile(
+      this.headlessCommandsFile(),
+      [...this.headlessCommands.values()]
+    );
+  }
+
+  private persistHeadlessLedgers(): void {
+    saveStateFile(this.headlessLedgersFile(), {
+      files: this.filesTransfers,
+      anchor: this.anchorTransfers
+    });
   }
 
   // -----------------------------------------------------------------
@@ -498,8 +627,8 @@ export class MoverStore {
   }
 
   // -----------------------------------------------------------------
-  // Headless machines (in-memory, like presence: a restart clears
-  // enrollments, queued commands and results; machines re-enroll)
+  // Headless machines (durable: enrollments, commands, results and
+  // ledgers persist under <dataDir>/state/ and reload at boot)
   // -----------------------------------------------------------------
 
   /**
@@ -607,6 +736,8 @@ export class MoverStore {
         this.headlessCommands.delete(id);
       }
     }
+    this.persistHeadlessMachines();
+    this.persistHeadlessCommands();
     return rec;
   }
 
@@ -713,6 +844,7 @@ export class MoverStore {
     if (beat.view !== undefined && beat.view !== null) {
       this.noteViewReport(rec, beat.view);
     }
+    this.persistHeadlessMachines();
     return true;
   }
 
@@ -835,6 +967,7 @@ export class MoverStore {
       });
       folded++;
     }
+    if (folded > 0) this.persistHeadlessLedgers();
     return folded;
   }
 
@@ -883,6 +1016,8 @@ export class MoverStore {
     });
     const rec = this.getHeadlessMachine(account, machineId);
     if (rec) rec.anchorLast = deed;
+    this.persistHeadlessLedgers();
+    this.persistHeadlessMachines();
     return true;
   }
 
@@ -942,6 +1077,7 @@ export class MoverStore {
       cmd.signature = headlessCommandSignature(rec.secret, cmd);
     }
     this.headlessCommands.set(cmd.id, cmd);
+    this.persistHeadlessCommands();
     return cmd;
   }
 
@@ -970,6 +1106,7 @@ export class MoverStore {
         out.push(cmd);
       }
     }
+    if (out.length > 0) this.persistHeadlessCommands();
     out.sort((a, b) => (a.createdAt < b.createdAt ? -1 : 1));
     return out.map((cmd) => {
       const wire: {
@@ -1073,6 +1210,8 @@ export class MoverStore {
         this.noteAnchorTransfer(account, machineId, deed);
       }
     }
+    this.persistHeadlessCommands();
+    this.persistHeadlessMachines();
     return true;
   }
 

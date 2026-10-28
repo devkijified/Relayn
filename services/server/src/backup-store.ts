@@ -1,5 +1,5 @@
 // =========================================================================
-// RELAYN — encrypted cookie backup store (in-memory, TypeScript)
+// RELAYN — encrypted cookie backup store (disk-backed, TypeScript)
 // -------------------------------------------------------------------------
 // Stores ONLY ciphertext. The passphrase never leaves the browser: the
 // extension encrypts with PBKDF2 + AES-GCM (WebCrypto) and uploads
@@ -12,13 +12,20 @@
 // and uploader/downloader IPs. No approval step: possession of the
 // unguessable backup ID plus the passphrase IS the authorization.
 //
-// NOTE: in-memory — a server restart wipes backups. Fine for testing;
-// use persistent storage (SQLite/file) for production.
+// DURABLE: constructed with a state file (index.ts passes
+// <MOVER_DATA_DIR>/state/backups.json), every mutation, audit
+// events included, is written through and the backups are
+// reloaded at boot, so a restart or redeploy no longer wipes
+// them. Records are stored in exactly the form this store
+// already holds them: ciphertext only. Expired records reload
+// too and are retired by the same read path and sweep as
+// before, so an expired backup still answers "expired".
 // =========================================================================
 
 import { randomUUID } from "node:crypto";
 
 import { config } from "./config.js";
+import { loadStateFile, saveStateFile } from "./state-file.js";
 
 export interface BackupBlob {
     salt: string;       // base64
@@ -48,12 +55,47 @@ const SWEEP_INTERVAL_MS = 60_000;
 export class BackupStore {
     private backups = new Map<string, BackupRecord>();
     private sweepTimer: NodeJS.Timeout;
+    private readonly stateFile?: string;
 
-    constructor() {
+    constructor(stateFile?: string) {
+        this.stateFile = stateFile;
+        if (this.stateFile) {
+            const saved = loadStateFile<BackupRecord[]>(this.stateFile);
+            if (Array.isArray(saved)) {
+                let dropped = 0;
+                for (const rec of saved) {
+                    if (
+                        rec &&
+                        typeof rec === "object" &&
+                        typeof rec.id === "string" &&
+                        rec.id !== "" &&
+                        typeof rec.expiresAt === "number" &&
+                        rec.blob &&
+                        typeof rec.blob === "object"
+                    ) {
+                        if (!Array.isArray(rec.audit)) rec.audit = [];
+                        this.backups.set(rec.id, rec);
+                    } else {
+                        dropped++;
+                    }
+                }
+                if (dropped > 0) {
+                    console.error(
+                        `[relayn] backups state file ${this.stateFile}: dropped ${dropped} malformed record(s) at load.`
+                    );
+                }
+            }
+        }
         this.sweepTimer = setInterval(() => {
             this.sweepExpired();
         }, SWEEP_INTERVAL_MS);
         this.sweepTimer.unref();
+    }
+
+    /** Write every held backup through to the state file, if any. */
+    private persist(): void {
+        if (!this.stateFile) return;
+        saveStateFile(this.stateFile, [...this.backups.values()]);
     }
 
     create(
@@ -73,6 +115,7 @@ export class BackupStore {
             audit: [{ t: new Date(now).toISOString(), event: "BACKUP_UPLOADED", ip }]
         };
         this.backups.set(record.id, record);
+        this.persist();
         return record;
     }
 
@@ -89,6 +132,7 @@ export class BackupStore {
                 ip: "-"
             });
             this.backups.delete(id);
+            this.persist();
             return "expired";
         }
         return record;
@@ -100,6 +144,7 @@ export class BackupStore {
             event: "BACKUP_DOWNLOADED",
             ip
         });
+        this.persist();
     }
 
     /** How many backups are currently held (the console Overview reads this). */
@@ -115,11 +160,14 @@ export class BackupStore {
             event: "BACKUP_DELETED",
             ip
         });
-        return this.backups.delete(id);
+        const deleted = this.backups.delete(id);
+        if (deleted) this.persist();
+        return deleted;
     }
 
     private sweepExpired(): void {
         const now = Date.now();
+        let changed = false;
         for (const [id, record] of this.backups) {
             if (now >= record.expiresAt) {
                 record.audit.push({
@@ -128,8 +176,10 @@ export class BackupStore {
                     ip: "-"
                 });
                 this.backups.delete(id);
+                changed = true;
             }
         }
+        if (changed) this.persist();
     }
 
     shutdown(): void {

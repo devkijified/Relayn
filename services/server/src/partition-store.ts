@@ -21,6 +21,7 @@ import { promises as fs } from "node:fs";
 import path from "node:path";
 
 import type { MoverStore } from "./mover-store.js";
+import { saveTextFileAtomic } from "./state-file.js";
 
 export interface PartitionFileRef {
   packPath: string;
@@ -91,7 +92,12 @@ function baseName(packPath: string): string {
  * PartitionStore builds and serves the Partition tree as a view over
  * MoverStore sealed moves. Disk layout for the ledger only:
  *   <dataDir>/<accountId>/_partition/<machineId>/ledger.json
- * File bytes are NEVER written here.
+ * File bytes are NEVER written here. Ledger writes are atomic (a
+ * temp sibling renamed over the target, see state-file.ts), and a
+ * corrupt ledger logs loudly and starts empty instead of crashing
+ * the read. The per-machine index stays in memory by design: it is
+ * a derived view, rebuilt from the sealed moves on disk whenever
+ * it is cold, so a restart loses nothing that cannot be recomputed.
  */
 export class PartitionStore {
   private indexes = new Map<string, Map<string, MachineIndex>>(); // account -> machineId -> index
@@ -136,21 +142,33 @@ export class PartitionStore {
     const cached = this.ledgers.get(key);
     if (cached) return cached;
     let records: PartitionMutateRecord[] = [];
+    let raw: string | undefined;
     try {
-      const raw = await fs.readFile(this.ledgerPath(account, machineId), "utf8");
-      const parsed = JSON.parse(raw) as unknown;
-      if (Array.isArray(parsed)) {
-        records = parsed.filter(
-          (r): r is PartitionMutateRecord =>
-            !!r &&
-            typeof r === "object" &&
-            (r as PartitionMutateRecord).confirmed === true &&
-            ((r as PartitionMutateRecord).op === "delete" ||
-              (r as PartitionMutateRecord).op === "rename")
-        );
-      }
+      raw = await fs.readFile(this.ledgerPath(account, machineId), "utf8");
     } catch {
-      records = [];
+      raw = undefined; // a missing ledger is the normal first-run case
+    }
+    if (raw !== undefined) {
+      try {
+        const parsed = JSON.parse(raw) as unknown;
+        if (Array.isArray(parsed)) {
+          records = parsed.filter(
+            (r): r is PartitionMutateRecord =>
+              !!r &&
+              typeof r === "object" &&
+              (r as PartitionMutateRecord).confirmed === true &&
+              ((r as PartitionMutateRecord).op === "delete" ||
+                (r as PartitionMutateRecord).op === "rename")
+          );
+        }
+      } catch (err) {
+        console.error(
+          `[relayn] PARTITION LEDGER CORRUPT: ${this.ledgerPath(account, machineId)} ` +
+            `could not be parsed (${(err as Error).message}). Starting that ` +
+            `machine's ledger empty; the sealed moves are untouched.`
+        );
+        records = [];
+      }
     }
     this.ledgers.set(key, records);
     return records;
@@ -163,12 +181,9 @@ export class PartitionStore {
   ): Promise<void> {
     const key = this.ledgerKey(account, machineId);
     this.ledgers.set(key, records);
-    const dir = path.dirname(this.ledgerPath(account, machineId));
-    await fs.mkdir(dir, { recursive: true });
-    await fs.writeFile(
+    await saveTextFileAtomic(
       this.ledgerPath(account, machineId),
-      JSON.stringify(records, null, 2),
-      "utf8"
+      JSON.stringify(records, null, 2)
     );
   }
 

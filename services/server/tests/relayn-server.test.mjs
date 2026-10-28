@@ -31,6 +31,13 @@
 //     path + newName + machineId validation, folder delete/rename),
 //     ledger (ordered, account-scoped, read back after a restart),
 //     sealed manifests untouched, nothing queued for the source
+//   * the durable store: every store written through to
+//     <MOVER_DATA_DIR>/state/ and reloaded at boot — an instance
+//     is SIGKILLed (no shutdown flush) and its successor on the
+//     same data dir reads back the enrollment + secret, a queued
+//     command, live and spent shares, a backup, a move, a
+//     partition ledger entry, and a license revocation that
+//     still gates enrollment
 // Run:  node tests/relayn-server.test.mjs
 // =========================================================================
 
@@ -3307,6 +3314,362 @@ async function main() {
     check(
       "partition fresh process keeps the folder rename",
       r.status === 200,
+      `got ${r.status}`
+    );
+
+    // ---------------------------------------------------------------
+    // Instances R1/R2: THE DURABLE STORE. Everything the server
+    // holds is written through to <MOVER_DATA_DIR>/state/ and
+    // reloaded at boot. R1 writes one of each kind, is KILLED
+    // (SIGKILL: no shutdown flush exists or is needed), and R2
+    // boots on the same data dir and must read it all back: the
+    // enrollment with its secret, a still-queued command, live
+    // and spent shares, a backup, a move, a partition ledger
+    // entry, and a license revocation that still gates enroll.
+    // ---------------------------------------------------------------
+    console.log("durable store across a restart");
+    const R1 = 4424;
+    const R2 = 4425;
+    const dataDirR = `${dataDir}-durable`;
+    const DUR_ACC = "duracct0000001";
+    const DUR_MID = "dur-host-01";
+    const DUR_NAME = "DUR-HOST";
+    const DH = {
+      "x-account-id": DUR_ACC,
+      "content-type": "application/json"
+    };
+    const r1child = boot(R1, {
+      MOVER_DATA_DIR: dataDirR,
+      MOVER_CONSOLE_KEY: CONSOLE_KEY
+    });
+    children.push(r1child);
+    check("durable instance R1 boots", await waitHealth(R1));
+    const r1 = `http://127.0.0.1:${R1}`;
+
+    // Shares: one spent on R1, one left live, one account share.
+    const durBlob = {
+      iv: randomBytes(12).toString("base64"),
+      data: randomBytes(128).toString("base64")
+    };
+    const sharePost = (body) =>
+      fetch(`${r1}/api/share`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body)
+      });
+    r = await sharePost({ blob: durBlob, cookieCount: 4, siteCount: 2 });
+    const spentShare = (await r.json()).id;
+    r = await fetch(`${r1}/api/share/${spentShare}`);
+    check(
+      "durable setup: anon share consumed on R1",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await sharePost({ blob: durBlob, cookieCount: 4, siteCount: 2 });
+    const liveShare = (await r.json()).id;
+    const durKey = randomBytes(32).toString("base64");
+    r = await sharePost({
+      blob: durBlob,
+      cookieCount: 4,
+      siteCount: 2,
+      accountId: DUR_ACC,
+      key: durKey
+    });
+    const durAcctShare = (await r.json()).id;
+    check(
+      "durable setup: live + account shares created on R1",
+      !!liveShare && !!durAcctShare
+    );
+
+    // Backup.
+    const bakBlob = {
+      salt: randomBytes(16).toString("base64"),
+      iv: randomBytes(12).toString("base64"),
+      iterations: 100000,
+      data: randomBytes(64).toString("base64")
+    };
+    r = await fetch(`${r1}/api/backups`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        blob: bakBlob,
+        siteDomain: "example.com",
+        cookieCount: 3
+      })
+    });
+    const bakDur = await r.json().catch(() => ({}));
+    check(
+      "durable setup: backup created on R1",
+      r.status === 201 && !!bakDur.id,
+      `got ${r.status} ${JSON.stringify(bakDur)}`
+    );
+
+    // Headless enrollment + heartbeat + a command left queued.
+    r = await fetch(`${r1}/api/headless/enroll`, {
+      method: "POST",
+      headers: DH,
+      body: JSON.stringify({
+        machineId: DUR_MID,
+        name: DUR_NAME,
+        os: "Windows Server 2022"
+      })
+    });
+    const durEnroll = await r.json().catch(() => ({}));
+    check(
+      "durable setup: machine enrolls on R1",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(durEnroll.machineSecret ?? ""),
+      JSON.stringify(durEnroll)
+    );
+    const DUR_AUTH = {
+      "x-account-id": DUR_ACC,
+      "x-machine-id": DUR_MID,
+      "x-machine-secret": durEnroll.machineSecret,
+      "content-type": "application/json"
+    };
+    r = await fetch(`${r1}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: DUR_AUTH,
+      body: JSON.stringify({ state: "idle" })
+    });
+    check(
+      "durable setup: heartbeat accepted on R1",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r1}/api/headless/commands`, {
+      method: "POST",
+      headers: {
+        "x-account-id": DUR_ACC,
+        "x-machine-id": DUR_MID,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ type: "scan", payload: {} })
+    });
+    const durCmd = await r.json().catch(() => ({}));
+    check(
+      "durable setup: command queued on R1 (never polled)",
+      r.status === 200 && !!durCmd.commandId,
+      JSON.stringify(durCmd)
+    );
+
+    // A sealed move + a partition ledger entry bound to the machine.
+    const durManifest = {
+      moveId: "move-durable-1",
+      name: "Durable test move",
+      sourceName: DUR_NAME,
+      createdAt: "2026-10-28T00:00:00Z",
+      categories: { files: 1 },
+      files: [
+        {
+          path: "files/Desktop/durable-note.txt",
+          category: "files",
+          size: 3,
+          sha256: "x",
+          chunks: 1
+        }
+      ],
+      chunks: [
+        {
+          index: 0,
+          path: "files/Desktop/durable-note.txt",
+          offset: 0,
+          size: 3,
+          sha256: "x"
+        }
+      ],
+      totalBytes: 3,
+      totalFiles: 1
+    };
+    r = await fetch(`${r1}/api/moves`, {
+      method: "POST",
+      headers: DH,
+      body: JSON.stringify({ moverName: DUR_NAME, manifest: durManifest })
+    });
+    check(
+      "durable setup: move announced on R1",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r1}/api/partition/${DUR_MID}/rebuild`, {
+      method: "POST",
+      headers: DH,
+      body: JSON.stringify({})
+    });
+    check(
+      "durable setup: partition rebuild binds the move",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r1}/api/partition/${DUR_MID}/mutate`, {
+      method: "POST",
+      headers: DH,
+      body: JSON.stringify({
+        op: "delete",
+        path: "files/Desktop/durable-note.txt",
+        confirmed: true
+      })
+    });
+    const durMut = await r.json().catch(() => ({}));
+    check(
+      "durable setup: partition delete ledgered on R1",
+      r.status === 200 && /^pm-[0-9a-f]{16}$/.test(durMut.id ?? ""),
+      `got ${r.status} ${JSON.stringify(durMut)}`
+    );
+
+    // Licenses: issue two products, revoke one of them.
+    const licPost = (sub, body) =>
+      fetch(`${r1}/mover/console/api/licenses${sub}`, {
+        method: "POST",
+        headers: KH,
+        body: JSON.stringify(body)
+      });
+    r = await licPost("", {
+      product: "mover",
+      accountId: DUR_ACC,
+      label: "Durable test"
+    });
+    check(
+      "durable setup: mover license issued on R1",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await licPost("", { product: "ext", accountId: DUR_ACC });
+    check(
+      "durable setup: ext license issued on R1",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await licPost("/revoke", { product: "ext", accountId: DUR_ACC });
+    check(
+      "durable setup: ext license revoked on R1",
+      r.status === 200,
+      `got ${r.status}`
+    );
+
+    // Kill R1 outright: durability must not depend on a clean exit.
+    r1child.kill("SIGKILL");
+    await new Promise((res) => setTimeout(res, 800));
+
+    children.push(
+      boot(R2, {
+        MOVER_DATA_DIR: dataDirR,
+        MOVER_CONSOLE_KEY: CONSOLE_KEY
+      })
+    );
+    check("durable instance R2 boots on R1's data dir", await waitHealth(R2));
+    const r2 = `http://127.0.0.1:${R2}`;
+
+    r = await fetch(`${r2}/api/share/${spentShare}`);
+    check(
+      "spent single-use share stays spent after a restart",
+      r.status === 404,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r2}/api/share/${liveShare}`);
+    const liveGot = await r.json().catch(() => ({}));
+    check(
+      "live anon share survives a restart and still downloads",
+      r.status === 200 && liveGot.blob?.data === durBlob.data,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r2}/api/account/${DUR_ACC}/shares/${durAcctShare}`);
+    const acctGot = await r.json().catch(() => ({}));
+    check(
+      "account share survives a restart (blob + key)",
+      r.status === 200 &&
+        acctGot.key === durKey &&
+        acctGot.blob?.data === durBlob.data,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r2}/api/backups/${bakDur.id}`);
+    const bakGot = await r.json().catch(() => ({}));
+    check(
+      "backup survives a restart (blob round trip)",
+      r.status === 200 && bakGot.blob?.data === bakBlob.data,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r2}/api/headless/machines`, {
+      headers: { "x-account-id": DUR_ACC }
+    });
+    const durMachines = await r.json().catch(() => ({}));
+    check(
+      "enrollment survives a restart",
+      r.status === 200 &&
+        (durMachines.machines ?? []).some((m) => m.machineId === DUR_MID),
+      JSON.stringify(durMachines).slice(0, 200)
+    );
+    r = await fetch(`${r2}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: DUR_AUTH,
+      body: JSON.stringify({ state: "idle" })
+    });
+    check(
+      "the R1 machine secret still verifies after a restart",
+      r.status === 200,
+      `got ${r.status}`
+    );
+    r = await fetch(`${r2}/api/headless/commands`, { headers: DUR_AUTH });
+    const durPoll = await r.json().catch(() => ({}));
+    check(
+      "the queued command survives a restart and is delivered once",
+      r.status === 200 &&
+        Array.isArray(durPoll) &&
+        durPoll.some((c) => c.id === durCmd.commandId && c.type === "scan"),
+      JSON.stringify(durPoll).slice(0, 200)
+    );
+    r = await fetch(`${r2}/api/headless/commands`, { headers: DUR_AUTH });
+    const durPoll2 = await r.json().catch(() => ({}));
+    check(
+      "the delivered command is not delivered twice",
+      r.status === 200 && Array.isArray(durPoll2) && durPoll2.length === 0,
+      JSON.stringify(durPoll2).slice(0, 200)
+    );
+    r = await fetch(`${r2}/api/moves`, {
+      headers: { "x-account-id": DUR_ACC }
+    });
+    const durMoves = await r.json().catch(() => ({}));
+    check(
+      "move metadata survives a restart",
+      r.status === 200 &&
+        Array.isArray(durMoves) &&
+        durMoves.some((m) => m.moveId === "move-durable-1"),
+      JSON.stringify(durMoves).slice(0, 200)
+    );
+    r = await fetch(`${r2}/api/partition/${DUR_MID}/ledger`, {
+      headers: { "x-account-id": DUR_ACC }
+    });
+    const durLedger = await r.json().catch(() => ({}));
+    check(
+      "partition ledger survives a restart",
+      r.status === 200 &&
+        (durLedger.records ?? []).some((rec) => rec.id === durMut.id),
+      JSON.stringify(durLedger).slice(0, 200)
+    );
+    r = await fetch(`${r2}/mover/console/api/licenses`, { headers: KH });
+    const durLic = await r.json().catch(() => ({}));
+    const durFor = (p) =>
+      (durLic.licenses ?? []).find(
+        (l) => l.accountId === DUR_ACC && l.product === p
+      );
+    check(
+      "licenses survive a restart (issued stays active, revoked stays revoked)",
+      r.status === 200 &&
+        durFor("mover")?.status === "active" &&
+        durFor("ext")?.status === "revoked",
+      JSON.stringify(durLic).slice(0, 300)
+    );
+    r = await fetch(`${r2}/api/headless/enroll`, {
+      method: "POST",
+      headers: DH,
+      body: JSON.stringify({
+        machineId: "dur-host-02",
+        name: "DUR-HOST-2",
+        os: "Windows"
+      })
+    });
+    check(
+      "the revoked account is still blocked from enrolling after a restart",
+      r.status === 403,
       `got ${r.status}`
     );
   } finally {

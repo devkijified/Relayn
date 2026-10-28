@@ -67,7 +67,8 @@ const envSchema = z.object({
   /*
    * Durable encrypted cookie backups (POST /api/backups). The server
    * stores ciphertext only — the passphrase never leaves the browser.
-   * BACKUP_TTL_MS default 7 days; a restart wipes the in-memory store.
+   * BACKUP_TTL_MS default 7 days; backups persist across restarts
+   * under MOVER_DATA_DIR/state (see backup-store.ts).
    */
   BACKUP_TTL_MS: z.coerce
     .number()

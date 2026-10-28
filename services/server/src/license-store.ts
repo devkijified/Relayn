@@ -1,5 +1,5 @@
 // =========================================================================
-// RELAYN — license registry (in-memory, TypeScript)
+// RELAYN — license registry (disk-backed, TypeScript)
 // -------------------------------------------------------------------------
 // One license per (product, account). Products are the three Relayn
 // surfaces this server knows about: "ext" (the browser extension),
@@ -13,11 +13,16 @@
 // mover-headless.ts and mover-console.ts). It does not end machines
 // or sessions that are already running, and restore() undoes it.
 //
-// NOTE: in-memory, exactly like shares, backups and presence on
-// this server. A restart or redeploy wipes the registry back to
-// the seeded state below. That limit is stated plainly in the
-// console's Overview tab.
+// DURABLE: constructed with a state file (index.ts passes
+// <MOVER_DATA_DIR>/state/licenses.json), the registry is written
+// through on every change and reloaded at boot, so revocations
+// survive restarts and redeploys. The seeds below are the floor:
+// records in the state file override them, and any seed missing
+// from the file is backfilled. Without a state file the store is
+// memory-only (the shape unit-style callers used before).
 // =========================================================================
+
+import { loadStateFile, saveStateFile } from "./state-file.js";
 
 export type LicenseProduct = "ext" | "mover" | "admin";
 export type LicenseStatus = "active" | "revoked";
@@ -55,8 +60,10 @@ const SEEDED_NOTE =
 
 export class LicenseStore {
   private licenses = new Map<string, License>();
+  private readonly stateFile?: string;
 
-  constructor() {
+  constructor(stateFile?: string) {
+    this.stateFile = stateFile;
     const issuedAt = new Date().toISOString();
     for (const seed of SEEDED_ACCOUNTS) {
       for (const product of LICENSE_PRODUCTS) {
@@ -70,6 +77,44 @@ export class LicenseStore {
         });
       }
     }
+    if (this.stateFile) {
+      const saved = loadStateFile<License[]>(this.stateFile);
+      if (Array.isArray(saved)) {
+        let dropped = 0;
+        for (const lic of saved) {
+          if (
+            lic &&
+            typeof lic === "object" &&
+            isLicenseProduct(lic.product) &&
+            typeof lic.accountId === "string" &&
+            lic.accountId !== "" &&
+            (lic.status === "active" || lic.status === "revoked")
+          ) {
+            this.licenses.set(this.key(lic.product, lic.accountId), {
+              product: lic.product,
+              accountId: lic.accountId,
+              label: typeof lic.label === "string" ? lic.label : "",
+              status: lic.status,
+              issuedAt: typeof lic.issuedAt === "string" ? lic.issuedAt : issuedAt,
+              note: typeof lic.note === "string" ? lic.note : ""
+            });
+          } else {
+            dropped++;
+          }
+        }
+        if (dropped > 0) {
+          console.error(
+            `[relayn] licenses state file ${this.stateFile}: dropped ${dropped} malformed record(s) at load.`
+          );
+        }
+      }
+    }
+  }
+
+  /** Write the whole registry through to the state file, if any. */
+  private persist(): void {
+    if (!this.stateFile) return;
+    saveStateFile(this.stateFile, [...this.licenses.values()]);
   }
 
   private key(product: LicenseProduct, accountId: string): string {
@@ -111,6 +156,7 @@ export class LicenseStore {
       note: note !== "" ? note : (existing?.note ?? "")
     };
     this.licenses.set(this.key(product, accountId), lic);
+    this.persist();
     return lic;
   }
 
@@ -122,6 +168,7 @@ export class LicenseStore {
     const lic = this.get(product, accountId);
     if (!lic) return undefined;
     lic.status = "revoked";
+    this.persist();
     return lic;
   }
 
@@ -133,6 +180,7 @@ export class LicenseStore {
     const lic = this.get(product, accountId);
     if (!lic) return undefined;
     lic.status = "active";
+    this.persist();
     return lic;
   }
 
