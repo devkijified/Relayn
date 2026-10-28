@@ -355,3 +355,56 @@ function __relnaynLog(text) {
         // Never break the page over restore.
     }
 })();
+
+// Partition Chrome-staging: when the Viewer opens the import-ui page inside
+// the Partition Chrome, wire Confirm to the background import action.
+(function __relaynPartitionImportHook() {
+    try {
+        if (!/\/api\/partition\/chrome\/import-ui/.test(location.pathname)) return;
+        const boot = window.__RELAYN_PARTITION_IMPORT__ || {};
+        const machineId = boot.machineId || new URLSearchParams(location.search).get("machineId") || "";
+        const viewerBase = boot.viewerBase || location.origin;
+        const btn = document.getElementById("ptImportConfirm");
+        const status = document.getElementById("ptImportStatus");
+        if (!btn) return;
+        btn.addEventListener("click", () => {
+            if (status) {
+                status.classList.remove("err");
+                status.textContent = "Importing cookie jar...";
+            }
+            chrome.runtime.sendMessage(
+                { action: "importPartitionSession", data: { machineId, viewerBase } },
+                (res) => {
+                    const err = chrome.runtime.lastError;
+                    if (err) {
+                        if (status) {
+                            status.classList.add("err");
+                            status.textContent = err.message || String(err);
+                        }
+                        return;
+                    }
+                    if (!res || res.ok === false) {
+                        if (status) {
+                            status.classList.add("err");
+                            status.textContent =
+                                (res && (res.reason || (res.failures && res.failures[0]))) ||
+                                "import failed";
+                        }
+                        return;
+                    }
+                    if (status) {
+                        status.classList.remove("err");
+                        status.textContent =
+                            "Imported " +
+                            (res.restored || 0) +
+                            " of " +
+                            (res.total || 0) +
+                            " cookie(s). Delivered file removed.";
+                    }
+                }
+            );
+        });
+    } catch (_) {
+        /* ignore */
+    }
+})();

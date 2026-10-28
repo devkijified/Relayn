@@ -1492,6 +1492,92 @@ function tabListSuffix(diag) {
 // -------------------------------------------------------------------------
 // Popup actions
 // -------------------------------------------------------------------------
+
+// -------------------------------------------------------------------------
+// Partition Chrome-staging import (Viewer-mediated).
+// -------------------------------------------------------------------------
+// The Viewer delivers a child share into
+// relayn-partition/<machine>/profile/relayn-session-export.json via the
+// existing session-export endpoint. This Chrome (launched with that
+// profile) cannot read the file off disk, so the Viewer serves it at
+// GET /api/partition/session-staged and finalises at
+// POST /api/partition/session-consume. On success the file is deleted so
+// it cannot become a reusable session token; on failure it is left and
+// the reason is named. Cookie jar only: origins are never restored into
+// localStorage or IndexedDB.
+async function importPartitionSession(data) {
+    const viewerBase = String((data && data.viewerBase) || "").replace(/\/+$/, "");
+    const machineId = String((data && data.machineId) || "").trim();
+    if (!viewerBase || !machineId) {
+        throw new Error("viewerBase and machineId are required to import a Partition session");
+    }
+    async function reportFailure(why) {
+        await fetch(viewerBase + "/api/partition/session-consume", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ machineId, ok: false, reason: String(why || "import failed") }),
+        }).catch(() => {});
+    }
+    let staged;
+    try {
+        const res = await fetch(
+            viewerBase + "/api/partition/session-staged?machineId=" + encodeURIComponent(machineId)
+        );
+        staged = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            const why = (staged && staged.error) || ("session-staged answered " + res.status);
+            await reportFailure(why);
+            throw new Error(why);
+        }
+    } catch (error) {
+        // HTTP failures already reported. Transport errors still need a named reason.
+        if (!staged) {
+            await reportFailure(error && error.message ? error.message : String(error));
+        }
+        throw error;
+    }
+    const cookies = Array.isArray(staged.cookies) ? staged.cookies : [];
+    if (!cookies.length) {
+        const why = "delivered session held no cookies";
+        await reportFailure(why);
+        throw new Error(why);
+    }
+    let restored = 0;
+    const failures = [];
+    for (const cookie of cookies) {
+        const result = await injectAuthCookie(cookie);
+        if (result.success) restored++;
+        else failures.push(((cookie && cookie.name) || "?") + ": " + (result.error || "refused"));
+    }
+    if (restored === 0) {
+        const why = "no cookies could be written: " + (failures[0] || "unknown");
+        await reportFailure(why);
+        return { ok: false, restored, total: cookies.length, failures, reason: why };
+    }
+    const cons = await fetch(viewerBase + "/api/partition/session-consume", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ machineId, ok: true }),
+    });
+    const consBody = await cons.json().catch(() => ({}));
+    if (!cons.ok || !consBody.deleted) {
+        const why =
+            (consBody && consBody.error) ||
+            "import wrote cookies but the delivered file could not be removed";
+        await reportFailure(why);
+        return { ok: false, restored, total: cookies.length, failures, reason: why };
+    }
+    setUi({
+        status:
+            "Partition session imported: " +
+            restored +
+            " of " +
+            cookies.length +
+            " cookie(s). Cookie jar only.",
+    });
+    return { ok: true, restored, total: cookies.length, failures, deleted: true };
+}
+
 async function handleAction(action, data) {
     switch (action) {
         case "getState":
@@ -1643,6 +1729,8 @@ async function handleAction(action, data) {
             });
             return { ok: true };
 
+        case "importPartitionSession":
+            return await importPartitionSession(data);
         case "importReceivedBackup":
             try {
                 return await importReceivedBackup(data?.domains);
