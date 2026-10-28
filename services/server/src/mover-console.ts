@@ -3622,12 +3622,45 @@ ${SHARED_CSS}
   #frame { width: 100%; max-width: 100%; height: auto; display: block; border: 1px solid var(--border2); border-radius: 10px; background: #17130F; cursor: crosshair; }
   #frame:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
   .row { display: flex; gap: 0.6rem; align-items: center; flex-wrap: wrap; margin: 0.8rem 0; }
+  #status { white-space: pre-wrap; }
+  #status.err { color: var(--err); }
+  .desk-diagnose {
+    margin: 0.75rem 0 1rem;
+    padding: 0.85rem 1rem;
+    border: 1px solid var(--border2);
+    border-radius: 10px;
+    background: #1c1713;
+    color: var(--text, #f2ebe3);
+    line-height: 1.45;
+  }
+  .desk-diagnose h2 {
+    margin: 0 0 0.55rem;
+    font-size: 0.95rem;
+    font-weight: 650;
+    color: var(--err);
+  }
+  .desk-diagnose dl { margin: 0; }
+  .desk-diagnose dt {
+    font-size: 0.72rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: var(--muted, #a89a8c);
+    margin-top: 0.45rem;
+  }
+  .desk-diagnose dd { margin: 0.15rem 0 0; }
+  .desk-diagnose .raw {
+    margin-top: 0.7rem;
+    font-size: 0.78rem;
+    color: var(--muted, #a89a8c);
+    word-break: break-word;
+  }
 </style>
 </head>
 <body>
 <h1>Background desktop</h1>
 <p class="meta" id="who"></p>
 <div id="status"></div>
+<div id="diagnose" hidden></div>
 <img id="frame" tabindex="0" alt="Background desktop frame">
 <div class="row">
   <input type="text" id="prog" placeholder="Program to launch, for example notepad" size="34">
@@ -3645,8 +3678,69 @@ Ending the session here is final: the desktop and everything open on it closes.<
   var accountId = qs.get("accountId") || "";
   var machineId = decodeURIComponent(location.pathname.split("/").pop() || "");
   var statusEl = document.getElementById("status");
+  var diagnoseEl = document.getElementById("diagnose");
   var img = document.getElementById("frame");
-  function say(msg) { statusEl.textContent = msg || ""; }
+  function esc(s) {
+    return String(s == null ? "" : s)
+      .replace(/&/g, "&amp;").replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+  }
+  function clearDiagnose() {
+    diagnoseEl.hidden = true;
+    diagnoseEl.innerHTML = "";
+    statusEl.classList.remove("err");
+  }
+  function say(msg) {
+    clearDiagnose();
+    statusEl.textContent = msg || "";
+  }
+  // Plain-English card for desk Create/session failures. Raw
+  // error stays visible for Muse; the card names what failed,
+  // what it means, and what to do next (INFERENCE until the
+  // Host stage strings are measured on the machine).
+  function diagnoseDeskCreateError(raw) {
+    var text = String(raw || "");
+    var failed = "Background desktop create failed";
+    var means = "The Host refused to open the private desktop.";
+    var next = "Copy the raw error below for Muse. Do not guess a fix from a truncated message.";
+    var t = text.toLowerCase();
+    if (t.indexOf("desk create stage birth") >= 0) {
+      failed = "Host could not birth deskhost into the interactive session";
+      means = "PERMANENT Backstage CreateProcessAsUser (or the pipe connect after it) failed. Without an interactive signed-in session, RelaynDesk cannot be created off the user's Default.";
+      next = "Sign in on the console/RDP, ensure Host runs as LocalSystem, stamp this Host, reopen background desktop, paste the stage birth line for Muse.";
+    } else if (t.indexOf("desk create stage warm-up") >= 0 ||
+               t.indexOf("printwindow") >= 0) {
+      failed = "Create PrintWindow warm-up failed";
+      means = "Seed painted on RelaynDesk, but EnumDesktopWindows+PrintWindow composite refused or printed 0 windows. Session-0 BitBlt probes were already FALSIFIED; this Host does not fall back to BitBlt.";
+      next = "Confirm deskhost is in the interactive session (stage birth passed). Paste the stage warm-up / PrintWindow line for Muse.";
+    } else if (t.indexOf("desk create stage seed") >= 0 ||
+               t.indexOf("could not realize its surface") >= 0) {
+      failed = "Create could not seed/paint the private desktop surface";
+      means = "RelaynDeskSeed RegisterClass/CreateWindow/Show/Update/FillRect failed before PrintWindow warm-up.";
+      next = "Read which Win32 call is named after stage seed. Fix that call or the desktop attachment, then retry open.";
+    } else if (t.indexOf("desk destroy stage switch-restore") >= 0) {
+      failed = "Destroy tried a legacy input restore and was refused";
+      means = "PERMANENT Create no longer claims station input. This stage only fires if a prior leave-as-input claim handle was somehow still set.";
+      next = "Paste the stage line for Muse. User Default should still be theirs if Create used PrintWindow path.";
+    } else if (t.indexOf("create background desktop") >= 0) {
+      failed = "Host create background desktop failed";
+      means = "The desk-open command returned a Host create error without a newer stage birth/seed/warm-up label.";
+      next = "Stamp the Host that emits desk create stage birth|seed|warm-up, reopen background desktop, paste the new error for Muse.";
+    }
+    statusEl.classList.add("err");
+    statusEl.textContent = "Could not open the desktop: " + text;
+    diagnoseEl.hidden = false;
+    diagnoseEl.innerHTML =
+      '<div class="desk-diagnose">' +
+        "<h2>What this Create error means</h2>" +
+        "<dl>" +
+          "<dt>What failed</dt><dd>" + esc(failed) + "</dd>" +
+          "<dt>What this means</dt><dd>" + esc(means) + "</dd>" +
+          "<dt>What to do next</dt><dd>" + esc(next) + "</dd>" +
+        "</dl>" +
+        '<div class="raw">Raw Host error (keep for Muse): ' + esc(text) + "</div>" +
+      "</div>";
+  }
   document.getElementById("who").textContent =
     "Machine " + machineId + " · account " + accountId;
   var session = null, frameW = 0, frameH = 0, gen = 0, timer = null;
@@ -3681,6 +3775,7 @@ Ending the session here is final: the desktop and everything open on it closes.<
   }
   async function start() {
     try {
+      clearDiagnose();
       var id = await queue("desk-open", { width: 1280, height: 800 });
       var res = await waitResult(id);
       if (res && res.error) throw new Error(res.error);
@@ -3688,7 +3783,7 @@ Ending the session here is final: the desktop and everything open on it closes.<
       say("Session live. Frames are pulled one at a time, about one a second.");
       img.focus();
       runFrames(++gen);
-    } catch (e) { say("Could not open the desktop: " + e.message); }
+    } catch (e) { diagnoseDeskCreateError(e.message || String(e)); }
   }
   async function runFrames(g) {
     if (g !== gen || !session) return;
