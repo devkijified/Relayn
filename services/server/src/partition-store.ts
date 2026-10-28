@@ -328,12 +328,18 @@ export class PartitionStore {
   ): Promise<PartitionMachineView> {
     const idx = await this.ensureIndex(account, machineId, machineName);
     const live = await this.liveFiles(account, machineId, machineName);
+    const gaps: string[] = [];
+    if (live.size === 0) {
+      gaps.push(
+        "No sealed moves bound to this machine yet. Partition shows an empty desktop until a move whose sourceName or moverName matches this machine is present."
+      );
+    }
     return {
       machineId,
       fileCount: live.size,
       moveIds: Array.from(idx.moveIds),
       updatedAt: idx.updatedAt,
-      gaps: []
+      gaps
     };
   }
 
