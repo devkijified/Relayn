@@ -1,22 +1,22 @@
 // =========================================================================
-// RELAYN — cloud share server (Fastify, TypeScript)
+// RELAYN: cloud share server (Fastify, TypeScript)
 // -------------------------------------------------------------------------
 // Pure HTTPS: no WebSocket, no sessions, no TURN. Device A uploads an
 // AES-GCM encrypted cookie jar (POST /api/share) and shows a QR pickup
 // ticket; Device B scans it and downloads the jar once (GET /api/share/:id).
-// The server only ever holds ciphertext — the encryption key travels in
+// The server only ever holds ciphertext, the encryption key travels in
 // the QR code and never touches the server.
 //
 // Also hosts the durable encrypted backups (POST/GET/DELETE /api/backups),
 // where the backup ID + passphrase is the authorization.
 //
-//   pnpm dev    — local development (tsx, watches src)
-//   pnpm build  — tsc -> dist/
-//   pnpm start  — node dist/index.js (what Docker / Render run)
+//   pnpm dev: local development (tsx, watches src)
+//   pnpm build: tsc -> dist/
+//   pnpm start: node dist/index.js (what Docker / Render run)
 // =========================================================================
 
 // Load .env (PORT, TRUST_PROXY, ...) before config.ts reads process.env.
-// No-op if the file is absent — hosts like Render inject env vars directly.
+// No-op if the file is absent, hosts like Render inject env vars directly.
 import "dotenv/config";
 
 import Fastify from "fastify";
@@ -31,16 +31,18 @@ import { headlessRoutes } from "./mover-headless.js";
 import { moverConsoleRoutes } from "./mover-console.js";
 import { moverRoutes } from "./mover-routes.js";
 import { MoverStore } from "./mover-store.js";
+import { partitionRoutes } from "./partition-routes.js";
+import { PartitionStore } from "./partition-store.js";
 import { shareRoutes } from "./share-routes.js";
 import { ShareStore } from "./share-store.js";
 
 const app = Fastify({
   logger: true,
-  // Share uploads carry megabytes of encrypted cookies — the 1 MB
+  // Share uploads carry megabytes of encrypted cookies, the 1 MB
   // default would reject them with 413 before our own size check runs.
   bodyLimit: config.SHARE_MAX_BYTES + 64 * 1024,
   // Honor X-Forwarded-For from the reverse proxy (Render, Railway,
-  // Fly.io, nginx, ...) so request.ip — used by the rate limiter — is
+  // Fly.io, nginx, ...) so request.ip, used by the rate limiter, is
   // the real client IP. Leave TRUST_PROXY=false when exposed directly.
   trustProxy: config.TRUST_PROXY
 });
@@ -48,6 +50,7 @@ const app = Fastify({
 const shareStore = new ShareStore();
 const backupStore = new BackupStore();
 const moverStore = new MoverStore();
+const partitionStore = new PartitionStore(moverStore);
 // The owner license registry (in-memory, seeded with the owner and
 // assistant accounts). The console reads and changes it; the headless
 // enroll gate and the console download gates enforce revocations.
@@ -83,6 +86,10 @@ await app.register(backupRoutes, { backupStore });
 // inbox and sealed-chunk relay (metadata + ciphertext chunks only,
 // chunk storage on disk under MOVER_DATA_DIR).
 await app.register(moverRoutes, { moverStore });
+
+// THE PARTITION: per-machine materialized view over sealed moves
+// (enumerations + file refs). Operator auth = X-Account-Id.
+await app.register(partitionRoutes, { partitionStore, moverStore });
 
 // Relayn Mover headless track: machines with no signed-in user
 // enroll, heartbeat, poll for commands and post results. Starts are
@@ -127,6 +134,7 @@ const shutdown = async (signal: string) => {
   shareStore.shutdown();
   backupStore.shutdown();
   moverStore.shutdown();
+  partitionStore.shutdown();
   await app.close();
   process.exit(0);
 };
