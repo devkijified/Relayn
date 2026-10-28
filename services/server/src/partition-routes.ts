@@ -22,7 +22,7 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
-import type { MoverStore } from "./mover-store.js";
+import { isValidHeadlessMachineId, type MoverStore } from "./mover-store.js";
 import type { PartitionStore } from "./partition-store.js";
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
@@ -45,9 +45,14 @@ function needAccount(
   return acc;
 }
 
+// The machineId names a directory under the account's _partition
+// ledger root, so it must be a plain headless machine id (the same
+// rule enroll applies). Anything else, path segments included, reads
+// as missing: it must never reach the store's disk paths.
 function machineParam(request: FastifyRequest): string {
   const params = request.params as { machineId?: string };
-  return String(params.machineId || "").trim();
+  const id = String(params.machineId || "").trim();
+  return isValidHeadlessMachineId(id) ? id : "";
 }
 
 export async function partitionRoutes(

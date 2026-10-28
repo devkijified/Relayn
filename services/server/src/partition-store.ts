@@ -300,12 +300,22 @@ export class PartitionStore {
           if (p === rec.path || p.startsWith(rec.path + "/")) out.delete(p);
         }
       } else if (rec.op === "rename" && rec.newName) {
-        const old = out.get(rec.path);
-        if (!old) continue;
-        out.delete(rec.path);
         const parent = parentPrefix(rec.path);
         const nextPath = parent ? parent + "/" + rec.newName : rec.newName;
-        out.set(nextPath, { ...old, packPath: nextPath });
+        const old = out.get(rec.path);
+        if (old) {
+          out.delete(rec.path);
+          out.set(nextPath, { ...old, packPath: nextPath });
+        }
+        // Folder rename: mutate accepts a folder path (one with
+        // children), so its children move with it.
+        const under = rec.path + "/";
+        for (const [p, ref] of Array.from(out.entries())) {
+          if (!p.startsWith(under)) continue;
+          out.delete(p);
+          const moved = nextPath + "/" + p.slice(under.length);
+          out.set(moved, { ...ref, packPath: moved });
+        }
       }
     }
     return out;

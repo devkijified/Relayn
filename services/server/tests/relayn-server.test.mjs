@@ -1,5 +1,5 @@
 // =========================================================================
-// Relayn server — local endpoint tests (no framework, plain fetch).
+// Relayn server - local endpoint tests (no framework, plain fetch).
 // Boots real server instances via tsx and proves:
 //   * anonymous share flow still works (upload, single-use download)
 //   * account share flow still works (list, one-tap fetch, multi-use)
@@ -24,13 +24,20 @@
 //     strict prefix, overlay tail parses back to the exact config),
 //     the merged artifact boots paired in an empty dir (config=inbuilt,
 //     no account warning), 501 when MOVER_BASE_EXE is unset
+//   * the Partition routes: status, rebuild (bind by machineId or
+//     enrolled name, unbound moves named), browse, document (refs
+//     only), wallpaper, desktop-icons, pins, mutate (confirmed:true
+//     required, every op other than delete/rename refused by name,
+//     path + newName + machineId validation, folder delete/rename),
+//     ledger (ordered, account-scoped, read back after a restart),
+//     sealed manifests untouched, nothing queued for the source
 // Run:  node tests/relayn-server.test.mjs
 // =========================================================================
 
 import { spawn } from "node:child_process";
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import { inflateRawSync } from "node:zlib";
-import { chmodSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -607,7 +614,7 @@ async function main() {
     );
 
     // Real proof: the merged admin artifact, alone in an empty dir,
-    // boots paired on the inbuilt config — no sidecar, no warning.
+    // boots paired on the inbuilt config - no sidecar, no warning.
     const bootProof = await bootMerged(mergedAdmin, "relayn-mover-admin");
     check(
       "merged artifact boots and answers /api/state",
@@ -2645,6 +2652,663 @@ async function main() {
       body: JSON.stringify({ accountId: pair.accountId, role: "mover" })
     });
     check("config download still works without base exe", r.status === 200);
+
+    // ---------------------------------------------------------------
+    // Instance P: THE PARTITION routes (status, rebuild, browse,
+    // document, wallpaper, desktop-icons, pins, mutate, ledger).
+    // Fresh data dir so the sealed-move view is fully known here.
+    // Instance PE then boots on the same data dir to prove the
+    // Delete/Rename ledger is read back from disk.
+    // ---------------------------------------------------------------
+    console.log("partition routes");
+    const PD = 4422;
+    const dataDirD = `${dataDir}-partition`;
+    children.push(boot(PD, { MOVER_DATA_DIR: dataDirD }));
+    check("instance P (partition) boots", await waitHealth(PD));
+    const pd = `http://127.0.0.1:${PD}`;
+    const P_ACC = "partacct000001";
+    const Q_ACC = "partacct000002";
+    const P_MID = "owner-pc-173";
+    const P_NAME = "OWNER-173";
+    const PH = { "x-account-id": P_ACC, "content-type": "application/json" };
+    const QH = { "x-account-id": Q_ACC, "content-type": "application/json" };
+    const pget = (acc, mid, sub) =>
+      fetch(`${pd}/api/partition/${mid}/${sub}`, {
+        headers: { "x-account-id": acc }
+      });
+    const ppost = (acc, mid, sub, body) =>
+      fetch(`${pd}/api/partition/${mid}/${sub}`, {
+        method: "POST",
+        headers: { "x-account-id": acc, "content-type": "application/json" },
+        body: JSON.stringify(body ?? {})
+      });
+    const announceMove = (headers, moverName, m) =>
+      fetch(`${pd}/api/moves`, {
+        method: "POST",
+        headers,
+        body: JSON.stringify({ moverName, manifest: m })
+      });
+    const pf = (p, size, modTime, sha) => ({
+      path: p,
+      category: p.split("/")[0],
+      size,
+      modTime,
+      sha256: sha,
+      chunks: 1
+    });
+
+    r = await fetch(`${pd}/api/headless/enroll`, {
+      method: "POST",
+      headers: PH,
+      body: JSON.stringify({
+        machineId: P_MID,
+        name: P_NAME,
+        os: "Windows 11 Pro",
+        profiles: ["OWNER"],
+        capabilities: { desktop: true }
+      })
+    });
+    const pEnrolled = await r.json().catch(() => ({}));
+    check(
+      "partition: source machine enrolled (name hint for binding)",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(pEnrolled.machineSecret ?? ""),
+      `got ${r.status}`
+    );
+
+    // Move 1: bound by the enrolled NAME (sourceName == machine name).
+    const PMOVE1 = "move-2026102801-0001";
+    const TASKBAR =
+      "appData/Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar";
+    const STARTP = "appData/Roaming/Microsoft/Windows/Start Menu/Programs";
+    r = await announceMove(PH, P_NAME, {
+      moveId: PMOVE1,
+      name: "Owner PC pull 1",
+      sourceName: P_NAME,
+      files: [
+        pf("files/Desktop/Report.docx", 100, 1000, "sha-report"),
+        pf("files/Desktop/Email Sorter.lnk", 2, 1000, "sha-eslnk"),
+        pf("files/Desktop/Projects/plan.txt", 7, 1000, "sha-plan"),
+        pf("files/Documents/notes.txt", 11, 1000, "sha-notes-old"),
+        pf("files/Documents/Sub/deep.txt", 3, 1000, "sha-deep"),
+        pf("files/../escape.txt", 1, 1000, "sha-escape"),
+        pf("setup/wallpaper/img0.jpg", 50, 500, "sha-wp0"),
+        pf("setup/wallpaper/img1.jpg", 60, 900, "sha-wp1"),
+        pf(`${TASKBAR}/Chrome.lnk`, 4, 1000, "sha-chrome"),
+        pf(`${STARTP}/Email Sorter Ultimate.lnk`, 4, 1000, "sha-esu")
+      ],
+      chunks: [],
+      totalBytes: 242,
+      totalFiles: 10
+    });
+    check("partition: move 1 announced", r.status === 200, `got ${r.status}`);
+    // createdAt is second-resolution; the view's "later move wins"
+    // rule needs move 2 to be strictly later.
+    await new Promise((res) => setTimeout(res, 1200));
+    // Move 2: bound by machineId (case-insensitive), fresher notes.txt.
+    const PMOVE2 = "move-2026102802-0002";
+    r = await announceMove(PH, "", {
+      moveId: PMOVE2,
+      name: "Owner PC pull 2",
+      sourceName: P_MID.toUpperCase(),
+      files: [pf("files/Documents/notes.txt", 222, 2000, "sha-notes-new")],
+      chunks: [],
+      totalBytes: 222,
+      totalFiles: 1
+    });
+    check("partition: move 2 announced", r.status === 200, `got ${r.status}`);
+    // Move 3: another machine on the same account (must stay unbound).
+    const PMOVE3 = "move-2026102803-0003";
+    r = await announceMove(PH, "OTHER-PC", {
+      moveId: PMOVE3,
+      sourceName: "OTHER-PC",
+      files: [pf("files/Desktop/other.txt", 1, 1, "sha-other")],
+      chunks: [],
+      totalBytes: 1,
+      totalFiles: 1
+    });
+    check("partition: move 3 (other machine) announced", r.status === 200);
+    // Account Q holds a move claiming the SAME machine id.
+    const QMOVE = "move-2026102804-0004";
+    r = await announceMove(QH, P_MID, {
+      moveId: QMOVE,
+      sourceName: P_MID,
+      files: [pf("files/Desktop/q-secret.txt", 9, 1, "sha-q")],
+      chunks: [],
+      totalBytes: 9,
+      totalFiles: 1
+    });
+    check("partition: account Q move announced", r.status === 200);
+
+    // ---- auth --------------------------------------------------------
+    r = await fetch(`${pd}/api/partition/${P_MID}/status`);
+    check("partition status without account -> 401", r.status === 401, `got ${r.status}`);
+    r = await pget("bad!", P_MID, "status");
+    check("partition status invalid account -> 401", r.status === 401, `got ${r.status}`);
+    r = await fetch(`${pd}/api/partition/${P_MID}/mutate`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: "delete", path: "files/Desktop/Report.docx", confirmed: true })
+    });
+    check("partition mutate without account -> 401", r.status === 401, `got ${r.status}`);
+
+    // ---- rebuild -----------------------------------------------------
+    r = await ppost(P_ACC, P_MID, "rebuild");
+    const rebuilt = await r.json().catch(() => ({}));
+    check(
+      "partition rebuild binds by name + machineId, skips other machine",
+      r.status === 200 &&
+        rebuilt.machineId === P_MID &&
+        Array.isArray(rebuilt.moveIds) &&
+        rebuilt.moveIds.length === 2 &&
+        rebuilt.moveIds.includes(PMOVE1) &&
+        rebuilt.moveIds.includes(PMOVE2) &&
+        !rebuilt.moveIds.includes(PMOVE3) &&
+        !rebuilt.moveIds.includes(QMOVE),
+      JSON.stringify(rebuilt)
+    );
+    check(
+      "partition rebuild fileCount = 9 (.. path dropped, later move wins)",
+      rebuilt.fileCount === 9,
+      `got ${rebuilt.fileCount}`
+    );
+    check(
+      "partition rebuild names the unbound move as a gap",
+      Array.isArray(rebuilt.gaps) &&
+        rebuilt.gaps.some((g) => g.startsWith("1 sealed move(s)") && g.includes(P_MID)) &&
+        rebuilt.gaps.some((g) => g.includes("ciphertext")),
+      JSON.stringify(rebuilt.gaps)
+    );
+    check(
+      "partition rebuild updatedAt is RFC3339",
+      /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/.test(rebuilt.updatedAt || "")
+    );
+
+    // ---- status ------------------------------------------------------
+    r = await pget(P_ACC, P_MID, "status");
+    const pst = await r.json().catch(() => ({}));
+    check(
+      "partition status = rebuild view (9 files, 2 moves)",
+      r.status === 200 &&
+        pst.machineId === P_MID &&
+        pst.fileCount === 9 &&
+        pst.moveIds?.length === 2 &&
+        Array.isArray(pst.gaps),
+      JSON.stringify(pst)
+    );
+    r = await pget(P_ACC, "never-seen-pc", "status");
+    const pstEmpty = await r.json().catch(() => ({}));
+    check(
+      "partition status for a machine with no bound moves -> empty view",
+      r.status === 200 && pstEmpty.fileCount === 0 && pstEmpty.moveIds?.length === 0,
+      JSON.stringify(pstEmpty)
+    );
+    r = await ppost(P_ACC, "never-seen-pc", "rebuild");
+    const rbEmpty = await r.json().catch(() => ({}));
+    check(
+      "partition rebuild with no bound moves names that gap",
+      r.status === 200 &&
+        rbEmpty.fileCount === 0 &&
+        rbEmpty.gaps?.some((g) => g.startsWith("No sealed moves bound")),
+      JSON.stringify(rbEmpty.gaps)
+    );
+
+    // ---- browse ------------------------------------------------------
+    r = await pget(P_ACC, P_MID, "browse");
+    const broot = await r.json().catch(() => ({}));
+    check(
+      "partition browse root lists top-level categories as dirs, sorted",
+      r.status === 200 &&
+        broot.prefix === "" &&
+        broot.total === 3 &&
+        broot.children.map((c) => c.name).join(",") === "appData,files,setup" &&
+        broot.children.every((c) => c.kind === "dir"),
+      JSON.stringify(broot)
+    );
+    r = await pget(P_ACC, P_MID, "browse?prefix=/files/Documents/");
+    const bdocs = await r.json().catch(() => ({}));
+    const notesRef = bdocs.children?.find((c) => c.name === "notes.txt");
+    check(
+      "partition browse folder: dirs first, then files (slashes trimmed)",
+      r.status === 200 &&
+        bdocs.prefix === "files/Documents" &&
+        bdocs.children.map((c) => c.kind + ":" + c.name).join(",") ===
+          "dir:Sub,file:notes.txt",
+      JSON.stringify(bdocs)
+    );
+    check(
+      "partition browse: later sealed move wins on the same path",
+      notesRef?.moveId === PMOVE2 && notesRef?.size === 222 && notesRef?.modTime === 2000,
+      JSON.stringify(notesRef)
+    );
+    r = await pget(P_ACC, P_MID, "browse?prefix=files/Desktop&offset=1&limit=1");
+    const bpage = await r.json().catch(() => ({}));
+    check(
+      "partition browse offset/limit pages, total stays whole",
+      r.status === 200 &&
+        bpage.total === 3 &&
+        bpage.children.length === 1 &&
+        bpage.children[0].name === "Email Sorter.lnk",
+      JSON.stringify(bpage)
+    );
+    r = await pget(P_ACC, P_MID, "browse?prefix=files");
+    const bfiles = await r.json().catch(() => ({}));
+    check(
+      "partition browse never surfaces a .. pack path",
+      r.status === 200 &&
+        !JSON.stringify(bfiles).includes("escape.txt") &&
+        bfiles.children.map((c) => c.name).join(",") === "Desktop,Documents",
+      JSON.stringify(bfiles)
+    );
+    r = await pget(Q_ACC, P_MID, "browse?prefix=files/Desktop");
+    const bq = await r.json().catch(() => ({}));
+    check(
+      "partition browse is account-scoped (Q sees only Q's move)",
+      r.status === 200 &&
+        bq.children.map((c) => c.name).join(",") === "q-secret.txt",
+      JSON.stringify(bq)
+    );
+    r = await pget(P_ACC, P_MID, "browse?prefix=files/Desktop");
+    check(
+      "partition browse: P never sees Q's file",
+      !JSON.stringify(await r.json()).includes("q-secret")
+    );
+
+    // ---- document ----------------------------------------------------
+    r = await pget(P_ACC, P_MID, "document?path=" + encodeURIComponent("files/Desktop/Report.docx"));
+    const pdoc = await r.json().catch(() => ({}));
+    check(
+      "partition document returns refs only (no bytes)",
+      r.status === 200 &&
+        Object.keys(pdoc).sort().join(",") ===
+          "category,modTime,moveId,packPath,sha256,size" &&
+        pdoc.packPath === "files/Desktop/Report.docx" &&
+        pdoc.moveId === PMOVE1 &&
+        pdoc.size === 100 &&
+        pdoc.sha256 === "sha-report" &&
+        pdoc.category === "files",
+      JSON.stringify(pdoc)
+    );
+    r = await pget(P_ACC, P_MID, "document");
+    check("partition document without path -> 400", r.status === 400, `got ${r.status}`);
+    r = await pget(P_ACC, P_MID, "document?path=files/Desktop/nope.docx");
+    check("partition document unknown path -> 404", r.status === 404, `got ${r.status}`);
+    r = await pget(Q_ACC, P_MID, "document?path=" + encodeURIComponent("files/Desktop/Report.docx"));
+    check("partition document from another account -> 404", r.status === 404, `got ${r.status}`);
+
+    // ---- wallpaper ---------------------------------------------------
+    r = await pget(P_ACC, P_MID, "wallpaper");
+    const pwp = await r.json().catch(() => ({}));
+    check(
+      "partition wallpaper picks the newest setup/wallpaper file",
+      r.status === 200 &&
+        pwp.present === true &&
+        pwp.packPath === "setup/wallpaper/img1.jpg" &&
+        pwp.moveId === PMOVE1,
+      JSON.stringify(pwp)
+    );
+    r = await pget(Q_ACC, P_MID, "wallpaper");
+    const pwpNone = await r.json().catch(() => ({}));
+    check(
+      "partition wallpaper absent -> { present: false }",
+      r.status === 200 && pwpNone.present === false && Object.keys(pwpNone).length === 1,
+      JSON.stringify(pwpNone)
+    );
+
+    // ---- desktop-icons -----------------------------------------------
+    r = await pget(P_ACC, P_MID, "desktop-icons");
+    const picons = await r.json().catch(() => ({}));
+    check(
+      "partition desktop-icons = files/Desktop children (dirs first)",
+      r.status === 200 &&
+        picons.children.map((c) => c.kind + ":" + c.name).join(",") ===
+          "dir:Projects,file:Email Sorter.lnk,file:Report.docx",
+      JSON.stringify(picons)
+    );
+    r = await pget(P_ACC, "never-seen-pc", "desktop-icons");
+    const piconsNone = await r.json().catch(() => ({}));
+    check(
+      "partition desktop-icons empty machine -> []",
+      r.status === 200 && Array.isArray(piconsNone.children) && piconsNone.children.length === 0
+    );
+
+    // ---- pins --------------------------------------------------------
+    r = await pget(P_ACC, P_MID, "pins");
+    const ppins = await r.json().catch(() => ({}));
+    check(
+      "partition pins: TaskBar pin from AppData Quick Launch path",
+      r.status === 200 &&
+        ppins.taskbar.length === 1 &&
+        ppins.taskbar[0].name === "Chrome.lnk" &&
+        ppins.taskbar[0].path === `${TASKBAR}/Chrome.lnk`,
+      JSON.stringify(ppins.taskbar)
+    );
+    check(
+      "partition pins: Start Menu Programs entry found",
+      ppins.startPrograms?.length === 1 &&
+        ppins.startPrograms[0].name === "Email Sorter Ultimate.lnk",
+      JSON.stringify(ppins.startPrograms)
+    );
+    check(
+      "partition pins: start2.bin + installed-apps gaps named",
+      ppins.notes?.some((n) => n.includes("start2.bin")) &&
+        ppins.notes?.some((n) => n.includes("Installed-apps")) &&
+        !ppins.notes?.some((n) => n.startsWith("No TaskBar pin")),
+      JSON.stringify(ppins.notes)
+    );
+    r = await pget(P_ACC, "never-seen-pc", "pins");
+    const ppinsNone = await r.json().catch(() => ({}));
+    check(
+      "partition pins empty machine -> empty lists + named notes",
+      r.status === 200 &&
+        ppinsNone.taskbar.length === 0 &&
+        ppinsNone.startPrograms.length === 0 &&
+        ppinsNone.notes.some((n) => n.startsWith("No TaskBar pin")) &&
+        ppinsNone.notes.some((n) => n.startsWith("No Start Menu Programs")),
+      JSON.stringify(ppinsNone)
+    );
+
+    // ---- mutate: refusals first (ledger must stay empty) --------------
+    r = await ppost(P_ACC, P_MID, "mutate", { op: "delete", path: "files/Desktop/Report.docx" });
+    let mBody = await r.json().catch(() => ({}));
+    check(
+      "partition mutate without confirmed -> 400 confirmed:true required",
+      r.status === 400 && mBody.error === "confirmed:true required",
+      `got ${r.status} ${JSON.stringify(mBody)}`
+    );
+    r = await ppost(P_ACC, P_MID, "mutate", {
+      op: "delete",
+      path: "files/Desktop/Report.docx",
+      confirmed: "true"
+    });
+    check(
+      "partition mutate confirmed:\"true\" (string) is NOT consent -> 400",
+      r.status === 400,
+      `got ${r.status}`
+    );
+    r = await ppost(P_ACC, P_MID, "mutate", {
+      op: "rename",
+      path: "files/Desktop/Report.docx",
+      newName: "x.docx",
+      confirmed: false
+    });
+    check("partition rename confirmed:false -> 400", r.status === 400, `got ${r.status}`);
+    const refusedOps = [
+      "move",
+      "copy",
+      "write",
+      "create",
+      "upload",
+      "push",
+      "fetch",
+      "restore",
+      "chmod",
+      "DELETE",
+      "Rename",
+      ""
+    ];
+    const opResults = [];
+    for (const op of refusedOps) {
+      r = await ppost(P_ACC, P_MID, "mutate", {
+        op,
+        path: "files/Desktop/Report.docx",
+        newName: "x.docx",
+        confirmed: true
+      });
+      const b = await r.json().catch(() => ({}));
+      opResults.push({ op, status: r.status, error: b.error });
+    }
+    for (const res of opResults) {
+      check(
+        `partition mutate op "${res.op}" refused -> 400 op must be delete or rename`,
+        res.status === 400 && res.error === "op must be delete or rename",
+        JSON.stringify(res)
+      );
+    }
+    r = await ppost(P_ACC, P_MID, "mutate", { op: "delete", path: "files/../escape.txt", confirmed: true });
+    check("partition mutate path with .. -> 400", r.status === 400, `got ${r.status}`);
+    r = await ppost(P_ACC, P_MID, "mutate", { op: "delete", path: "", confirmed: true });
+    check("partition mutate empty path -> 400", r.status === 400, `got ${r.status}`);
+    r = await ppost(P_ACC, P_MID, "mutate", { op: "delete", path: "files/Desktop/nope.docx", confirmed: true });
+    mBody = await r.json().catch(() => ({}));
+    check(
+      "partition mutate path not in view -> 404",
+      r.status === 404 && mBody.error === "path not in Partition view",
+      `got ${r.status}`
+    );
+    for (const bad of ["", "a/b.docx", "..", "a\\b.docx"]) {
+      r = await ppost(P_ACC, P_MID, "mutate", {
+        op: "rename",
+        path: "files/Desktop/Report.docx",
+        newName: bad,
+        confirmed: true
+      });
+      check(
+        `partition rename newName ${JSON.stringify(bad)} -> 400`,
+        r.status === 400,
+        `got ${r.status}`
+      );
+    }
+    r = await ppost(Q_ACC, P_MID, "mutate", { op: "delete", path: "files/Desktop/Report.docx", confirmed: true });
+    check("partition mutate on another account's file -> 404", r.status === 404, `got ${r.status}`);
+    r = await pget(P_ACC, P_MID, "ledger");
+    let pled = await r.json().catch(() => ({}));
+    check(
+      "partition ledger empty after every refused mutate",
+      r.status === 200 && Array.isArray(pled.records) && pled.records.length === 0,
+      JSON.stringify(pled)
+    );
+
+    // ---- mutate: confirmed delete + rename --------------------------
+    r = await ppost(P_ACC, P_MID, "mutate", {
+      op: "delete",
+      path: "/files/Desktop/Report.docx/",
+      confirmed: true
+    });
+    const delRec = await r.json().catch(() => ({}));
+    check(
+      "partition confirmed delete -> ledger record",
+      r.status === 200 &&
+        /^pm-[0-9a-f]{16}$/.test(delRec.id || "") &&
+        delRec.op === "delete" &&
+        delRec.path === "files/Desktop/Report.docx" &&
+        delRec.accountId === P_ACC &&
+        delRec.machineId === P_MID &&
+        delRec.confirmed === true &&
+        delRec.newName === undefined,
+      JSON.stringify(delRec)
+    );
+    r = await pget(P_ACC, P_MID, "document?path=" + encodeURIComponent("files/Desktop/Report.docx"));
+    check("partition deleted document -> 404", r.status === 404, `got ${r.status}`);
+    r = await pget(P_ACC, P_MID, "desktop-icons");
+    check(
+      "partition desktop-icons drop the deleted file",
+      !(await r.json()).children.some((c) => c.name === "Report.docx")
+    );
+    r = await pget(P_ACC, P_MID, "status");
+    check("partition status fileCount 9 -> 8 after delete", (await r.json()).fileCount === 8);
+
+    r = await ppost(P_ACC, P_MID, "mutate", {
+      op: "rename",
+      path: "files/Documents/notes.txt",
+      newName: "  notes-renamed.txt ",
+      confirmed: true
+    });
+    const renRec = await r.json().catch(() => ({}));
+    check(
+      "partition confirmed rename -> ledger record (newName trimmed)",
+      r.status === 200 && renRec.op === "rename" && renRec.newName === "notes-renamed.txt",
+      JSON.stringify(renRec)
+    );
+    r = await pget(P_ACC, P_MID, "browse?prefix=files/Documents");
+    const bren = await r.json().catch(() => ({}));
+    const renamedRef = bren.children?.find((c) => c.name === "notes-renamed.txt");
+    check(
+      "partition browse shows the renamed file with the same sealed ref",
+      !bren.children?.some((c) => c.name === "notes.txt") &&
+        renamedRef?.moveId === PMOVE2 &&
+        renamedRef?.size === 222,
+      JSON.stringify(bren)
+    );
+    r = await pget(P_ACC, P_MID, "document?path=" + encodeURIComponent("files/Documents/notes-renamed.txt"));
+    const renDoc = await r.json().catch(() => ({}));
+    check(
+      "partition document resolves under the new name",
+      r.status === 200 && renDoc.sha256 === "sha-notes-new" && renDoc.moveId === PMOVE2,
+      JSON.stringify(renDoc)
+    );
+
+    // Folder delete drops its children.
+    r = await ppost(P_ACC, P_MID, "mutate", { op: "delete", path: "files/Documents/Sub", confirmed: true });
+    check("partition confirmed folder delete -> 200", r.status === 200, `got ${r.status}`);
+    r = await pget(P_ACC, P_MID, "document?path=" + encodeURIComponent("files/Documents/Sub/deep.txt"));
+    check("partition folder delete drops its children", r.status === 404, `got ${r.status}`);
+
+    // Folder rename (the Explorer Rename button acts on the focused
+    // item, which can be a folder): children move with it.
+    r = await ppost(P_ACC, P_MID, "mutate", {
+      op: "rename",
+      path: "files/Desktop/Projects",
+      newName: "Work",
+      confirmed: true
+    });
+    check("partition confirmed folder rename -> 200", r.status === 200, `got ${r.status}`);
+    r = await pget(P_ACC, P_MID, "desktop-icons");
+    const iconsAfter = await r.json().catch(() => ({}));
+    check(
+      "partition folder rename shows the new folder name, old gone",
+      iconsAfter.children?.some((c) => c.kind === "dir" && c.name === "Work") &&
+        !iconsAfter.children?.some((c) => c.name === "Projects"),
+      JSON.stringify(iconsAfter)
+    );
+    r = await pget(P_ACC, P_MID, "document?path=" + encodeURIComponent("files/Desktop/Work/plan.txt"));
+    const movedChild = await r.json().catch(() => ({}));
+    check(
+      "partition folder rename carries children (same sealed ref)",
+      r.status === 200 && movedChild.moveId === PMOVE1 && movedChild.sha256 === "sha-plan",
+      `got ${r.status} ${JSON.stringify(movedChild)}`
+    );
+
+    // ---- ledger --------------------------------------------------------
+    r = await pget(P_ACC, P_MID, "ledger");
+    pled = await r.json().catch(() => ({}));
+    check(
+      "partition ledger lists confirmed delete/rename only, in order",
+      r.status === 200 &&
+        pled.records.map((x) => x.op).join(",") === "delete,rename,delete,rename" &&
+        pled.records.every((x) => x.confirmed === true && x.accountId === P_ACC) &&
+        pled.records[0].id === delRec.id,
+      JSON.stringify(pled)
+    );
+    r = await pget(Q_ACC, P_MID, "ledger");
+    check(
+      "partition ledger is account-scoped (Q sees none of P's)",
+      r.status === 200 && (await r.json()).records.length === 0
+    );
+
+    // ---- source stays read-only; view holds no bytes -----------------
+    r = await fetch(`${pd}/api/moves/${PMOVE1}/manifest`, { headers: PH });
+    const m1After = await r.json().catch(() => ({}));
+    check(
+      "partition mutate never touches the sealed move manifest",
+      r.status === 200 &&
+        m1After.files.some((f) => f.path === "files/Desktop/Report.docx") &&
+        m1After.files.some((f) => f.path === "files/Desktop/Projects/plan.txt"),
+      JSON.stringify(m1After.files?.map((f) => f.path))
+    );
+    r = await fetch(`${pd}/api/headless/commands`, {
+      headers: {
+        "x-account-id": P_ACC,
+        "x-machine-id": P_MID,
+        "x-machine-secret": pEnrolled.machineSecret
+      }
+    });
+    const pCmds = await r.json().catch(() => null);
+    check(
+      "partition routes queued nothing for the source machine",
+      r.status === 200 && Array.isArray(pCmds) && pCmds.length === 0,
+      `got ${r.status} ${JSON.stringify(pCmds)}`
+    );
+        let partFiles = [];
+    try {
+      partFiles = readdirSync(path.join(dataDirD, P_ACC, "_partition", P_MID));
+    } catch {
+      partFiles = ["<missing>"];
+    }
+    check(
+      "partition disk holds only ledger.json (no second byte store)",
+      partFiles.join(",") === "ledger.json",
+      JSON.stringify(partFiles)
+    );
+
+    // ---- machineId hygiene --------------------------------------------
+    // The ledger lives at <dataDir>/<account>/_partition/<machineId>/,
+    // so a machineId carrying path segments must never reach the store:
+    // it would read (or write) another account's Partition ledger.
+    r = await ppost(Q_ACC, P_MID, "mutate", {
+      op: "delete",
+      path: "files/Desktop/q-secret.txt",
+      confirmed: true
+    });
+    check("partition account Q confirmed delete -> 200", r.status === 200, `got ${r.status}`);
+    const crossMid = encodeURIComponent(`../../${Q_ACC}/_partition/${P_MID}`);
+    r = await pget(P_ACC, crossMid, "ledger");
+    const crossBody = await r.text();
+    check(
+      "partition machineId with path segments -> 400 (no cross-account ledger read)",
+      r.status === 400 && !crossBody.includes("q-secret"),
+      `got ${r.status} ${crossBody.slice(0, 200)}`
+    );
+    r = await ppost(P_ACC, crossMid, "mutate", {
+      op: "delete",
+      path: "files/Desktop/q-secret.txt",
+      confirmed: true
+    });
+    check("partition mutate with path-segment machineId -> 400", r.status === 400, `got ${r.status}`);
+    r = await ppost(P_ACC, encodeURIComponent("..\\x"), "rebuild");
+    check("partition machineId with backslash -> 400", r.status === 400, `got ${r.status}`);
+    r = await pget(P_ACC, encodeURIComponent(".hidden"), "status");
+    check("partition machineId not starting alphanumeric -> 400", r.status === 400, `got ${r.status}`);
+
+    // ---- ledger persists across a restart ----------------------------
+    const PE = 4423;
+    children.push(boot(PE, { MOVER_DATA_DIR: dataDirD }));
+    check("instance PE boots on P's data dir", await waitHealth(PE));
+    r = await fetch(`http://127.0.0.1:${PE}/api/partition/${P_MID}/ledger`, {
+      headers: { "x-account-id": P_ACC }
+    });
+    const pledE = await r.json().catch(() => ({}));
+    check(
+      "partition ledger read back from disk on a fresh process",
+      r.status === 200 && pledE.records?.length === 4 && pledE.records[0].id === delRec.id,
+      JSON.stringify(pledE)
+    );
+    // The headless registry is in memory, so after a restart the Host
+    // re-enrolls before its enrolled NAME can bind moves again.
+    r = await fetch(`http://127.0.0.1:${PE}/api/headless/enroll`, {
+      method: "POST",
+      headers: PH,
+      body: JSON.stringify({ machineId: P_MID, name: P_NAME, os: "Windows 11 Pro" })
+    });
+    check("partition: Host re-enrolls on the fresh process", r.status === 200, `got ${r.status}`);
+    r = await fetch(`http://127.0.0.1:${PE}/api/partition/${P_MID}/status`, {
+      headers: { "x-account-id": P_ACC }
+    });
+    const pstE = await r.json().catch(() => ({}));
+    check(
+      "partition fresh process re-applies the ledger over sealed moves (9 - 2 deletes = 7)",
+      r.status === 200 && pstE.fileCount === 7 && pstE.moveIds?.length === 2,
+      JSON.stringify(pstE)
+    );
+    r = await fetch(
+      `http://127.0.0.1:${PE}/api/partition/${P_MID}/document?path=` +
+        encodeURIComponent("files/Desktop/Work/plan.txt"),
+      { headers: { "x-account-id": P_ACC } }
+    );
+    check(
+      "partition fresh process keeps the folder rename",
+      r.status === 200,
+      `got ${r.status}`
+    );
   } finally {
     for (const child of children) child.kill("SIGTERM");
   }
