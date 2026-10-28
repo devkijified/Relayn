@@ -52,6 +52,9 @@
 //   files-browse { prefix, offset?, limit? }      result: the app browse response, with modTime on each child
 //   files-fetch  { moveName, paths: [concrete files] } (signed)
 //   files-push   { moveId, destDir }              (signed)
+//   viewprobe    { paint }                        (signed; the view helper's
+//                                                  birth twin, measurement
+//                                                  only; result: { log })
 //   anchor-update  { stamp }                      (signed; the Host anchor
 //                                                  renews itself to the named
 //                                                  build, fetched from
@@ -257,7 +260,7 @@ export async function headlessRoutes(
   // this is how the console and the RelaynAdminViewer app drive
   // machines. It can list the account's machines, queue a command
   // for one (the store signs "start", "desk-end", "view-end",
-  // "files-fetch" and "files-push" with the machine's secret
+  // "viewprobe", "files-fetch" and "files-push" with the machine's secret
   // server-side, so those commands exist only
   // because an operator queued them here), and read a command
   // back. The machine channel above deliberately has NO enqueue

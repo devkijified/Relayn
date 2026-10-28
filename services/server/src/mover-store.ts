@@ -278,9 +278,9 @@ export interface HeadlessCommand {
   id: string;
   account: string;
   machineId: string;
-  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | files-browse | files-fetch | files-push | anchor-update | anchor-deliver
+  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | viewprobe | files-browse | files-fetch | files-push | anchor-update | anchor-deliver
   payload: Record<string, unknown>;
-  signature?: string; // set for "start", "desk-end", "view-end", "files-fetch", "files-push", "anchor-update" and "anchor-deliver" commands
+  signature?: string; // set for "start", "desk-end", "view-end", "viewprobe", "files-fetch", "files-push", "anchor-update" and "anchor-deliver" commands
   createdAt: string; // RFC3339 UTC
   status: "pending" | "delivered" | "done";
   result?: unknown;
@@ -905,7 +905,7 @@ export class MoverStore {
 
   /**
    * Queue a command for a machine. "start", "desk-end",
-   * "view-end", "files-fetch", "files-push", "anchor-update"
+   * "view-end", "viewprobe", "files-fetch", "files-push", "anchor-update"
    * and "anchor-deliver" commands are signed with the machine's
    * secret at queue time, so each exists only because an
    * operator on an account channel queued it; the engine refuses
@@ -933,6 +933,7 @@ export class MoverStore {
       type === "start" ||
       type === "desk-end" ||
       type === "view-end" ||
+      type === "viewprobe" ||
       type === "files-fetch" ||
       type === "files-push" ||
       type === "anchor-update" ||
