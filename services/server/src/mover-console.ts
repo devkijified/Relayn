@@ -1116,6 +1116,7 @@ compiled in, nothing else to carry or place beside it.</p>
       <button type="button" id="adminDlConfig">Download config.json</button>
       <button type="button" id="adminDlExe" class="ghost">Download ready build (single exe, config inbuilt)</button>
     </p>
+    <p class="meta" id="adminDlStatus"></p>
     <p class="meta">Host and viewer downloads are gated by the admin license for the account, same as the admin build.</p>
   </div>
   <div class="card">
@@ -2148,26 +2149,56 @@ compiled in, nothing else to carry or place beside it.</p>
     if (role === "viewer") return "relayn-admin-viewer.exe";
     return "relayn-mover-admin.exe";
   }
+  // Download outcomes are reported on the status line inside the
+  // Downloads card itself (adminDlStatus), not the shared page status:
+  // that one sits in the MOVER section, where an admin working here
+  // never sees the message and the click looks dead.
+  function adminDlSay(msg) {
+    var el = document.getElementById("adminDlStatus");
+    if (el) el.textContent = msg || "";
+  }
+  // The Downloads card carries its own account, visibly: prefill the
+  // account field with the pair account from section 1, so the admin
+  // sees exactly which account a download will carry and can change
+  // it here in the card instead of hunting through another tab.
+  (function () {
+    var f = document.getElementById("dlAdminAccount");
+    if (f && !f.value.trim()) {
+      try { f.value = accountId(); } catch (e) { /* section 1 not ready */ }
+    }
+  })();
   document.getElementById("adminDlConfig").addEventListener("click", async function () {
-    say("");
+    adminDlSay("");
     var res = await api("/mover/console/api/config", adminOptions());
     if (!res.ok) {
       var err = await res.json().catch(function () { return {}; });
-      say("Config failed: " + (err.message || err.error || res.status));
+      adminDlSay("Config failed: " + (err.message || err.error || res.status));
       return;
     }
     saveBlob(await res.blob(), "config.json");
+    adminDlSay("Download started: config.json");
   });
   document.getElementById("adminDlExe").addEventListener("click", async function () {
-    say("");
-    var opts = adminOptions();
-    var res = await api("/mover/console/api/package", opts);
-    if (!res.ok) {
-      var err = await res.json().catch(function () { return {}; });
-      say("Ready build failed: " + (err.message || err.error || res.status));
-      return;
+    var btn = document.getElementById("adminDlExe");
+    adminDlSay("");
+    btn.disabled = true;
+    var label = btn.textContent;
+    btn.textContent = "Building...";
+    try {
+      var opts = adminOptions();
+      var res = await api("/mover/console/api/package", opts);
+      if (!res.ok) {
+        var err = await res.json().catch(function () { return {}; });
+        adminDlSay("Ready build failed: " + (err.message || err.error || res.status));
+        return;
+      }
+      var name = adminExeName(opts.role);
+      saveBlob(await res.blob(), name);
+      adminDlSay("Download started: " + name);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = label;
     }
-    saveBlob(await res.blob(), adminExeName(opts.role));
   });
 
   // ---------------- Admin machines oversight ----------------
