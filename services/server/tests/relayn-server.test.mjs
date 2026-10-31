@@ -477,6 +477,12 @@ async function main() {
         !html.includes('id="issueBuildBtn"') &&
         !html.includes('id="issueBuildsCard"')
     );
+    check(
+      "console has the one-press bound set button",
+      html.includes('id="oneClickSet"') &&
+        html.includes('id="oneClickStatus"') &&
+        html.includes("/mover/console/api/licenses/bind-admin-key")
+    );
     const selectBlock = (id) => {
       const i = html.indexOf(`id="${id}"`);
       return i < 0 ? "" : html.slice(i, html.indexOf("</select>", i));

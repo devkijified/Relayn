@@ -1228,6 +1228,8 @@ compiled in, nothing else to carry or place beside it.</p>
   <h3>Licences: one bounded set each</h3>
   <p>One licence is one bounded set. The account is born with the licence, every build issued for it carries that account, its Hosts enroll only under it, and its Admin sees only its own machines. Every build for a set sits on the set's own row in the list: one press on a build button downloads that build for that account.</p>
   <p><strong>An Admin only ever sees the machines under its own licence. Nothing crosses between licences.</strong></p>
+  <p><button type="button" id="oneClickSet">Create a bound set and download its Host and Admin Viewer</button></p>
+  <p class="meta" id="oneClickStatus"></p>
   <div id="adminIssueAccounts"><p class="meta">Loading accounts.</p></div>
   <p class="meta" id="adminBuildStatus"></p>
   <p class="meta">A machine that already has a Host does not need a fresh build: update it from the Admin Viewer instead. Issue a Host build only for a machine that has none yet.</p>
@@ -2582,6 +2584,77 @@ compiled in, nothing else to carry or place beside it.</p>
     // The section 1 account is named in the estate rows: when
     // it changes, the rows follow it.
     renderAllIssueAccounts();
+  });
+
+  // ---------------- One press: a whole bound set ----------------
+  // The owner's standing ask (2026-10-31): the fresh process is
+  // ONE click. This button runs the whole chain in order: create
+  // the pair (a new account, its licences born Active), bind its
+  // admin key, then download its Host and its Admin Viewer, both
+  // carrying the account and the key. Any step that fails stops
+  // the chain and says where, with the row buttons as the way to
+  // finish by hand.
+  document.getElementById("oneClickSet").addEventListener("click", async function () {
+    var btn = this;
+    var statusEl = document.getElementById("oneClickStatus");
+    var say1 = function (m) { if (statusEl) statusEl.textContent = m; };
+    btn.disabled = true;
+    say1("Creating the new set...");
+    try {
+      var pairRes = await api("/mover/console/api/pairs");
+      if (!pairRes.ok) { say1("Could not create the pair (HTTP " + pairRes.status + "). Nothing was made."); return; }
+      var pair = await pairRes.json().catch(function () { return {}; });
+      var acct = pair.accountId || "";
+      if (!isAccountId(acct)) { say1("The pair came back without an account ID. Nothing was made."); return; }
+      document.getElementById("accountId").textContent = acct;
+      document.getElementById("accountIdInput").value = "";
+      var bindRes = await api("/mover/console/api/licenses/bind-admin-key", { accountId: acct });
+      if (!bindRes.ok) {
+        var be = await bindRes.json().catch(function () { return {}; });
+        say1("The set " + acct + " was created but the bind failed: " + (be.message || be.error || bindRes.status) + ". Press Bind the admin key on its row below.");
+        refreshLicenses();
+        return;
+      }
+      say1("Set " + acct + " created and bound. Downloading its Host and Admin Viewer...");
+      var stamp = "";
+      var roleKeys = ["host", "viewer"];
+      var doneFiles = [];
+      for (var i = 0; i < roleKeys.length; i++) {
+        var role = ISSUE_ROLES[roleKeys[i]];
+        say1("Set " + acct + " created and bound. Downloading its " + role.title + "...");
+        var res = null;
+        try {
+          var opts = options();
+          opts.accountId = acct;
+          opts.role = roleKeys[i];
+          res = await api("/mover/console/api/package", opts);
+        } catch (netErr) {
+          say1("The set is created and bound, but the " + role.title + " download did not reach the server. Press " + role.title + " on its row below.");
+          refreshLicenses();
+          return;
+        }
+        if (!res.ok) {
+          var err = await res.json().catch(function () { return {}; });
+          say1("The set is created and bound, but the " + role.title + " download failed: " + (err.message || err.error || res.status) + ". Press " + role.title + " on its row below.");
+          refreshLicenses();
+          return;
+        }
+        var blob = await res.blob();
+        try { stamp = stampFromExeBytes(await blob.arrayBuffer()) || stamp; } catch (e) { /* the stamp stays unreported */ }
+        saveBlob(blob, role.file);
+        doneFiles.push(role.file);
+        await new Promise(function (r) { setTimeout(r, 700); });
+      }
+      say1("Done. New set " + acct + ": licence Active, admin key bound. " + doneFiles.join(" and ") + " downloaded" +
+        (stamp ? ", build " + stamp : "") + ". Only these builds can drive this set. If your browser held one file back, press its button on the set's row below.");
+      refreshLicenses();
+      loadOverview();
+    } catch (chainErr) {
+      say1("The one-press chain stopped: " + (chainErr && chainErr.message ? chainErr.message : chainErr) + ". Whatever was created is in the list below; finish from its row.");
+      refreshLicenses();
+    } finally {
+      btn.disabled = false;
+    }
   });
 
   // ---------------- Admin machines oversight ----------------
