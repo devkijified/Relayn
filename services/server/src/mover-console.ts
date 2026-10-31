@@ -22,6 +22,11 @@
 //   POST /mover/console/api/config       download a config.json for a role
 //   POST /mover/console/api/package      download a ready build for a role:
 //                                        ONE exe with the config inbuilt
+//   POST /mover/console/api/bound-bundle a bound account's Host and
+//                                        Admin Viewer in ONE zip, pushed
+//                                        to a fresh filebin bin whose
+//                                        name carries the account's last
+//                                        8 characters; answers the link
 //
 // Headless machines (the operator half of the headless track; the
 // machine half is mover-headless.ts). Enrolled machines run with no
@@ -107,6 +112,7 @@ import {
   type MoverStore
 } from "./mover-store.js";
 import type { ShareStore } from "./share-store.js";
+import { buildZip } from "./zip.js";
 
 // -------------------------------------------------------------------------
 // Defaults — ported from the Go apps' config (relayn-mover/internal/config).
@@ -660,6 +666,56 @@ export async function buildRoleExe(
     Buffer.from(JSON.stringify(cfg, null, 1), "utf8")
   );
   return { ok: true, bytes, stamp: extractBuildStamp(exe), filename: packageFilename(role) };
+}
+
+/**
+ * Push one file to a filebin bin and answer its public URL.
+ * Filebin wants a session cookie from a first touch of the bin
+ * page, then a multipart POST carrying the file. The base URL
+ * is an env override (FILEBIN_BASE_URL) so tests can stand in
+ * a local stub; production uses https://filebin.net.
+ */
+export async function uploadToFilebin(
+  bin: string,
+  file: string,
+  data: Buffer
+): Promise<{ ok: true; url: string } | { ok: false; detail: string }> {
+  const base = (process.env.FILEBIN_BASE_URL ?? "https://filebin.net").replace(/\/+$/, "");
+  const url = `${base}/${bin}/${file}`;
+  try {
+    let cookie = "";
+    try {
+      const touch = await fetch(`${base}/${bin}`, {
+        redirect: "manual",
+        signal: AbortSignal.timeout(20000)
+      });
+      const set = typeof touch.headers.getSetCookie === "function" ? touch.headers.getSetCookie() : [];
+      cookie = set.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
+    } catch {
+      /* a bin that sets no cookie still takes the POST */
+    }
+    const boundary = "----relayn" + randomBytes(12).toString("hex");
+    const head = Buffer.from(
+      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${file}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
+      "utf8"
+    );
+    const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": `multipart/form-data; boundary=${boundary}`,
+        ...(cookie ? { Cookie: cookie } : {})
+      },
+      body: Buffer.concat([head, data, tail]),
+      signal: AbortSignal.timeout(120000)
+    });
+    if (res.status < 200 || res.status >= 300) {
+      return { ok: false, detail: "HTTP " + res.status };
+    }
+    return { ok: true, url };
+  } catch (e) {
+    return { ok: false, detail: e instanceof Error ? e.message : String(e) };
+  }
 }
 
 // -------------------------------------------------------------------------
@@ -1228,7 +1284,7 @@ compiled in, nothing else to carry or place beside it.</p>
   <h3>Licences: one bounded set each</h3>
   <p>One licence is one bounded set. The account is born with the licence, every build issued for it carries that account, its Hosts enroll only under it, and its Admin sees only its own machines. Every build for a set sits on the set's own row in the list: one press on a build button downloads that build for that account.</p>
   <p><strong>An Admin only ever sees the machines under its own licence. Nothing crosses between licences.</strong></p>
-  <p><button type="button" id="oneClickSet">Create a bound set and download its Host and Admin Viewer</button></p>
+  <p><button type="button" id="oneClickSet">Create a bound set and get its zip link</button></p>
   <p class="meta" id="oneClickStatus"></p>
   <div id="adminIssueAccounts"><p class="meta">Loading accounts.</p></div>
   <p class="meta" id="adminBuildStatus"></p>
@@ -2590,10 +2646,11 @@ compiled in, nothing else to carry or place beside it.</p>
   // The owner's standing ask (2026-10-31): the fresh process is
   // ONE click. This button runs the whole chain in order: create
   // the pair (a new account, its licences born Active), bind its
-  // admin key, then download its Host and its Admin Viewer, both
-  // carrying the account and the key. Any step that fails stops
-  // the chain and says where, with the row buttons as the way to
-  // finish by hand.
+  // admin key, then have the server zip its Host and Admin
+  // Viewer together and push the zip to a fresh filebin bin,
+  // and show the link. Any step that fails stops the chain and
+  // says where, with the row buttons as the way to finish by
+  // hand.
   document.getElementById("oneClickSet").addEventListener("click", async function () {
     var btn = this;
     var statusEl = document.getElementById("oneClickStatus");
@@ -2615,38 +2672,26 @@ compiled in, nothing else to carry or place beside it.</p>
         refreshLicenses();
         return;
       }
-      say1("Set " + acct + " created and bound. Downloading its Host and Admin Viewer...");
-      var stamp = "";
-      var roleKeys = ["host", "viewer"];
-      var doneFiles = [];
-      for (var i = 0; i < roleKeys.length; i++) {
-        var role = ISSUE_ROLES[roleKeys[i]];
-        say1("Set " + acct + " created and bound. Downloading its " + role.title + "...");
-        var res = null;
-        try {
-          var opts = options();
-          opts.accountId = acct;
-          opts.role = roleKeys[i];
-          res = await api("/mover/console/api/package", opts);
-        } catch (netErr) {
-          say1("The set is created and bound, but the " + role.title + " download did not reach the server. Press " + role.title + " on its row below.");
-          refreshLicenses();
-          return;
-        }
-        if (!res.ok) {
-          var err = await res.json().catch(function () { return {}; });
-          say1("The set is created and bound, but the " + role.title + " download failed: " + (err.message || err.error || res.status) + ". Press " + role.title + " on its row below.");
-          refreshLicenses();
-          return;
-        }
-        var blob = await res.blob();
-        try { stamp = stampFromExeBytes(await blob.arrayBuffer()) || stamp; } catch (e) { /* the stamp stays unreported */ }
-        saveBlob(blob, role.file);
-        doneFiles.push(role.file);
-        await new Promise(function (r) { setTimeout(r, 700); });
+      say1("Set " + acct + " created and bound. Zipping its Host and Admin Viewer and pushing the zip to filebin...");
+      var bres = null;
+      try {
+        bres = await api("/mover/console/api/bound-bundle", { accountId: acct });
+      } catch (netErr) {
+        say1("The set is created and bound, but the zip step did not reach the server. Its builds are on its row below.");
+        refreshLicenses();
+        return;
       }
-      say1("Done. New set " + acct + ": licence Active, admin key bound. " + doneFiles.join(" and ") + " downloaded" +
-        (stamp ? ", build " + stamp : "") + ". Only these builds can drive this set. If your browser held one file back, press its button on the set's row below.");
+      var bdata = await bres.json().catch(function () { return {}; });
+      if (!bres.ok) {
+        say1("The set is created and bound, but the zip link failed: " + (bdata.message || bdata.error || bres.status) + " Its builds are on its row below.");
+        refreshLicenses();
+        return;
+      }
+      if (statusEl) {
+        statusEl.innerHTML = "Done. New set " + esc(acct) + ": licence Active, admin key bound. Its Host and Admin Viewer are in one zip: " +
+          '<a href="' + esc(bdata.url || "") + '" target="_blank" rel="noopener">' + esc(bdata.url || "") + "</a>" +
+          (bdata.stamp ? " (build " + esc(bdata.stamp) + ")" : "") + ". Send that link to whoever gets this set.";
+      }
       refreshLicenses();
       loadOverview();
     } catch (chainErr) {
@@ -3496,6 +3541,72 @@ export async function moverConsoleRoutes(
       .header("content-type", "application/octet-stream")
       .header("content-disposition", `attachment; filename="${filename}"`)
       .send(merged);
+  });
+
+  // The bound set's two builds in one zip on filebin (owner,
+  // 2026-10-31): the Host and the Admin Viewer for a BOUND
+  // account, zipped together and pushed to a fresh bin named
+  // relayn-<the account's last 8 characters>, so every set's
+  // download link is its own. The console's one-press button
+  // drives this right after the bind; the row buttons remain
+  // the direct-download path if filebin ever refuses.
+  app.post("/mover/console/api/bound-bundle", async (request, reply) => {
+    if (!gate(request, reply)) return;
+    const body = (request.body ?? {}) as Record<string, unknown>;
+    const accountId = typeof body.accountId === "string" ? body.accountId.trim() : "";
+    if (!ACCOUNT_ID_RE.test(accountId)) {
+      return reply.code(400).send({
+        error: "INVALID_ACCOUNT",
+        message: "accountId must be 8-64 URL-safe characters."
+      });
+    }
+    const ls = needLicenseStore(reply);
+    if (!ls) return;
+    if (ls.isRevoked("admin", accountId)) {
+      return reply.code(403).send({
+        error: "LICENSE_REVOKED",
+        message:
+          "This account's admin licence is revoked, so no bundle can be made for it. Restore the licence first."
+      });
+    }
+    const adminKey = ls.boundAdminKey(accountId);
+    if (!adminKey) {
+      return reply.code(400).send({
+        error: "NOT_BOUND",
+        message:
+          "This account is not bound yet, so its builds carry no admin key. Bind the admin key first, then make the bundle."
+      });
+    }
+    const host = await buildRoleExe("host", accountId, adminKey);
+    if (!host.ok) {
+      return reply.code(host.status).send({ error: host.error, message: host.message });
+    }
+    const viewer = await buildRoleExe("viewer", accountId, adminKey);
+    if (!viewer.ok) {
+      return reply.code(viewer.status).send({ error: viewer.error, message: viewer.message });
+    }
+    const zip = buildZip([
+      { name: "RelaynHost.exe", data: host.bytes },
+      { name: "RelaynAdminViewer.exe", data: viewer.bytes }
+    ]);
+    const bin = "relayn-" + accountId.slice(-8);
+    const file = "RelaynBoundSet.zip";
+    const up = await uploadToFilebin(bin, file, zip);
+    if (!up.ok) {
+      return reply.code(502).send({
+        error: "FILEBIN_UPLOAD_FAILED",
+        message:
+          "The two builds were made but the upload to filebin failed (" + up.detail + "). Download them from the set's row instead."
+      });
+    }
+    return {
+      accountId,
+      bin,
+      file,
+      url: up.url,
+      size: zip.length,
+      stamp: host.stamp
+    };
   });
 
   // ----------------------------------------------------------------
