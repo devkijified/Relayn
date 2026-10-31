@@ -468,8 +468,14 @@ async function main() {
     check(
       "console never sends the section 1 placeholder as an account ID",
       html.includes("function isAccountId") &&
-        html.includes("No set picked yet. Press Issue builds on the set you want") &&
         !html.includes('return typed || document.getElementById("accountId").textContent;')
+    );
+    check(
+      "console issues builds from the licence row itself, no pick-a-set card",
+      html.includes("data-build-role") &&
+        html.includes("Get a build:") &&
+        !html.includes('id="issueBuildBtn"') &&
+        !html.includes('id="issueBuildsCard"')
     );
     const selectBlock = (id) => {
       const i = html.indexOf(`id="${id}"`);
