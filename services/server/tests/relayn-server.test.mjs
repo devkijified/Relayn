@@ -3530,6 +3530,214 @@ async function main() {
       `got ${r.status}`
     );
 
+    // ---- session auto delivery: arm state, requests, envelopes ----
+    // The arm flag is per machine, default OFF, durable state class
+    // storage. Requests are recorded only for armed machines. The
+    // extension poll is account scoped. A staged envelope is taken
+    // exactly once, and disarming clears request and envelope.
+    console.log("partition session auto delivery");
+    const SA_MID2 = "second-pc-99";
+    const sget = (acc, sub) =>
+      fetch(`${pd}${sub}`, { headers: { "x-account-id": acc } });
+    const spost = (acc, sub, body) =>
+      fetch(`${pd}${sub}`, {
+        method: "POST",
+        headers: { "x-account-id": acc, "content-type": "application/json" },
+        body: JSON.stringify(body ?? {})
+      });
+
+    r = await fetch(`${pd}/api/partition/${P_MID}/session-arm`);
+    check("session arm without account -> 401", r.status === 401, `got ${r.status}`);
+    r = await sget("bad!", `/api/partition/${P_MID}/session-arm`);
+    check("session arm invalid account -> 401", r.status === 401, `got ${r.status}`);
+    r = await sget(P_ACC, `/api/partition/${encodeURIComponent("../x")}/session-arm`);
+    check("session arm bad machineId -> 400", r.status === 400, `got ${r.status}`);
+
+    r = await sget(P_ACC, `/api/partition/${P_MID}/session-arm`);
+    const arm0 = await r.json().catch(() => ({}));
+    check(
+      "session arm defaults OFF",
+      r.status === 200 && arm0.armed === false && arm0.machineId === P_MID,
+      JSON.stringify(arm0)
+    );
+    r = await sget(Q_ACC, `/api/partition/${P_MID}/session-arm`);
+    check(
+      "session arm is account scoped (other account also OFF)",
+      r.status === 200 && (await r.json()).armed === false
+    );
+
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-arm`, { armed: "yes" });
+    check("session arm set with a non-boolean -> 400", r.status === 400, `got ${r.status}`);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-arm`, { armed: true });
+    const arm1 = await r.json().catch(() => ({}));
+    check(
+      "session arm set ON",
+      r.status === 200 && arm1.armed === true,
+      JSON.stringify(arm1)
+    );
+    r = await sget(P_ACC, `/api/partition/${P_MID}/session-arm`);
+    check("session arm reads back ON", (await r.json()).armed === true);
+    r = await sget(P_ACC, `/api/partition/${SA_MID2}/session-arm`);
+    check(
+      "session arm is per machine (second machine still OFF)",
+      r.status === 200 && (await r.json()).armed === false
+    );
+    r = await sget(Q_ACC, `/api/partition/${P_MID}/session-arm`);
+    check(
+      "session arm stays account scoped after set (Q still OFF)",
+      (await r.json()).armed === false
+    );
+
+    // Requests: unarmed machines are refused and record nothing.
+    r = await spost(P_ACC, `/api/partition/${SA_MID2}/session-request`, {});
+    const unarmedReq = await r.json().catch(() => ({}));
+    check(
+      "session request for an unarmed machine -> 409, nothing recorded",
+      r.status === 409 && unarmedReq.armed === false,
+      `got ${r.status} ${JSON.stringify(unarmedReq)}`
+    );
+    r = await sget(P_ACC, `/api/partition/session-requests`);
+    const poll0 = await r.json().catch(() => ({}));
+    check(
+      "extension poll starts empty (unarmed request never recorded)",
+      r.status === 200 && Array.isArray(poll0.requests) && poll0.requests.length === 0,
+      JSON.stringify(poll0)
+    );
+    r = await fetch(`${pd}/api/partition/session-requests`);
+    check("extension poll without account -> 401", r.status === 401, `got ${r.status}`);
+
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-request`, {});
+    const req1 = await r.json().catch(() => ({}));
+    check(
+      "session request for an armed machine -> pending with a requestId",
+      r.status === 200 && req1.pending === true && /^sr-[0-9a-f]{20}$/.test(req1.requestId ?? ""),
+      JSON.stringify(req1)
+    );
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-request`, {});
+    const req2 = await r.json().catch(() => ({}));
+    check(
+      "a second session request returns the same pending request",
+      r.status === 200 && req2.requestId === req1.requestId,
+      JSON.stringify(req2)
+    );
+    r = await sget(P_ACC, `/api/partition/session-requests`);
+    const poll1 = await r.json().catch(() => ({}));
+    check(
+      "extension poll lists the armed machine request only",
+      poll1.requests?.length === 1 &&
+        poll1.requests[0].machineId === P_MID &&
+        poll1.requests[0].requestId === req1.requestId,
+      JSON.stringify(poll1)
+    );
+    r = await sget(Q_ACC, `/api/partition/session-requests`);
+    check(
+      "extension poll is account scoped",
+      r.status === 200 && (await r.json()).requests?.length === 0
+    );
+
+    // Envelope staging: fences first, then the happy path.
+    const saEnvelope = {
+      v: 2,
+      server: "https://relayn-server.onrender.com",
+      id: "0123456789abcdef0123456789abcdef",
+      key: randomBytes(32).toString("base64")
+    };
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-envelope`, {
+      requestId: "sr-00000000000000000000",
+      envelope: saEnvelope
+    });
+    check("envelope with a mismatched requestId -> 409", r.status === 409, `got ${r.status}`);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-envelope`, {
+      requestId: req1.requestId,
+      envelope: { ...saEnvelope, v: 3 }
+    });
+    check("malformed envelope (v:3) -> 400", r.status === 400, `got ${r.status}`);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-envelope`, {
+      requestId: req1.requestId,
+      envelope: { ...saEnvelope, key: "short" }
+    });
+    check("malformed envelope (short key) -> 400", r.status === 400, `got ${r.status}`);
+    r = await spost(P_ACC, `/api/partition/${SA_MID2}/session-envelope`, {
+      requestId: req1.requestId,
+      envelope: saEnvelope
+    });
+    check("envelope for an unarmed machine -> 409", r.status === 409, `got ${r.status}`);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-envelope`, {
+      requestId: req1.requestId,
+      envelope: saEnvelope
+    });
+    check("envelope stages for the pending request", r.status === 200, `got ${r.status}`);
+    r = await sget(P_ACC, `/api/partition/session-requests`);
+    check(
+      "staging clears the pending request (poll empty again)",
+      (await r.json()).requests?.length === 0
+    );
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-envelope`, {
+      requestId: req1.requestId,
+      envelope: saEnvelope
+    });
+    check("the same request cannot be answered twice -> 404", r.status === 404, `got ${r.status}`);
+
+    r = await sget(P_ACC, `/api/partition/${P_MID}/session-envelope`);
+    const taken = await r.json().catch(() => ({}));
+    check(
+      "Viewer takes the staged envelope once, byte for byte",
+      r.status === 200 &&
+        taken.requestId === req1.requestId &&
+        taken.envelope?.v === 2 &&
+        taken.envelope?.id === saEnvelope.id &&
+        taken.envelope?.key === saEnvelope.key &&
+        taken.envelope?.server === saEnvelope.server,
+      JSON.stringify(taken)
+    );
+    r = await sget(P_ACC, `/api/partition/${P_MID}/session-envelope`);
+    check("a second take is single use -> 404", r.status === 404, `got ${r.status}`);
+    r = await sget(Q_ACC, `/api/partition/${P_MID}/session-envelope`);
+    check("envelope take is account scoped -> 404", r.status === 404, `got ${r.status}`);
+
+    // Disarm is a full revoke: pending request and staged envelope go.
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-request`, {});
+    const req3 = await r.json().catch(() => ({}));
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-envelope`, {
+      requestId: req3.requestId,
+      envelope: saEnvelope
+    });
+    check("second round stages before the revoke test", r.status === 200, `got ${r.status}`);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-request`, {});
+    const req4 = await r.json().catch(() => ({}));
+    check("a fresh request can pend behind a staged envelope", r.status === 200 && !!req4.requestId);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-arm`, { armed: false });
+    check("disarm answers armed:false", r.status === 200 && (await r.json()).armed === false);
+    r = await sget(P_ACC, `/api/partition/${P_MID}/session-envelope`);
+    check("disarm clears the staged envelope (take -> 404)", r.status === 404, `got ${r.status}`);
+    r = await sget(P_ACC, `/api/partition/session-requests`);
+    check("disarm clears the pending request (poll empty)", (await r.json()).requests?.length === 0);
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-request`, {});
+    check("requests stay refused after disarm -> 409", r.status === 409, `got ${r.status}`);
+
+    // Durability: arm ON written by P reads back on a fresh process
+    // over the same data dir (state class storage, never swept).
+    r = await spost(P_ACC, `/api/partition/${P_MID}/session-arm`, { armed: true });
+    check("arm set ON again for the durability readback", r.status === 200);
+    const PF = 4431;
+    children.push(boot(PF, { MOVER_DATA_DIR: dataDirD }));
+    check("instance PF boots on P's data dir", await waitHealth(PF));
+    r = await fetch(`http://127.0.0.1:${PF}/api/partition/${P_MID}/session-arm`, {
+      headers: { "x-account-id": P_ACC }
+    });
+    check(
+      "arm state is durable across a store reload (fresh process reads ON)",
+      r.status === 200 && (await r.json()).armed === true,
+      `got ${r.status}`
+    );
+    r = await fetch(`http://127.0.0.1:${PF}/api/partition/${SA_MID2}/session-arm`, {
+      headers: { "x-account-id": P_ACC }
+    });
+    check(
+      "the untouched machine still reads OFF on the fresh process",
+      r.status === 200 && (await r.json()).armed === false
+    );
+
     // ---------------------------------------------------------------
     // Instances R1/R2: THE DURABLE STORE. Everything the server
     // holds is written through to <MOVER_DATA_DIR>/state/ and

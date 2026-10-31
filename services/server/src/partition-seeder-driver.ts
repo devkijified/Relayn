@@ -48,19 +48,65 @@ export const SEEDER_PROBE_EVERY_MS = 30 * 60_000; // per machine
 export const SEEDER_PROBE_MAX_COMMANDS = 400;
 export const SEEDER_PROBE_MAX_ENTRIES = 20_000;
 export const SEEDER_PROBE_PAGE = 200;
+// AppData can dwarf every user-folder root combined, so its part
+// of a probe walk gets its own page budget. The budget counts
+// files-browse pages dispatched for the appData root; once it is
+// spent, the walk drops any remaining AppData pages for that
+// cycle and still merges everything it gathered.
+export const SEEDER_PROBE_APPDATA_PAGE_BUDGET = 200;
 
 // The inventory roots the probe walks, in packPath form. A root
 // the machine does not have answers with an error result and is
 // skipped; that is a normal shape (not every profile carries
-// every known folder).
+// every known folder). The AppData root (the top of the
+// appData/Roaming and appData/Local trees) walks last, after
+// every files/* root.
 export const SEEDER_PROBE_ROOTS = [
   "files/Desktop",
   "files/Documents",
   "files/Downloads",
   "files/Pictures",
   "files/Music",
-  "files/Videos"
+  "files/Videos",
+  "appData"
 ];
+
+function isAppDataPath(prefix: string): boolean {
+  return prefix === "appData" || prefix.startsWith("appData/");
+}
+
+// Reorder one plan for the driver pass: every express path in the
+// plan becomes its own single-file batch at the head, in the
+// plan's express request order, and the remaining batches follow
+// with the express paths taken out (a batch left empty drops).
+// A plan with no express paths passes through unchanged, in its
+// original batch order. The door never changes: files-fetch only.
+export function orderBatchesExpressFirst(plan: {
+  batches: Array<{ door: typeof SEEDER_FETCH_DOOR; paths: string[]; bytes: number }>;
+  express?: string[];
+}): Array<{ door: typeof SEEDER_FETCH_DOOR; paths: string[]; bytes: number }> {
+  const express = (plan.express || []).filter(
+    (p, i, all) => typeof p === "string" && p !== "" && all.indexOf(p) === i
+  );
+  if (express.length === 0) return plan.batches;
+  const expressSet = new Set(express);
+  const present = new Set<string>();
+  for (const b of plan.batches) {
+    for (const p of b.paths) {
+      if (expressSet.has(p)) present.add(p);
+    }
+  }
+  const head: Array<{ door: typeof SEEDER_FETCH_DOOR; paths: string[]; bytes: number }> = [];
+  for (const p of express) {
+    if (present.has(p)) head.push({ door: SEEDER_FETCH_DOOR, paths: [p], bytes: 0 });
+  }
+  const rest: Array<{ door: typeof SEEDER_FETCH_DOOR; paths: string[]; bytes: number }> = [];
+  for (const b of plan.batches) {
+    const paths = b.paths.filter((p) => !expressSet.has(p));
+    if (paths.length > 0) rest.push({ door: SEEDER_FETCH_DOOR, paths, bytes: b.bytes });
+  }
+  return [...head, ...rest];
+}
 
 interface ProbePage {
   prefix: string;
@@ -73,6 +119,7 @@ interface ProbeWalk {
   out: Map<string, ProbePage>; // command id -> the page it asked for
   entries: Array<{ packPath: string; size: number; modTime: number }>;
   commands: number;
+  appDataPages: number; // files-browse pages dispatched under appData
 }
 
 export interface SeederDriverDeps {
@@ -170,6 +217,11 @@ export class PartitionSeederDriver {
   }
 
   // Queue plan batches while the machine has concurrency room.
+  // Express paths (plan.express) are served first on this pass,
+  // ahead of ordinary bumps and ahead of the background batches:
+  // each express path is queued as its own single-file fetch
+  // before anything else takes the room, even if a plan batch
+  // arrived with an express path mixed in among other paths.
   private async seedMachine(account: string, machineId: string): Promise<void> {
     const inFlight = this.deps.moverStore.countActiveHeadlessCommands(
       account,
@@ -180,7 +232,8 @@ export class PartitionSeederDriver {
     if (room <= 0) return;
     const ledger = await this.deps.partitionStore.listLedger(account, machineId);
     const plan = await this.deps.seeder.plan(account, machineId, true, ledger);
-    for (const batch of plan.batches) {
+    const batches = orderBatchesExpressFirst(plan);
+    for (const batch of batches) {
       if (room <= 0) break;
       for (const packPath of batch.paths) {
         await this.deps.catalog.markSeeding(account, machineId, packPath);
@@ -216,7 +269,8 @@ export class PartitionSeederDriver {
         queue: SEEDER_PROBE_ROOTS.map((prefix) => ({ prefix, offset: 0 })),
         out: new Map(),
         entries: [],
-        commands: 0
+        commands: 0,
+        appDataPages: 0
       };
       this.walks.set(key, walk);
     }
@@ -230,11 +284,22 @@ export class PartitionSeederDriver {
     }
 
     // Queue the next browses while there is room and budget.
+    // An AppData page whose budget is spent is dropped, never
+    // queued: the walk ends that root for this cycle, and any
+    // files/* pages waiting behind it still get their turn.
     while (
       walk.queue.length > 0 &&
       walk.out.size < 2 &&
       walk.commands < SEEDER_PROBE_MAX_COMMANDS
     ) {
+      const head = walk.queue[0] as ProbePage;
+      if (
+        isAppDataPath(head.prefix) &&
+        walk.appDataPages >= SEEDER_PROBE_APPDATA_PAGE_BUDGET
+      ) {
+        walk.queue.shift();
+        continue;
+      }
       const pageReq = walk.queue.shift() as ProbePage;
       const cmd = await this.deps.moverStore.queueHeadlessCommand(
         account,
@@ -249,6 +314,7 @@ export class PartitionSeederDriver {
       if (!cmd) break;
       walk.out.set(cmd.id, pageReq);
       walk.commands++;
+      if (isAppDataPath(pageReq.prefix)) walk.appDataPages++;
     }
 
     // Walk over: merge what was found and stamp the cadence.

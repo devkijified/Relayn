@@ -16,8 +16,20 @@
 //   GET  /api/partition/:machineId/catalog/browse?prefix=  (catalog ONLY)
 //   POST /api/partition/:machineId/catalog/refresh         (merge revision)
 //   GET  /api/partition/:machineId/seeder                  (server-held plan)
-//   POST /api/partition/:machineId/seeder/bump { path }    (on-demand)
+//   POST /api/partition/:machineId/seeder/bump { path, express? }
+//        (on-demand; express puts this one file first of all)
 //   POST /api/partition/:machineId/probe                   (manual Check now)
+//   GET  /api/partition/:machineId/session-arm             (arm state)
+//   POST /api/partition/:machineId/session-arm  { armed }  (set arm state)
+//   POST /api/partition/:machineId/session-request         (record a need)
+//   GET  /api/partition/session-requests                   (extension poll)
+//   POST /api/partition/:machineId/session-envelope        (extension answer)
+//   GET  /api/partition/:machineId/session-envelope        (Viewer take, once)
+//
+// Session auto delivery: the arm flag, pending requests and staged
+// envelopes live in partition-session.ts (state class storage,
+// default OFF). Requests exist only for armed machines; a staged
+// envelope is single use and expires with its share.
 //
 // Catalog-first (doc 23): the Partition lists from the CATALOG ONLY
 // (ruling A). catalog/browse never merges a live Host browse. The legacy
@@ -41,6 +53,10 @@ import type { PartitionStore } from "./partition-store.js";
 import type { PartitionCatalog } from "./partition-catalog.js";
 import type { PartitionSeeder } from "./partition-seeder.js";
 import type { PartitionSeederDriver } from "./partition-seeder-driver.js";
+import {
+  cleanSessionEnvelope,
+  type PartitionSessionStore
+} from "./partition-session.js";
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -80,9 +96,17 @@ export async function partitionRoutes(
     catalog: PartitionCatalog;
     seeder: PartitionSeeder;
     driver: PartitionSeederDriver;
+    sessionStore: PartitionSessionStore;
   }
 ): Promise<void> {
-  const { partitionStore, moverStore, catalog, seeder, driver } = options;
+  const {
+    partitionStore,
+    moverStore,
+    catalog,
+    seeder,
+    driver,
+    sessionStore
+  } = options;
 
   // Host-awake gate (same window the machine list uses). Seeding and the
   // three-state vocabulary turn on this, NOT on any mechanism word.
@@ -343,24 +367,28 @@ export async function partitionRoutes(
     if (!acc) return;
     const machineId = machineParam(request);
     if (!machineId) return reply.code(400).send({ error: "machineId required" });
-    const body = (request.body ?? {}) as { path?: unknown };
+    const body = (request.body ?? {}) as { path?: unknown; express?: unknown };
     const packPath =
       typeof body.path === "string"
         ? body.path.replace(/^\/+|\/+$/g, "")
         : "";
     if (!packPath) return reply.code(400).send({ error: "path required" });
+    // Express is the single-file lane: the caller is opening this
+    // file right now, so it goes ahead of every ordinary request.
+    const express = body.express === true;
     const ledger = await partitionStore.listLedger(acc, machineId);
     const result = await seeder.bump(
       acc,
       machineId,
       packPath,
       hostAwake(acc, machineId),
-      ledger
+      ledger,
+      { express }
     );
     if (result.state === "unknown") {
       return reply.code(404).send({ error: "path not in catalog" });
     }
-    return { path: packPath, state: result.state };
+    return { path: packPath, state: result.state, express };
   });
 
   // Manual probe trigger (the Backup door's Check now): arms the
@@ -375,4 +403,168 @@ export async function partitionRoutes(
     const probe = driver.requestProbe(acc, machineId);
     return { machineId, probe };
   });
+
+  // ---- session auto delivery -----------------------------------------
+  // Arm state, session requests and staged envelopes. All account
+  // scoped through the same guard as every route above. The arm
+  // flag defaults OFF; requests are only recorded for armed
+  // machines; a staged envelope is taken exactly once.
+
+  app.get(
+    "/api/partition/:machineId/session-arm",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      return { machineId, armed: await sessionStore.getArm(acc, machineId) };
+    }
+  );
+
+  app.post(
+    "/api/partition/:machineId/session-arm",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const body = (request.body ?? {}) as { armed?: unknown };
+      if (typeof body.armed !== "boolean") {
+        return reply.code(400).send({ error: "armed must be true or false" });
+      }
+      const state = await sessionStore.setArm(acc, machineId, body.armed);
+      return { machineId, armed: state.armed };
+    }
+  );
+
+  // The Viewer records that a pull for this machine needs a
+  // browser session. Unarmed machines are refused by name and
+  // nothing is recorded for them.
+  app.post(
+    "/api/partition/:machineId/session-request",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const result = await sessionStore.requestSession(acc, machineId);
+      if (!result.armed) {
+        return reply
+          .code(409)
+          .send({ error: "machine is not armed", armed: false });
+      }
+      return {
+        machineId,
+        armed: true,
+        pending: true,
+        requestId: result.request.requestId,
+        requestedAt: result.request.requestedAt
+      };
+    }
+  );
+
+  // The extension poll: this account's pending session requests.
+  // The extension authenticates with its pair account ID in the
+  // X-Account-Id header, the standing Relayn account model. Only
+  // armed machines ever appear here.
+  app.get("/api/partition/session-requests", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    const requests = await sessionStore.listRequests(acc);
+    return {
+      requests: requests.map((r) => ({
+        machineId: r.machineId,
+        requestId: r.request.requestId,
+        requestedAt: r.request.requestedAt
+      }))
+    };
+  });
+
+  // The extension answers one pending request with the sealed
+  // share envelope it built. The pending request clears in the
+  // same write, so one request can only be answered once.
+  app.post(
+    "/api/partition/:machineId/session-envelope",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const body = (request.body ?? {}) as {
+        requestId?: unknown;
+        envelope?: unknown;
+      };
+      const requestId =
+        typeof body.requestId === "string" ? body.requestId : "";
+      if (!requestId) {
+        return reply.code(400).send({ error: "requestId required" });
+      }
+      const envelope = cleanSessionEnvelope(body.envelope);
+      if (!envelope) {
+        return reply.code(400).send({ error: "envelope is malformed" });
+      }
+      const result = await sessionStore.stageEnvelope(
+        acc,
+        machineId,
+        requestId,
+        envelope
+      );
+      if (result === "not-armed") {
+        return reply
+          .code(409)
+          .send({ error: "machine is not armed", armed: false });
+      }
+      if (result === "no-request") {
+        return reply
+          .code(404)
+          .send({ error: "no pending session request for this machine" });
+      }
+      if (result === "request-mismatch") {
+        return reply
+          .code(409)
+          .send({ error: "requestId does not match the pending request" });
+      }
+      return { ok: true, machineId, requestId };
+    }
+  );
+
+  // The Viewer takes the staged envelope. Single use: the store
+  // deletes it before answering, so a second take is a 404. An
+  // envelope older than its share lifetime answers 410.
+  app.get(
+    "/api/partition/:machineId/session-envelope",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const result = await sessionStore.takeEnvelope(acc, machineId);
+      if (result === "none") {
+        return reply
+          .code(404)
+          .send({ error: "no staged session for this machine" });
+      }
+      if (result === "not-armed") {
+        return reply
+          .code(409)
+          .send({ error: "machine is not armed", armed: false });
+      }
+      if (result === "expired") {
+        return reply
+          .code(410)
+          .send({ error: "the staged session has expired" });
+      }
+      return {
+        machineId,
+        requestId: result.staged.requestId,
+        stagedAt: new Date(result.staged.stagedAt).toISOString(),
+        envelope: result.staged.envelope
+      };
+    }
+  );
 }

@@ -38,6 +38,11 @@
 //   POST /mover/console/api/machines/:id/anchor-deliver  queue a SIGNED anchor-deliver
 //   GET  /mover/console/api/anchor-ledger                anchor deed ledger
 //
+// The ADMIN tab also carries a Host log view: per machine, a
+// control queues a host-log command through the operator channel
+// (POST /api/headless/commands) and the page renders the log the
+// machine sends back, read through GET /api/headless/commands/:id.
+//
 // The files-fetch payload carries concrete files only, exactly like
 // start: the console expands ticked folders through "paths", shows
 // the exact list in a confirmation step, and only then is the signed
@@ -1120,6 +1125,22 @@ compiled in, nothing else to carry or place beside it.</p>
     <div id="adminMachineList"><p class="meta">Not loaded yet.</p></div>
   </div>
   <div class="card">
+    <h3>Host log</h3>
+    <p>The latest lines from a machine's Host log, for the account in section 1 of the MOVER tab. Pick a machine, then view its log. Refresh asks that machine for a fresh copy.</p>
+    <div class="row">
+      <label>Machine
+        <select id="hostLogMachine"></select>
+      </label>
+    </div>
+    <p>
+      <button type="button" id="hostLogLoadMachines" class="ghost">Load machines</button>
+      <button type="button" id="hostLogView">View Host log</button>
+      <button type="button" id="hostLogRefresh" class="ghost">Refresh</button>
+    </p>
+    <div id="hostLogNote"><p class="meta">Not loaded yet.</p></div>
+    <pre id="hostLogOut" style="white-space:pre-wrap;word-break:break-word;background:var(--surface2);border:1px solid var(--border);border-radius:10px;padding:0.8rem;font-size:13px;max-height:480px;overflow:auto;display:none"></pre>
+  </div>
+  <div class="card">
     <h3>Files</h3>
     <p>Browse files on a machine for the account in section 1 of the MOVER tab. Tick the exact files to fetch, then review the list. Check this list, then confirm. Nothing moves until you confirm.</p>
     <p>Upload runs from the Viewer app only. This panel cannot upload.</p>
@@ -1544,11 +1565,11 @@ compiled in, nothing else to carry or place beside it.</p>
     if (m.os) bits.push(m.os);
     return bits.join(" · ");
   }
-  document.getElementById("loadMachines").addEventListener("click", async function () {
-    say("");
+  async function loadMoverMachines(quiet) {
+    if (quiet !== true) say("");
     var res = await apiGet("/mover/console/api/machines?accountId=" + encodeURIComponent(accountId()));
     var data = await res.json().catch(function () { return {}; });
-    if (!res.ok) { say("Could not load machines: " + (data.message || data.error || res.status)); return; }
+    if (!res.ok) { if (quiet !== true) say("Could not load machines: " + (data.message || data.error || res.status)); return; }
     var list = document.getElementById("machineList");
     while (list.firstChild) list.removeChild(list.firstChild);
     var machines = data.machines || [];
@@ -1682,7 +1703,8 @@ compiled in, nothing else to carry or place beside it.</p>
       }
       list.appendChild(div);
     });
-  });
+  }
+  document.getElementById("loadMachines").addEventListener("click", function () { loadMoverMachines(); });
 
   // ---------------- Anchor deeds (update + deliver) ----------------
   var anchorPending = null;
@@ -1833,6 +1855,7 @@ compiled in, nothing else to carry or place beside it.</p>
       });
       document.getElementById("tab-" + btn.getAttribute("data-tab")).classList.add("active");
       if (btn.getAttribute("data-tab") === "overview") loadOverview();
+      if (btn.getAttribute("data-tab") === "mover" || btn.getAttribute("data-tab") === "admin") refreshActiveConsoleTab();
     });
   });
 
@@ -2037,7 +2060,7 @@ compiled in, nothing else to carry or place beside it.</p>
   loadExtDefaults();
 
   // ---------------- Overview + EXT activity ----------------
-  async function loadOverview() {
+  async function loadOverview(quiet) {
     try {
       var res = await apiGet("/mover/console/api/overview");
       var data = await res.json().catch(function () { return {}; });
@@ -2057,7 +2080,7 @@ compiled in, nothing else to carry or place beside it.</p>
       document.getElementById("ovPayloads").textContent = (data.ext && data.ext.livePayloads) || 0;
       renderExtActivity(data.ext || {});
     } catch (e) {
-      say("Could not load the overview: " + e.message);
+      if (quiet !== true) say("Could not load the overview: " + e.message);
     }
   }
   function renderExtActivity(ext) {
@@ -2085,8 +2108,8 @@ compiled in, nothing else to carry or place beside it.</p>
   document.getElementById("refreshOverview").addEventListener("click", loadOverview);
 
   // ---------------- Cloud moves ----------------
-  document.getElementById("loadMoves").addEventListener("click", async function () {
-    say("");
+  async function loadCloudMoves(quiet) {
+    if (quiet !== true) say("");
     var el = document.getElementById("cloudMoves");
     try {
       var res = await apiGet("/mover/console/api/moves");
@@ -2107,9 +2130,10 @@ compiled in, nothing else to carry or place beside it.</p>
       html += "</table>";
       el.innerHTML = html;
     } catch (e) {
-      el.innerHTML = '<p class="meta">Could not load cloud moves: ' + esc(e.message) + "</p>";
+      if (quiet !== true) el.innerHTML = '<p class="meta">Could not load cloud moves: ' + esc(e.message) + "</p>";
     }
-  });
+  }
+  document.getElementById("loadMoves").addEventListener("click", function () { loadCloudMoves(); });
 
   // ---------------- Admin downloads ----------------
   function adminOptions() {
@@ -2158,12 +2182,12 @@ compiled in, nothing else to carry or place beside it.</p>
     html += "</div>";
     return html;
   }
-  document.getElementById("loadAdminMachines").addEventListener("click", async function () {
-    say("");
+  async function loadAdminMachines(quiet) {
+    if (quiet !== true) say("");
     var el = document.getElementById("adminMachineList");
     var res = await apiGet("/mover/console/api/machines?accountId=" + encodeURIComponent(accountId()));
     var data = await res.json().catch(function () { return {}; });
-    if (!res.ok) { say("Could not load machines: " + (data.message || data.error || res.status)); return; }
+    if (!res.ok) { if (quiet !== true) say("Could not load machines: " + (data.message || data.error || res.status)); return; }
     var machines = data.machines || [];
     if (machines.length === 0) {
       el.innerHTML = '<p class="meta">No machines enrolled for this account yet.</p>';
@@ -2262,7 +2286,122 @@ compiled in, nothing else to carry or place beside it.</p>
         filesBtn.addEventListener("click", function () { showFilesFor(m.machineId); });
         slot.appendChild(filesBtn);
       }
+      if (m.online) {
+        var hostLogBtn = document.createElement("button");
+        hostLogBtn.type = "button";
+        hostLogBtn.className = "small";
+        hostLogBtn.style.marginLeft = "0.5rem";
+        hostLogBtn.textContent = "Host log";
+        hostLogBtn.addEventListener("click", function () { showHostLogFor(m.machineId); });
+        slot.appendChild(hostLogBtn);
+      }
     });
+  }
+  document.getElementById("loadAdminMachines").addEventListener("click", function () { loadAdminMachines(); });
+
+  // ---------------- Admin Host log ----------------
+  // Per machine: ask the machine for its Host log, wait for its
+  // answer, and show the latest lines it sends back. Refresh runs
+  // the same request again for the machine on show, so the page
+  // always carries a fresh copy.
+  var hostLogPreselect = "";
+  var hostLogCurrent = "";
+  async function loadHostLogMachines() {
+    var sel = document.getElementById("hostLogMachine");
+    try {
+      var res = await apiGet("/mover/console/api/machines?accountId=" + encodeURIComponent(accountId()));
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+      while (sel.firstChild) sel.removeChild(sel.firstChild);
+      var machines = data.machines || [];
+      if (machines.length === 0) {
+        var opt = document.createElement("option");
+        opt.value = "";
+        opt.textContent = "No machines enrolled for this account yet";
+        sel.appendChild(opt);
+        return;
+      }
+      machines.forEach(function (m) {
+        var opt = document.createElement("option");
+        opt.value = m.machineId;
+        opt.textContent = (m.name || m.machineId) + (m.online ? "" : " (offline)");
+        sel.appendChild(opt);
+      });
+      if (hostLogPreselect && machines.some(function (m) { return m.machineId === hostLogPreselect; })) {
+        sel.value = hostLogPreselect;
+        hostLogPreselect = "";
+      }
+    } catch (e) {
+      say("Could not load machines for the Host log: " + e.message);
+    }
+  }
+  document.getElementById("hostLogLoadMachines").addEventListener("click", loadHostLogMachines);
+  async function pollHostLogResult(commandId) {
+    for (var i = 0; i < 100; i++) {
+      var res = await fetch(
+        "/api/headless/commands/" + encodeURIComponent(commandId) +
+        "?key=" + encodeURIComponent(key),
+        { headers: { "X-Account-Id": accountId() } }
+      );
+      if (res.ok) {
+        var data = await res.json();
+        if (data.status === "done") return data.result;
+      }
+      await new Promise(function (r) { setTimeout(r, 1200); });
+    }
+    throw new Error("Timed out waiting for the machine to answer.");
+  }
+  async function loadHostLog(machineId) {
+    var note = document.getElementById("hostLogNote");
+    var out = document.getElementById("hostLogOut");
+    if (!machineId) {
+      note.innerHTML = '<p class="meta">Pick a machine first. Load machines, pick one, then view its log.</p>';
+      return;
+    }
+    hostLogCurrent = machineId;
+    note.innerHTML = '<p class="meta">Asking the machine for its Host log. It answers shortly, this can take a few seconds.</p>';
+    try {
+      var res = await fetch("/api/headless/commands", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Account-Id": accountId(),
+          "X-Machine-Id": machineId
+        },
+        body: JSON.stringify({ type: "host-log", payload: {} })
+      });
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
+      if (!data.commandId) throw new Error("The server did not return a request to follow.");
+      var result = await pollHostLogResult(data.commandId);
+      if (result && result.error) throw new Error(result.error);
+      var logText = result && typeof result.log === "string" ? result.log : "";
+      var lines = result && typeof result.lines === "number" ? result.lines : null;
+      if (!logText) {
+        out.style.display = "none";
+        out.textContent = "";
+        note.innerHTML = '<p class="meta">This machine sent back an empty Host log.</p>';
+        return;
+      }
+      out.textContent = logText;
+      out.style.display = "block";
+      note.innerHTML = '<p class="meta">Host log for ' + esc(machineId) +
+        (lines !== null ? ", " + esc(lines) + (lines === 1 ? " line" : " lines") : "") +
+        ". Refresh asks for a fresh copy.</p>";
+    } catch (e) {
+      note.innerHTML = '<p class="meta">Could not load the Host log: ' + esc(e.message) + "</p>";
+    }
+  }
+  async function showHostLogFor(machineId) {
+    hostLogPreselect = machineId;
+    await loadHostLogMachines();
+    await loadHostLog(machineId);
+  }
+  document.getElementById("hostLogView").addEventListener("click", function () {
+    loadHostLog(document.getElementById("hostLogMachine").value);
+  });
+  document.getElementById("hostLogRefresh").addEventListener("click", function () {
+    loadHostLog(hostLogCurrent || document.getElementById("hostLogMachine").value);
   });
 
   // ---------------- Admin Files panel ----------------
@@ -2506,7 +2645,7 @@ compiled in, nothing else to carry or place beside it.</p>
     pendingFilesFetch = null;
     loadFilesLedger();
   });
-  async function loadFilesLedger() {
+  async function loadFilesLedger(quiet) {
     var el = document.getElementById("filesLedger");
     try {
       var res = await apiGet("/mover/console/api/files-ledger");
@@ -2527,11 +2666,11 @@ compiled in, nothing else to carry or place beside it.</p>
       html += "</table>";
       el.innerHTML = html;
     } catch (e) {
-      el.innerHTML = '<p class="meta">Could not load the ledger: ' + esc(e.message) + "</p>";
+      if (quiet !== true) el.innerHTML = '<p class="meta">Could not load the ledger: ' + esc(e.message) + "</p>";
     }
   }
   document.getElementById("filesLedgerRefresh").addEventListener("click", loadFilesLedger);
-  async function loadAnchorLedger() {
+  async function loadAnchorLedger(quiet) {
     var el = document.getElementById("anchorLedger");
     try {
       var res = await apiGet("/mover/console/api/anchor-ledger");
@@ -2554,13 +2693,94 @@ compiled in, nothing else to carry or place beside it.</p>
       html += "</table>";
       el.innerHTML = html;
     } catch (e) {
-      el.innerHTML = '<p class="meta">Could not load the ledger: ' + esc(e.message) + "</p>";
+      if (quiet !== true) el.innerHTML = '<p class="meta">Could not load the ledger: ' + esc(e.message) + "</p>";
     }
   }
   document.getElementById("anchorLedgerRefresh").addEventListener("click", loadAnchorLedger);
 
+  // ---------------- Console listening ----------------
+  // The console lists keep themselves current while their tab
+  // is showing: a poll on the named interval below re-fetches
+  // the lists for the tab on screen only, and never a tab that
+  // is not showing. When the page itself is hidden the poll
+  // pauses, and it resumes with a fresh fetch when the page is
+  // seen again. A refresh paints the lists in place: the page
+  // does not reload, the scroll position stays where it was,
+  // and the machines picked in the Admin tab selects are kept.
+  // Work in progress is left alone: the MOVER browse tree and
+  // its ticked selection, a pending start, fetch or anchor
+  // confirmation, and the Host log view are never repainted by
+  // a poll, and a control inside the MOVER machines list keeps
+  // its focus and its chosen value.
+  var CONSOLE_LISTEN_MS = 15000;
+  var consoleListenTimer = null;
+  var consoleListenBusy = false;
+  function activeConsoleTab() {
+    var btn = document.querySelector(".tabbtn.active");
+    return btn ? btn.getAttribute("data-tab") : "overview";
+  }
+  function consoleMoverListBusy() {
+    var ae = document.activeElement;
+    if (!ae) return false;
+    var list = document.getElementById("machineList");
+    return !!(list && list.contains(ae));
+  }
+  async function refreshActiveConsoleTab() {
+    if (document.hidden) return;
+    if (consoleListenBusy) return;
+    var tab = activeConsoleTab();
+    if (tab !== "overview" && tab !== "mover" && tab !== "admin") return;
+    consoleListenBusy = true;
+    var sx = window.scrollX, sy = window.scrollY;
+    var hostSel = document.getElementById("hostLogMachine");
+    var hostVal = hostSel ? hostSel.value : "";
+    var filesSel = document.getElementById("filesMachine");
+    var filesVal = filesSel ? filesSel.value : "";
+    try {
+      if (tab === "overview") {
+        await loadOverview(true);
+      } else if (tab === "mover") {
+        await refreshLicenses();
+        if (!consoleMoverListBusy()) await loadMoverMachines(true);
+        await loadCloudMoves(true);
+      } else if (tab === "admin") {
+        await refreshLicenses();
+        await loadAdminMachines(true);
+        await loadFilesLedger(true);
+        await loadAnchorLedger(true);
+      }
+    } catch (e) {
+      // A failed refresh leaves the lists already on screen as
+      // they are; the next interval tries again.
+    }
+    if (hostSel && hostVal) {
+      for (var i = 0; i < hostSel.options.length; i++) {
+        if (hostSel.options[i].value === hostVal) { hostSel.value = hostVal; break; }
+      }
+    }
+    if (filesSel && filesVal) {
+      for (var j = 0; j < filesSel.options.length; j++) {
+        if (filesSel.options[j].value === filesVal) { filesSel.value = filesVal; break; }
+      }
+    }
+    if (window.scrollX !== sx || window.scrollY !== sy) window.scrollTo(sx, sy);
+    consoleListenBusy = false;
+  }
+  function startConsoleListener() {
+    stopConsoleListener();
+    consoleListenTimer = setInterval(function () { refreshActiveConsoleTab(); }, CONSOLE_LISTEN_MS);
+  }
+  function stopConsoleListener() {
+    if (consoleListenTimer) { clearInterval(consoleListenTimer); consoleListenTimer = null; }
+  }
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) stopConsoleListener();
+    else { refreshActiveConsoleTab(); startConsoleListener(); }
+  });
+
   refreshLicenses();
   loadOverview();
+  startConsoleListener();
 </script>
 </body>
 </html>`;

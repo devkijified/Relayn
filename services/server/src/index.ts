@@ -33,6 +33,7 @@ import { moverRoutes } from "./mover-routes.js";
 import { MoverStore } from "./mover-store.js";
 import { PartitionCatalog } from "./partition-catalog.js";
 import { partitionRoutes } from "./partition-routes.js";
+import { PartitionSessionStore } from "./partition-session.js";
 import { PartitionSeeder } from "./partition-seeder.js";
 import { PartitionSeederDriver } from "./partition-seeder-driver.js";
 import { PartitionStore } from "./partition-store.js";
@@ -72,6 +73,10 @@ const partitionStore = new PartitionStore(
   moverStore.docs,
   partitionCatalog
 );
+// Session auto delivery: the per machine arm flag, pending session
+// requests and staged envelopes (state class, under _partition/,
+// never swept). Default OFF; see partition-session.ts.
+const partitionSessionStore = new PartitionSessionStore(moverStore.docs);
 // The seeder driver executes the seeder plan from the server
 // (seed while the Host is awake, confirm from landed moves,
 // probe for new files on a slow cadence), so background sync
@@ -128,7 +133,8 @@ await app.register(partitionRoutes, {
   moverStore,
   catalog: partitionCatalog,
   seeder: partitionSeeder,
-  driver: partitionSeederDriver
+  driver: partitionSeederDriver,
+  sessionStore: partitionSessionStore
 });
 
 // Relayn Mover headless track: machines with no signed-in user
@@ -176,6 +182,7 @@ const shutdown = async (signal: string) => {
   moverStore.shutdown();
   partitionStore.shutdown();
   partitionCatalog.shutdown();
+  partitionSessionStore.shutdown();
   partitionSeeder.shutdown();
   partitionSeederDriver.shutdown();
   await app.close();

@@ -358,6 +358,9 @@ function __relnaynLog(text) {
 
 // Partition Chrome-staging: when the Viewer opens the import-ui page inside
 // the Partition Chrome, wire Confirm to the background import action.
+// Session auto delivery: for a machine the admin has armed, the Viewer
+// marks this page with autoImport and the same import runs on its own,
+// with no click. Unarmed machines get the Confirm flow only, unchanged.
 (function __relaynPartitionImportHook() {
     try {
         if (!/\/api\/partition\/chrome\/import-ui/.test(location.pathname)) return;
@@ -367,16 +370,20 @@ function __relnaynLog(text) {
         const btn = document.getElementById("ptImportConfirm");
         const status = document.getElementById("ptImportStatus");
         if (!btn) return;
-        btn.addEventListener("click", () => {
+        let started = false;
+        function runImport() {
+            if (started) return;
+            started = true;
             if (status) {
                 status.classList.remove("err");
                 status.textContent = "Importing cookie jar...";
             }
             chrome.runtime.sendMessage(
-                { action: "importPartitionSession", data: { machineId, viewerBase } },
+                { kind: "action", action: "importPartitionSession", data: { machineId, viewerBase } },
                 (res) => {
                     const err = chrome.runtime.lastError;
                     if (err) {
+                        started = false;
                         if (status) {
                             status.classList.add("err");
                             status.textContent = err.message || String(err);
@@ -384,6 +391,7 @@ function __relnaynLog(text) {
                         return;
                     }
                     if (!res || res.ok === false) {
+                        started = false;
                         if (status) {
                             status.classList.add("err");
                             status.textContent =
@@ -403,7 +411,11 @@ function __relnaynLog(text) {
                     }
                 }
             );
-        });
+        }
+        btn.addEventListener("click", runImport);
+        if (boot.autoImport === true && boot.hasSession === true) {
+            runImport();
+        }
     } catch (_) {
         /* ignore */
     }

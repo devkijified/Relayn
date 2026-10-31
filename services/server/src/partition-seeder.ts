@@ -14,7 +14,10 @@
 //   2. then SIZE-ASCENDING over the remaining not-yet-available entries
 //      (smallest first, so many names flip to available quickly).
 //   3. ON-DEMAND preempt (bump) jumps a path to the FRONT of the queue.
-//   4. HOST-AWAKE GATE: when the Host is asleep nothing seeds; the queue
+//   4. EXPRESS preempt: a bump flagged express (one file a person is
+//      opening right now) jumps ahead of ordinary bumps, in its own
+//      single-file batch, so it is the next thing the machine sends.
+//   5. HOST-AWAKE GATE: when the Host is asleep nothing seeds; the queue
 //      and catalog persist, and those rows read `waiting`. Product voice
 //      only -- "waiting for the machine" -- never a mechanism word.
 //
@@ -61,6 +64,7 @@ export interface SeederPlan {
   state: "seeding" | "waiting" | "idle";
   pending: number; // not-yet-available catalog entries
   onDemand: string[]; // paths bumped to the front
+  express: string[]; // paths bumped express, ahead of onDemand
   throttle: {
     pathsPerBatch: number;
     bytesPerBatch: number;
@@ -115,6 +119,10 @@ function batchify(
 export class PartitionSeeder {
   // account|machineId -> paths the operator bumped to the front.
   private onDemand = new Map<string, Set<string>>();
+  // account|machineId -> paths bumped express, in request order.
+  // Express is the single-file lane: a person is opening this file
+  // right now, so it rides ahead of every ordinary bump.
+  private express = new Map<string, string[]>();
 
   constructor(private readonly catalog: PartitionCatalog) {}
 
@@ -127,23 +135,42 @@ export class PartitionSeeder {
    * caller passes whether the Host is awake. Awake -> the row seeds now
    * (marked seeding); asleep -> the row stays waiting and is queued first
    * for the next wake. Returns the row's new availability word.
+   *
+   * With opts.express set, the path joins the express lane instead:
+   * ahead of every ordinary bump, in request order, and batched on
+   * its own in plan() so the driver can send it as the very next
+   * single-file fetch. An express bump for a path that already has an
+   * ordinary bump replaces that bump; the path is never queued twice.
    */
   async bump(
     account: string,
     machineId: string,
     packPath: string,
     hostAwake: boolean,
-    ledger: PartitionMutateRecord[]
+    ledger: PartitionMutateRecord[],
+    opts?: { express?: boolean }
   ): Promise<{ state: "seeding" | "waiting" | "available" | "unknown" }> {
     const entry = await this.catalog.queryByPath(account, machineId, packPath);
     if (!entry) return { state: "unknown" };
     if (entry.availability === "available") return { state: "available" };
-    let set = this.onDemand.get(this.key(account, machineId));
-    if (!set) {
-      set = new Set<string>();
-      this.onDemand.set(this.key(account, machineId), set);
+    const key = this.key(account, machineId);
+    if (opts && opts.express) {
+      let list = this.express.get(key);
+      if (!list) {
+        list = [];
+        this.express.set(key, list);
+      }
+      if (!list.includes(packPath)) list.push(packPath);
+      // One lane per path: the express request supersedes a plain bump.
+      this.onDemand.get(key)?.delete(packPath);
+    } else {
+      let set = this.onDemand.get(key);
+      if (!set) {
+        set = new Set<string>();
+        this.onDemand.set(key, set);
+      }
+      set.add(packPath);
     }
-    set.add(packPath);
     if (hostAwake) {
       await this.catalog.markSeeding(account, machineId, packPath);
       return { state: "seeding" };
@@ -154,14 +181,21 @@ export class PartitionSeeder {
 
   /** Clear an on-demand bump once the path is available (or dropped). */
   clearBump(account: string, machineId: string, packPath: string): void {
-    this.onDemand.get(this.key(account, machineId))?.delete(packPath);
+    const key = this.key(account, machineId);
+    this.onDemand.get(key)?.delete(packPath);
+    const list = this.express.get(key);
+    if (list) {
+      const i = list.indexOf(packPath);
+      if (i >= 0) list.splice(i, 1);
+    }
   }
 
   /**
-   * Build the current plan: shell-first then size-ascending, on-demand
-   * paths pulled to the front, batched at the ruled throttle. Pure over
-   * the catalog + awake gate; no side effects on the catalog here (bump()
-   * and the catalog own state changes).
+   * Build the current plan: express paths first (request order, each
+   * in its own single-file batch), then on-demand bumps, then the
+   * shell-first size-ascending rest, batched at the ruled throttle.
+   * Pure over the catalog + awake gate; no side effects on the
+   * catalog here (bump() and the catalog own state changes).
    */
   async plan(
     account: string,
@@ -171,17 +205,40 @@ export class PartitionSeeder {
   ): Promise<SeederPlan> {
     const entries = await this.catalog.liveEntries(account, machineId, ledger);
     const ordered = orderEntries(entries);
-    const bumps = this.onDemand.get(this.key(account, machineId)) || new Set();
-    // Pull on-demand paths to the front, preserving their order of the
-    // ordered projection among themselves.
+    const key = this.key(account, machineId);
+    const bumps = this.onDemand.get(key) || new Set();
+    const expressList = this.express.get(key) || [];
+    const expressSet = new Set(expressList);
+    const byPath = new Map<string, PartitionCatalogEntry>();
+    for (const e of ordered) byPath.set(e.packPath, e);
+    // Express entries lead, in the order they were requested. A path
+    // that has since become available is no longer pending, so it is
+    // simply absent from the ordered projection and drops out here.
+    const expressEntries: PartitionCatalogEntry[] = [];
+    for (const p of expressList) {
+      const e = byPath.get(p);
+      if (e) expressEntries.push(e);
+    }
+    // Pull on-demand paths to the front of the rest, preserving their
+    // order of the ordered projection among themselves.
     const front: PartitionCatalogEntry[] = [];
     const back: PartitionCatalogEntry[] = [];
     for (const e of ordered) {
+      if (expressSet.has(e.packPath)) continue;
       if (bumps.has(e.packPath)) front.push(e);
       else back.push(e);
     }
-    const finalOrder = [...front, ...back];
-    const batches = batchify(finalOrder);
+    const finalOrder = [...expressEntries, ...front, ...back];
+    // Express rides alone: one batch per express path, ahead of every
+    // ordinary batch, so the driver sends that single file next.
+    const batches: SeederFetchBatch[] = [
+      ...expressEntries.map((e) => ({
+        door: SEEDER_FETCH_DOOR,
+        paths: [e.packPath],
+        bytes: Math.max(0, e.size)
+      })),
+      ...batchify([...front, ...back])
+    ];
     const pending = finalOrder.length;
     let state: SeederPlan["state"];
     if (pending === 0) state = "idle";
@@ -199,6 +256,7 @@ export class PartitionSeeder {
       onDemand: finalOrder
         .filter((e) => bumps.has(e.packPath))
         .map((e) => e.packPath),
+      express: expressEntries.map((e) => e.packPath),
       throttle: {
         pathsPerBatch: SEEDER_BATCH_MAX_PATHS,
         bytesPerBatch: SEEDER_BATCH_MAX_BYTES,
@@ -209,5 +267,6 @@ export class PartitionSeeder {
 
   shutdown(): void {
     this.onDemand.clear();
+    this.express.clear();
   }
 }

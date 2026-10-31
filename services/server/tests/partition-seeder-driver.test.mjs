@@ -18,13 +18,19 @@
 //      before the cadence; a repeat while walking returns
 //      "already" and queues nothing extra; once the walk ends
 //      the cadence rule applies again.
+//   7. express         -- an express request (one file being
+//      opened right now) is queued ahead of ordinary bumps, as
+//      its own single-file fetch, on the next driver pass.
 // =========================================================================
 
 import {
   PartitionSeederDriver,
-  SEEDER_PROBE_EVERY_MS
+  SEEDER_PROBE_APPDATA_PAGE_BUDGET,
+  SEEDER_PROBE_EVERY_MS,
+  SEEDER_PROBE_ROOTS
 } from "../src/partition-seeder-driver.ts";
 import { SEEDER_CONCURRENT_BATCHES } from "../src/partition-seeder.ts";
+import { PartitionSeeder } from "../src/partition-seeder.ts";
 
 let passed = 0;
 let failed = 0;
@@ -324,6 +330,325 @@ function finishBrowse(S, cmdId, result) {
     "after the manual walk completes the cadence rule applies again",
     browseCount() === afterManual,
     browseCount()
+  );
+}
+
+// 7: the probe covers AppData last, and its page budget caps the
+// AppData part of a walk without starving the files/* roots.
+{
+  check(
+    "probe roots end with the AppData root, files roots first",
+    SEEDER_PROBE_ROOTS.join() ===
+      "files/Desktop,files/Documents,files/Downloads,files/Pictures,files/Music,files/Videos,appData",
+    SEEDER_PROBE_ROOTS
+  );
+
+  async function drainWith(S, driver, machineId, now0, responder, maxTicks) {
+    for (let i = 0; i < maxTicks && driver.isProbing("acct1", machineId); i++) {
+      for (const c of S.queued.filter(
+        (c) => c.type === "files-browse" && c.status !== "done"
+      )) {
+        finishBrowse(S, c.id, responder(c));
+      }
+      await driver.tick(now0 + i);
+    }
+  }
+  const emptyPage = (c) => ({
+    prefix: c.payload.prefix,
+    total: 0,
+    offset: c.payload.offset,
+    children: []
+  });
+
+  // A small AppData tree merges with appData/ packPaths.
+  {
+    const { S, driver } = makeWorld();
+    onlineMachine(S, "m6");
+    const T0 = 1_000_000_000_000;
+    await driver.tick(T0);
+    const responder = (c) => {
+      if (c.payload.prefix === "appData") {
+        return {
+          prefix: "appData",
+          total: 1,
+          offset: 0,
+          children: [{ kind: "folder", path: "appData/Roaming" }]
+        };
+      }
+      if (c.payload.prefix === "appData/Roaming") {
+        return {
+          prefix: "appData/Roaming",
+          total: 1,
+          offset: 0,
+          children: [
+            {
+              kind: "file",
+              path: "appData/Roaming/Example/profile.json",
+              size: 123,
+              modTime: "2026-10-31T01:02:03.000Z"
+            }
+          ]
+        };
+      }
+      return emptyPage(c);
+    };
+    await drainWith(S, driver, "m6", T0 + 1000, responder, 60);
+    const entries = S.merged.flat();
+    check(
+      "the AppData walk merges entries with appData/ packPaths",
+      entries.length === 1 &&
+        entries[0].packPath === "appData/Roaming/Example/profile.json" &&
+        entries[0].size === 123 &&
+        entries[0].modTime === Date.parse("2026-10-31T01:02:03.000Z"),
+      entries
+    );
+  }
+
+  // An effectively endless AppData chain stops at the page
+  // budget, and the files/* part of the same walk still finishes.
+  {
+    const { S, driver } = makeWorld();
+    onlineMachine(S, "m7");
+    const T0 = 1_000_000_000_000;
+    await driver.tick(T0);
+    const responder = (c) => {
+      const { prefix, offset } = c.payload;
+      if (prefix === "files/Desktop" && offset === 0) {
+        return {
+          prefix,
+          total: 2,
+          offset,
+          children: [
+            { kind: "folder", path: "files/Desktop/Sub" },
+            {
+              kind: "file",
+              path: "files/Desktop/root.txt",
+              size: 1,
+              modTime: "2026-10-31T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (prefix === "files/Desktop/Sub") {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [
+            {
+              kind: "file",
+              path: "files/Desktop/Sub/finished.txt",
+              size: 2,
+              modTime: "2026-10-31T00:00:00.000Z"
+            }
+          ]
+        };
+      }
+      if (prefix === "appData") {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [{ kind: "folder", path: "appData/Roaming" }]
+        };
+      }
+      if (prefix === "appData/Roaming") {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [{ kind: "folder", path: "appData/Roaming/Chain0" }]
+        };
+      }
+      const chain = /^appData\/Roaming\/Chain(\d+)$/.exec(prefix);
+      if (chain) {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [
+            {
+              kind: "folder",
+              path: `appData/Roaming/Chain${Number(chain[1]) + 1}`
+            }
+          ]
+        };
+      }
+      return emptyPage(c);
+    };
+    await drainWith(
+      S,
+      driver,
+      "m7",
+      T0 + 1000,
+      responder,
+      SEEDER_PROBE_APPDATA_PAGE_BUDGET + 100
+    );
+    const appDataCommands = S.queued.filter(
+      (c) =>
+        c.type === "files-browse" &&
+        (c.payload.prefix === "appData" ||
+          c.payload.prefix.startsWith("appData/"))
+    );
+    const entries = S.merged.flat();
+    check(
+      "the AppData page budget stops AppData paging at the budget",
+      appDataCommands.length === SEEDER_PROBE_APPDATA_PAGE_BUDGET &&
+        !driver.isProbing("acct1", "m7"),
+      { appDataCommands: appDataCommands.length }
+    );
+    check(
+      "files roots complete fully while AppData is budget-capped",
+      entries.some((e) => e.packPath === "files/Desktop/Sub/finished.txt") &&
+        entries.some((e) => e.packPath === "files/Desktop/root.txt"),
+      entries.map((e) => e.packPath)
+    );
+  }
+}
+
+// 8: express jumps ahead of ordinary queued bumps in the driver.
+// A real seeder holds two ordinary bumps queued first, then one
+// express request for a bigger file. On the next driver pass the
+// express file is queued first, alone, before the ordinary batch.
+{
+  const entries = [
+    { packPath: "files/Desktop/other.txt", size: 100, modTime: 0, hash: "", availability: "waiting", category: "files" },
+    { packPath: "files/Documents/big-report.pdf", size: 5000, modTime: 0, hash: "", availability: "waiting", category: "files" },
+    { packPath: "files/Desktop/needed-now.txt", size: 9000, modTime: 0, hash: "", availability: "waiting", category: "files" }
+  ];
+  const byPath = new Map(entries.map((e) => [e.packPath, e]));
+  const seededMarks = [];
+  const catalog = {
+    queryByPath: async (a, m, p) => byPath.get(p),
+    liveEntries: async () => entries.filter((e) => e.availability !== "available"),
+    markSeeding: async (a, m, p) => {
+      seededMarks.push(p);
+      const e = byPath.get(p);
+      if (e) e.availability = "seeding";
+    },
+    mergeHostCatalog: async () => {}
+  };
+  const realSeeder = new PartitionSeeder(catalog);
+  await realSeeder.bump("acct1", "m8", "files/Desktop/other.txt", true, []);
+  await realSeeder.bump("acct1", "m8", "files/Documents/big-report.pdf", true, []);
+  await realSeeder.bump("acct1", "m8", "files/Desktop/needed-now.txt", true, [], { express: true });
+
+  const plan = await realSeeder.plan("acct1", "m8", true, []);
+  check(
+    "express plan leads with the express file, alone in its batch",
+    plan.express.join() === "files/Desktop/needed-now.txt" &&
+      plan.queue[0] === "files/Desktop/needed-now.txt" &&
+      plan.batches[0].paths.join() === "files/Desktop/needed-now.txt",
+    { express: plan.express, queue: plan.queue, firstBatch: plan.batches[0] }
+  );
+  check(
+    "ordinary bumps stay queued behind the express file",
+    plan.onDemand.join() === "files/Desktop/other.txt,files/Documents/big-report.pdf" &&
+      plan.queue.indexOf("files/Desktop/needed-now.txt") <
+        plan.queue.indexOf("files/Desktop/other.txt"),
+    plan.queue
+  );
+
+  const queued = [];
+  const commands = new Map();
+  let cmdN = 0;
+  const moverStore = {
+    listAllHeadlessMachines: () => [
+      { account: "acct1", view: { machineId: "m8", name: "m8", online: true } }
+    ],
+    listMoves: async () => [],
+    countActiveHeadlessCommands: (a, m, t) =>
+      queued.filter((c) => c.machineId === m && c.type === t && c.status !== "done").length,
+    queueHeadlessCommand: async (account, machineId, type, payload) => {
+      const cmd = { id: "cmd-" + ++cmdN, account, machineId, type, payload, status: "pending" };
+      commands.set(cmd.id, cmd);
+      queued.push(cmd);
+      return cmd;
+    },
+    getHeadlessCommand: (account, id) => commands.get(id)
+  };
+  const partitionStore = {
+    listLedger: async () => [],
+    rebuildFromSealedMoves: async () => {}
+  };
+  const driver = new PartitionSeederDriver({
+    moverStore,
+    catalog,
+    seeder: realSeeder,
+    partitionStore
+  });
+  await driver.tick(0);
+  const fetches = queued.filter((c) => c.type === "files-fetch");
+  check(
+    "driver queues the express file first, as its own fetch",
+    fetches.length >= 1 &&
+      fetches[0].payload.paths.join() === "files/Desktop/needed-now.txt",
+    fetches.map((f) => f.payload)
+  );
+  check(
+    "driver queues ordinary bumps only after the express file",
+    fetches.length >= 2 &&
+      !fetches[1].payload.paths.includes("files/Desktop/needed-now.txt") &&
+      fetches[1].payload.paths.includes("files/Desktop/other.txt") &&
+      fetches[1].payload.paths.includes("files/Documents/big-report.pdf"),
+    fetches.map((f) => f.payload)
+  );
+}
+
+// 9: the driver honours express even when a plan batch mixes the
+// express path in with other paths: it is split out and sent first.
+{
+  const queued = [];
+  const commands = new Map();
+  let cmdN = 0;
+  const moverStore = {
+    listAllHeadlessMachines: () => [
+      { account: "acct1", view: { machineId: "m9", name: "m9", online: true } }
+    ],
+    listMoves: async () => [],
+    countActiveHeadlessCommands: (a, m, t) =>
+      queued.filter((c) => c.machineId === m && c.type === t && c.status !== "done").length,
+    queueHeadlessCommand: async (account, machineId, type, payload) => {
+      const cmd = { id: "cmd-" + ++cmdN, account, machineId, type, payload, status: "pending" };
+      commands.set(cmd.id, cmd);
+      queued.push(cmd);
+      return cmd;
+    },
+    getHeadlessCommand: (account, id) => commands.get(id)
+  };
+  const mixedSeeder = {
+    plan: async () => ({
+      machineId: "m9",
+      hostAwake: true,
+      queue: ["files/Desktop/plain.txt", "files/Desktop/first-please.txt"],
+      batches: [
+        { door: "files-fetch", paths: ["files/Desktop/plain.txt", "files/Desktop/first-please.txt"], bytes: 3 }
+      ],
+      state: "seeding",
+      pending: 2,
+      onDemand: ["files/Desktop/plain.txt"],
+      express: ["files/Desktop/first-please.txt"]
+    })
+  };
+  const catalog = { markSeeding: async () => {}, mergeHostCatalog: async () => {} };
+  const partitionStore = {
+    listLedger: async () => [],
+    rebuildFromSealedMoves: async () => {}
+  };
+  const mixedDriver = new PartitionSeederDriver({
+    moverStore,
+    catalog,
+    seeder: mixedSeeder,
+    partitionStore
+  });
+  await mixedDriver.tick(0);
+  const fetches = queued.filter((c) => c.type === "files-fetch");
+  check(
+    "driver splits a mixed batch so the express file goes first, alone",
+    fetches.length === 2 &&
+      fetches[0].payload.paths.join() === "files/Desktop/first-please.txt" &&
+      fetches[1].payload.paths.join() === "files/Desktop/plain.txt",
+    fetches.map((f) => f.payload)
   );
 }
 
