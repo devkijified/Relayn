@@ -790,6 +790,44 @@ export class MoverStore {
       .map(headlessMachineView);
   }
 
+  /** Every enrolled headless machine across all accounts.
+   * Server background drivers (the seeder driver) iterate this;
+   * operator surfaces stay account-scoped. */
+  listAllHeadlessMachines(): Array<{
+    account: string;
+    view: HeadlessMachineView;
+  }> {
+    const out: Array<{ account: string; view: HeadlessMachineView }> = [];
+    for (const [account, byId] of this.headlessMachines) {
+      for (const rec of byId.values()) {
+        out.push({ account, view: headlessMachineView(rec) });
+      }
+    }
+    return out;
+  }
+
+  /** Commands of one type still in flight for a machine
+   * (queued or delivered, not yet resulted). Background
+   * drivers use this to respect their concurrency room. */
+  countActiveHeadlessCommands(
+    account: string,
+    machineId: string,
+    type: string
+  ): number {
+    let n = 0;
+    for (const cmd of this.headlessCommands.values()) {
+      if (
+        cmd.account === account &&
+        cmd.machineId === machineId &&
+        cmd.type === type &&
+        cmd.status !== "done"
+      ) {
+        n++;
+      }
+    }
+    return n;
+  }
+
   /** Heartbeat: always refreshes lastSeen; fields update when present. */
   async heartbeatHeadless(
     account: string,

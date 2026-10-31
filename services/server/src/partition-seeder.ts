@@ -18,8 +18,11 @@
 //      and catalog persist, and those rows read `waiting`. Product voice
 //      only -- "waiting for the machine" -- never a mechanism word.
 //
-// THROTTLE (ruled starting shape): 20 paths / ~32 MiB per batch, 1
-// concurrent batch per machine.
+// THROTTLE: 48 paths / ~32 MiB per batch, 3 concurrent batches
+// per machine. (Ruled starting shape was 20 / 1; raised
+// 2026-10-31 for the backup product, where background seeding
+// speed is the product. The seeder driver enforces the
+// concurrency room against commands actually in flight.)
 //
 // FENCES (absolute, guard-tested): the seeder queues the signed
 // `files-fetch` door ONLY. It never queues files-push and never any
@@ -34,9 +37,9 @@ import type {
 import { isShellPath } from "./partition-catalog.js";
 import type { PartitionMutateRecord } from "./partition-store.js";
 
-export const SEEDER_BATCH_MAX_PATHS = 20;
+export const SEEDER_BATCH_MAX_PATHS = 48;
 export const SEEDER_BATCH_MAX_BYTES = 32 * 1024 * 1024; // ~32 MiB
-export const SEEDER_CONCURRENT_BATCHES = 1;
+export const SEEDER_CONCURRENT_BATCHES = 3;
 
 // The one door the seeder is ever allowed to queue. Guard-pinned: any
 // other door (files-push, desk-*) is a bug, not a config.

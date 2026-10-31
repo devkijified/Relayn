@@ -17,6 +17,7 @@
 //   POST /api/partition/:machineId/catalog/refresh         (merge revision)
 //   GET  /api/partition/:machineId/seeder                  (server-held plan)
 //   POST /api/partition/:machineId/seeder/bump { path }    (on-demand)
+//   POST /api/partition/:machineId/probe                   (manual Check now)
 //
 // Catalog-first (doc 23): the Partition lists from the CATALOG ONLY
 // (ruling A). catalog/browse never merges a live Host browse. The legacy
@@ -39,6 +40,7 @@ import {
 import type { PartitionStore } from "./partition-store.js";
 import type { PartitionCatalog } from "./partition-catalog.js";
 import type { PartitionSeeder } from "./partition-seeder.js";
+import type { PartitionSeederDriver } from "./partition-seeder-driver.js";
 
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
 
@@ -77,9 +79,10 @@ export async function partitionRoutes(
     moverStore: MoverStore;
     catalog: PartitionCatalog;
     seeder: PartitionSeeder;
+    driver: PartitionSeederDriver;
   }
 ): Promise<void> {
-  const { partitionStore, moverStore, catalog, seeder } = options;
+  const { partitionStore, moverStore, catalog, seeder, driver } = options;
 
   // Host-awake gate (same window the machine list uses). Seeding and the
   // three-state vocabulary turn on this, NOT on any mechanism word.
@@ -358,5 +361,18 @@ export async function partitionRoutes(
       return reply.code(404).send({ error: "path not in catalog" });
     }
     return { path: packPath, state: result.state };
+  });
+
+  // Manual probe trigger (the Backup door's Check now): arms the
+  // seeder driver's catalog probe for this machine so the next
+  // driver pass walks it, whatever the probe cadence says. The
+  // walk itself still runs inside the driver, on its own fences.
+  app.post("/api/partition/:machineId/probe", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    const machineId = machineParam(request);
+    if (!machineId) return reply.code(400).send({ error: "machineId required" });
+    const probe = driver.requestProbe(acc, machineId);
+    return { machineId, probe };
   });
 }

@@ -9,7 +9,7 @@
 //   3. hash-before-available  -- a piece flips to available ONLY after a
 //      full SHA-256 verifies during seeding (ruling C)
 //   4. expiry-to-waiting with the ledger still winning (ruling F)
-//   5. seeder shape -- shell-first then size-ascending, 20 / ~32 MiB / 1
+//   5. seeder shape -- shell-first then size-ascending, 48 / ~32 MiB / 3
 //      concurrent, Host-awake gate, on-demand preempt, files-fetch ONLY
 // =========================================================================
 
@@ -23,7 +23,8 @@ import {
   PartitionSeeder,
   SEEDER_FETCH_DOOR,
   SEEDER_BATCH_MAX_PATHS,
-  SEEDER_BATCH_MAX_BYTES
+  SEEDER_BATCH_MAX_BYTES,
+  SEEDER_CONCURRENT_BATCHES
 } from "../src/partition-seeder.ts";
 
 let passed = 0;
@@ -270,10 +271,10 @@ async function main() {
 
     const awake = await seeder.plan(ACC, MID, true, []);
     check(
-      "seeder: throttle is 20 paths / ~32 MiB / 1 concurrent",
+      "seeder: throttle is 48 paths / ~32 MiB / 3 concurrent",
       awake.throttle.pathsPerBatch === SEEDER_BATCH_MAX_PATHS &&
         awake.throttle.bytesPerBatch === SEEDER_BATCH_MAX_BYTES &&
-        awake.throttle.concurrentBatches === 1,
+        awake.throttle.concurrentBatches === SEEDER_CONCURRENT_BATCHES,
       JSON.stringify(awake.throttle)
     );
     check(

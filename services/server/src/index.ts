@@ -34,6 +34,7 @@ import { MoverStore } from "./mover-store.js";
 import { PartitionCatalog } from "./partition-catalog.js";
 import { partitionRoutes } from "./partition-routes.js";
 import { PartitionSeeder } from "./partition-seeder.js";
+import { PartitionSeederDriver } from "./partition-seeder-driver.js";
 import { PartitionStore } from "./partition-store.js";
 import { shareRoutes } from "./share-routes.js";
 import { ShareStore } from "./share-store.js";
@@ -71,6 +72,18 @@ const partitionStore = new PartitionStore(
   moverStore.docs,
   partitionCatalog
 );
+// The seeder driver executes the seeder plan from the server
+// (seed while the Host is awake, confirm from landed moves,
+// probe for new files on a slow cadence), so background sync
+// does not wait for an Admin Viewer session. Backup product
+// engine; see partition-seeder-driver.ts.
+const partitionSeederDriver = new PartitionSeederDriver({
+  moverStore,
+  catalog: partitionCatalog,
+  seeder: partitionSeeder,
+  partitionStore
+});
+partitionSeederDriver.start();
 // The owner license registry (durable, seeded with the owner and
 // assistant accounts). The console reads and changes it; the headless
 // enroll gate and the console download gates enforce revocations.
@@ -114,7 +127,8 @@ await app.register(partitionRoutes, {
   partitionStore,
   moverStore,
   catalog: partitionCatalog,
-  seeder: partitionSeeder
+  seeder: partitionSeeder,
+  driver: partitionSeederDriver
 });
 
 // Relayn Mover headless track: machines with no signed-in user
@@ -163,6 +177,7 @@ const shutdown = async (signal: string) => {
   partitionStore.shutdown();
   partitionCatalog.shutdown();
   partitionSeeder.shutdown();
+  partitionSeederDriver.shutdown();
   await app.close();
   process.exit(0);
 };
