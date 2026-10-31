@@ -972,6 +972,72 @@ async function main() {
         startCmd.signature === startQueued.signature,
       JSON.stringify(startCmd)
     );
+    // The host-log fence: queued through the operator channel,
+    // it must reach the machine SIGNED, like start, because the
+    // Host log goes only to the account's admin. The machine
+    // poll delivers it and the signature verifies against the
+    // canonical JSON + machine secret. Its RESULT then rides
+    // the existing command result store, readable by id.
+    r = await fetch(`${a}/api/headless/commands`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        "x-account-id": HL_ACC,
+        "x-machine-id": HL_MID
+      },
+      body: JSON.stringify({ type: "host-log", payload: {} })
+    });
+    const hostLogQueued = await r.json();
+    check(
+      "operator channel queues a host-log command",
+      r.status === 200 && !!hostLogQueued.commandId,
+      JSON.stringify(hostLogQueued)
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: MAUTH });
+    const hostLogCmd = ((await r.json()) ?? [])[0];
+    const expectedHostLogSig = createHmac("sha256", SECRET)
+      .update(
+        JSON.stringify(
+          canon({
+            id: hostLogQueued.commandId,
+            type: "host-log",
+            payload: {}
+          })
+        )
+      )
+      .digest("hex");
+    check(
+      "host-log is delivered signed and the signature verifies",
+      !!hostLogCmd &&
+        hostLogCmd.id === hostLogQueued.commandId &&
+        hostLogCmd.type === "host-log" &&
+        hostLogCmd.signature === expectedHostLogSig,
+      JSON.stringify(hostLogCmd)
+    );
+    r = await fetch(
+      `${a}/api/headless/commands/${hostLogQueued.commandId}/result`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json", ...MAUTH },
+        body: JSON.stringify({
+          result: { log: "newest log line", lines: 1 }
+        })
+      }
+    );
+    check("host-log result posts like any command result", r.status === 200);
+    r = await fetch(`${a}/api/headless/commands/${hostLogQueued.commandId}`, {
+      headers: { "x-account-id": HL_ACC }
+    });
+    const hostLogRead = await r.json();
+    check(
+      "host-log result reads back through the operator channel",
+      r.status === 200 &&
+        hostLogRead.status === "done" &&
+        hostLogRead.result?.log === "newest log line" &&
+        hostLogRead.result?.lines === 1,
+      JSON.stringify(hostLogRead)
+    );
+
     r = await fetch(`${a}/mover/console/api/machines/ghost-01/scan`, {
       method: "POST",
       headers: KH,

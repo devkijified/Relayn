@@ -25,8 +25,8 @@
 //   POST  /api/headless/commands                 queue a command (X-Machine-Id
 //                                                names the target; "start",
 //                                                "desk-end", "view-end",
-//                                                "files-fetch" and
-//                                                "files-push" are signed
+//                                                "host-log", "files-fetch"
+//                                                and "files-push" are signed
 //                                                by the store at queue time)
 //   GET   /api/headless/commands/:id             one command's state + result
 //
@@ -55,6 +55,10 @@
 //   viewprobe    { paint }                        (signed; the view helper's
 //                                                  birth twin, measurement
 //                                                  only; result: { log })
+//   host-log     { lines? }                       (signed; the tail of the
+//                                                  machine's own host.log,
+//                                                  read only on the machine;
+//                                                  result: { log, lines })
 //   anchor-update  { stamp }                      (signed; the Host anchor
 //                                                  renews itself to the named
 //                                                  build, fetched from
@@ -260,8 +264,8 @@ export async function headlessRoutes(
   // this is how the console and the RelaynAdminViewer app drive
   // machines. It can list the account's machines, queue a command
   // for one (the store signs "start", "desk-end", "view-end",
-  // "viewprobe", "files-fetch" and "files-push" with the machine's secret
-  // server-side, so those commands exist only
+  // "viewprobe", "host-log", "files-fetch" and "files-push" with the
+  // machine's secret server-side, so those commands exist only
   // because an operator queued them here), and read a command
   // back. The machine channel above deliberately has NO enqueue
   // route: a machine can poll and post results, never command
