@@ -1348,9 +1348,21 @@ compiled in, nothing else to carry or place beside it.</p>
   wireColor("brandColorPick", "brandColor");
   wireColor("brandSuccessBgPick", "brandSuccessBg");
   wireColor("brandSuccessPick", "brandSuccess");
+  // An account ID is 8 to 64 URL-safe characters, the server's
+  // own rule. The section 1 pair display starts life holding the
+  // placeholder text "(none yet)", and reading that text as an
+  // account ID used to send it to the server, which refused it
+  // with a raw validation message (owner hit exactly this on the
+  // Issue builds card, 2026-10-31). Anything not shaped like an
+  // account ID is no account at all.
+  function isAccountId(v) {
+    return /^[A-Za-z0-9_-]{8,64}$/.test(v || "");
+  }
   function accountId() {
     var typed = document.getElementById("accountIdInput").value.trim();
-    return typed || document.getElementById("accountId").textContent;
+    if (typed) return isAccountId(typed) ? typed : "";
+    var shown = document.getElementById("accountId").textContent.trim();
+    return isAccountId(shown) ? shown : "";
   }
   function options() {
     return {
@@ -2092,7 +2104,7 @@ compiled in, nothing else to carry or place beside it.</p>
     try { return accountId(); } catch (e) { return ""; }
   }
   function selectEstate(acct) {
-    selectedEstate = acct || "";
+    selectedEstate = isAccountId(acct) ? acct : "";
     renderIssueAccounts("admin");
     updateBuildsCard();
     var card = document.getElementById("issueBuildsCard");
@@ -2546,7 +2558,13 @@ compiled in, nothing else to carry or place beside it.</p>
     var licEl = document.getElementById("issueLicLine");
     var btn = document.getElementById("issueBuildBtn");
     if (!licEl) return;
-    if (!knownLicenses || !acct) {
+    if (!acct) {
+      licEl.style.display = "";
+      licEl.textContent = "No set picked yet. Press Issue builds on the set you want in the Licences card above, then this card issues for it.";
+      if (btn) btn.disabled = true;
+      return;
+    }
+    if (!knownLicenses) {
       licEl.style.display = "none";
       if (btn) btn.disabled = false;
       return;
@@ -2616,6 +2634,10 @@ compiled in, nothing else to carry or place beside it.</p>
   }
   document.getElementById("issueBuildBtn").addEventListener("click", async function () {
     var btn = document.getElementById("issueBuildBtn");
+    if (!effectiveBuildAccount()) {
+      adminDlSay("No set picked yet. Press Issue builds on the set you want in the Licences card above first.");
+      return;
+    }
     var lic = issueLicenseRecord();
     if (lic && lic.status === "revoked") {
       // Refused in the card with the reason, the same refusal

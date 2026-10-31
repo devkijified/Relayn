@@ -465,6 +465,12 @@ async function main() {
         html.includes('id="brandSuccessBg"') &&
         html.includes('id="brandSuccess"')
     );
+    check(
+      "console never sends the section 1 placeholder as an account ID",
+      html.includes("function isAccountId") &&
+        html.includes("No set picked yet. Press Issue builds on the set you want") &&
+        !html.includes('return typed || document.getElementById("accountId").textContent;')
+    );
     const selectBlock = (id) => {
       const i = html.indexOf(`id="${id}"`);
       return i < 0 ? "" : html.slice(i, html.indexOf("</select>", i));
