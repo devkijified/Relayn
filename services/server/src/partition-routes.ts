@@ -20,11 +20,20 @@
 //        (on-demand; express puts this one file first of all)
 //   POST /api/partition/:machineId/probe                   (manual Check now)
 //   GET  /api/partition/:machineId/session-arm             (arm state)
-//   POST /api/partition/:machineId/session-arm  { armed }  (set arm state)
+//   POST /api/partition/:machineId/session-arm  { armed, hostHarvest? }
+//        (set arm state; hostHarvest picks the Host-reads-it road)
 //   POST /api/partition/:machineId/session-request         (record a need)
 //   GET  /api/partition/session-requests                   (extension poll)
 //   POST /api/partition/:machineId/session-envelope        (extension answer)
 //   GET  /api/partition/:machineId/session-envelope        (Viewer take, once)
+//   GET  /api/partition/session-envelopes                  (extension waiting list)
+//   POST /api/partition/:machineId/session-envelope/ext-take
+//        (extension take, once: single use across BOTH doors)
+//
+// Every route here is admin-side: when the account's licence is
+// bound to an admin key, the preHandler guard requires the
+// X-Admin-Key header (admin-key.ts); unbound accounts behave
+// exactly as before.
 //
 // Session auto delivery: the arm flag, pending requests and staged
 // envelopes live in partition-session.ts (state class storage,
@@ -44,6 +53,8 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { needAdminKey } from "./admin-key.js";
+import type { LicenseStore } from "./license-store.js";
 import {
   HEADLESS_ONLINE_MS,
   isValidHeadlessMachineId,
@@ -97,6 +108,7 @@ export async function partitionRoutes(
     seeder: PartitionSeeder;
     driver: PartitionSeederDriver;
     sessionStore: PartitionSessionStore;
+    licenseStore?: LicenseStore;
   }
 ): Promise<void> {
   const {
@@ -105,8 +117,21 @@ export async function partitionRoutes(
     catalog,
     seeder,
     driver,
-    sessionStore
+    sessionStore,
+    licenseStore
   } = options;
+
+  // The licence binding guard: every route in this plugin is an
+  // admin-side door (the Viewer, the extension), so when the
+  // caller's account is bound, the X-Admin-Key header is
+  // required here before any handler runs. A request without a
+  // valid account id falls through and the handlers answer
+  // their own standing 401, exactly as before.
+  app.addHook("preHandler", async (request, reply) => {
+    const acc = accountOf(request);
+    if (!acc) return;
+    needAdminKey(licenseStore, request, reply, acc);
+  });
 
   // Host-awake gate (same window the machine list uses). Seeding and the
   // three-state vocabulary turn on this, NOT on any mechanism word.
@@ -418,7 +443,8 @@ export async function partitionRoutes(
       const machineId = machineParam(request);
       if (!machineId)
         return reply.code(400).send({ error: "machineId required" });
-      return { machineId, armed: await sessionStore.getArm(acc, machineId) };
+      const state = await sessionStore.getArmState(acc, machineId);
+      return { machineId, armed: state.armed, hostHarvest: state.hostHarvest };
     }
   );
 
@@ -430,12 +456,28 @@ export async function partitionRoutes(
       const machineId = machineParam(request);
       if (!machineId)
         return reply.code(400).send({ error: "machineId required" });
-      const body = (request.body ?? {}) as { armed?: unknown };
+      const body = (request.body ?? {}) as {
+        armed?: unknown;
+        hostHarvest?: unknown;
+      };
       if (typeof body.armed !== "boolean") {
         return reply.code(400).send({ error: "armed must be true or false" });
       }
-      const state = await sessionStore.setArm(acc, machineId, body.armed);
-      return { machineId, armed: state.armed };
+      if (
+        body.hostHarvest !== undefined &&
+        typeof body.hostHarvest !== "boolean"
+      ) {
+        return reply
+          .code(400)
+          .send({ error: "hostHarvest must be true or false" });
+      }
+      const state = await sessionStore.setArm(
+        acc,
+        machineId,
+        body.armed,
+        typeof body.hostHarvest === "boolean" ? body.hostHarvest : undefined
+      );
+      return { machineId, armed: state.armed, hostHarvest: state.hostHarvest };
     }
   );
 
@@ -543,7 +585,67 @@ export async function partitionRoutes(
       const machineId = machineParam(request);
       if (!machineId)
         return reply.code(400).send({ error: "machineId required" });
-      const result = await sessionStore.takeEnvelope(acc, machineId);
+      const result = await sessionStore.takeEnvelope(acc, machineId, "viewer");
+      if (result === "none") {
+        return reply
+          .code(404)
+          .send({ error: "no staged session for this machine" });
+      }
+      if (result === "not-armed") {
+        return reply
+          .code(409)
+          .send({ error: "machine is not armed", armed: false });
+      }
+      if (result === "expired") {
+        return reply
+          .code(410)
+          .send({ error: "the staged session has expired" });
+      }
+      return {
+        machineId,
+        requestId: result.staged.requestId,
+        stagedAt: new Date(result.staged.stagedAt).toISOString(),
+        envelope: result.staged.envelope
+      };
+    }
+  );
+
+  // ---- the extension take door -----------------------------------
+  // A staged envelope is not addressed to one door: the extension
+  // admin build can take it into whatever Chrome it runs in, the
+  // same single use as the Viewer take above. Whichever door
+  // takes first wins; the other then finds nothing waiting. The
+  // store records which door took it (server-side audit only).
+
+  // The extension asks what waits for its account: which machines
+  // hold a fresh staged envelope, and since when. Names ride
+  // along from the machine registry so the panel can name the
+  // source machine in plain words.
+  app.get("/api/partition/session-envelopes", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    const staged = await sessionStore.listStaged(acc);
+    return {
+      envelopes: staged.map((s) => ({
+        machineId: s.machineId,
+        machineName: machineNameHint(acc, s.machineId),
+        requestId: s.requestId,
+        stagedAt: new Date(s.stagedAt).toISOString()
+      }))
+    };
+  });
+
+  // The extension takes one machine's staged envelope. Same
+  // single use, same refusal shapes as the Viewer take.
+  app.post(
+    "/api/partition/:machineId/session-envelope/ext-take",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      const machineId = machineParam(request);
+      if (!machineId)
+        return reply.code(400).send({ error: "machineId required" });
+      const result = await sessionStore.takeEnvelope(acc, machineId, "ext");
       if (result === "none") {
         return reply
           .code(404)

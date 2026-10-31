@@ -29,6 +29,25 @@
 //                                                and "files-push" are signed
 //                                                by the store at queue time)
 //   GET   /api/headless/commands/:id             one command's state + result
+//   POST  /api/headless/anchor-update            the Update Host deed
+//                                                (X-Machine-Id names the
+//                                                target; the deed's rules
+//                                                are shared with the
+//                                                console's anchor route
+//                                                through queueAnchorUpdate)
+//   POST  /api/headless/machines/:id/retire      the Dump a Host deed
+//                                                (sets retiredAt once;
+//                                                the machine's own calls
+//                                                then answer 403
+//                                                MACHINE_RETIRED and its
+//                                                identity can never
+//                                                enroll again)
+//
+// The operator channel above is admin-side: when the account's
+// licence is bound to an admin key, every operator route here
+// also requires the X-Admin-Key header (admin-key.ts). Unbound
+// accounts behave exactly as before. The machine channel is
+// never key-gated: machine secrets bind that side.
 //
 // The machine channel has no enqueue route by design: a machine
 // can never command itself, so it can never end its own
@@ -87,10 +106,12 @@
 
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 
+import { needAdminKey } from "./admin-key.js";
 import type { LicenseStore } from "./license-store.js";
 import {
   buildRoleExe,
   productForRole,
+  queueAnchorUpdate,
   type MoverRole
 } from "./mover-console.js";
 import {
@@ -101,6 +122,10 @@ import {
 
 // Pre-shared account ID, same rule as the mover routes.
 const ACCOUNT_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/** The plain refusal a dumped machine's own calls answer with. */
+export const MACHINE_RETIRED_MESSAGE =
+  "This machine was removed by its admin, so it no longer has access. Its identity cannot be used again.";
 
 // Scan summaries, browse pages and result payloads can be sizeable;
 // allow far more than the app-level default (chunk uploads keep
@@ -168,6 +193,30 @@ export async function headlessRoutes(
     return { acc, machine };
   }
 
+  /**
+   * The retirement fence on the machine channel: once a machine
+   * is dumped, its heartbeat, command poll and result posts all
+   * answer 403 MACHINE_RETIRED. Checked only after needMachine
+   * has verified the secret, so the code is revealed solely to
+   * the machine that owns the identity. The engine stands itself
+   * down on this code, and on no other.
+   */
+  function needLiveMachine(
+    request: FastifyRequest,
+    reply: FastifyReply
+  ): { acc: string; machine: HeadlessMachineRecord } | undefined {
+    const found = needMachine(request, reply);
+    if (!found) return undefined;
+    if (found.machine.retiredAt) {
+      reply.code(403).send({
+        error: "MACHINE_RETIRED",
+        message: MACHINE_RETIRED_MESSAGE
+      });
+      return undefined;
+    }
+    return found;
+  }
+
   // ------------------------------------------------------------------
   // Enroll: account header only. Returns the per-machine secret once;
   // re-enrolling the same machineId mints a fresh secret and drops
@@ -179,6 +228,21 @@ export async function headlessRoutes(
     async (request, reply) => {
       const acc = needAccount(request, reply);
       if (!acc) return;
+      // Retirement fence, before anything is issued or refreshed:
+      // an enrollment carrying a dumped machine's identity is
+      // refused outright. The identity is burned; the machine can
+      // only ever come back under a fresh enrollment identity.
+      const wantedId = (request.body as { machineId?: unknown } | null)
+        ?.machineId;
+      if (typeof wantedId === "string") {
+        const existing = moverStore.getHeadlessMachine(acc, wantedId);
+        if (existing && existing.retiredAt) {
+          return reply.code(403).send({
+            error: "MACHINE_RETIRED",
+            message: MACHINE_RETIRED_MESSAGE
+          });
+        }
+      }
       // License gate: an account with any revoked license cannot
       // enroll new machines. Machines and sessions already running
       // are not touched; only this new enrollment is blocked.
@@ -233,7 +297,7 @@ export async function headlessRoutes(
   // who is signed in at the console right now.
   // ------------------------------------------------------------------
   app.post("/api/headless/heartbeat", async (request, reply) => {
-    const found = needMachine(request, reply);
+    const found = needLiveMachine(request, reply);
     if (!found) return;
     const body = (request.body ?? {}) as {
       state?: unknown;
@@ -274,6 +338,7 @@ export async function headlessRoutes(
   app.get("/api/headless/machines", async (request, reply) => {
     const acc = needAccount(request, reply);
     if (!acc) return;
+    if (!needAdminKey(licenseStore, request, reply, acc)) return;
     return { machines: moverStore.listHeadlessMachines(acc) };
   });
 
@@ -283,6 +348,7 @@ export async function headlessRoutes(
     async (request, reply) => {
       const acc = needAccount(request, reply);
       if (!acc) return;
+      if (!needAdminKey(licenseStore, request, reply, acc)) return;
       const machineId = request.headers["x-machine-id"];
       if (typeof machineId !== "string" || !machineId) {
         return reply
@@ -316,9 +382,71 @@ export async function headlessRoutes(
     }
   );
 
+  // ----- operator door: the Update Host deed (Admin Viewer) ----
+  // The same deed the console offers, behind the Viewer's
+  // standing credentials (the account header; the machine header
+  // names the target). Every rule, the exact served stamp, the
+  // license gate and the machine's existence, is the shared
+  // queueAnchorUpdate in mover-console.ts, so this door and the
+  // console can never drift apart.
+  app.post("/api/headless/anchor-update", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return reply;
+    if (!needAdminKey(licenseStore, request, reply, acc)) return reply;
+    const machineId = request.headers["x-machine-id"];
+    if (typeof machineId !== "string" || machineId.length === 0) {
+      return reply.code(400).send({ error: "X-Machine-Id header required" });
+    }
+    const body = (request.body ?? {}) as { stamp?: unknown };
+    const stamp = typeof body.stamp === "string" ? body.stamp : "";
+    const out = await queueAnchorUpdate(
+      moverStore,
+      licenseStore,
+      acc,
+      machineId,
+      stamp
+    );
+    if (!out.ok) {
+      return reply
+        .code(out.status)
+        .send({ error: out.error, message: out.message });
+    }
+    return { commandId: out.cmd.id };
+  });
+
+  // ----- operator door: Dump a Host (the retire deed) --------
+  // The final admin deed: the machine's record is stamped
+  // retired, it leaves every admin-facing list, its own calls
+  // answer MACHINE_RETIRED from here on, and its identity can
+  // never enroll again. Account header auth like every operator
+  // route, and a bound account's admin key is required too: a
+  // dumped machine is an admin deed, so it passes the same
+  // binding guard as the rest of this channel.
+  app.post(
+    "/api/headless/machines/:machineId/retire",
+    async (request, reply) => {
+      const acc = needAccount(request, reply);
+      if (!acc) return;
+      if (!needAdminKey(licenseStore, request, reply, acc)) return;
+      const params = request.params as { machineId: string };
+      const machineId = String(params.machineId || "");
+      const rec = isValidHeadlessMachineId(machineId)
+        ? await moverStore.retireHeadlessMachine(acc, machineId)
+        : undefined;
+      if (!rec) {
+        return reply.code(404).send({
+          error: "MACHINE_NOT_FOUND",
+          message: "No such machine for this account."
+        });
+      }
+      return { machineId: rec.machineId, retiredAt: rec.retiredAt };
+    }
+  );
+
   app.get("/api/headless/commands/:id", async (request, reply) => {
     const acc = needAccount(request, reply);
     if (!acc) return;
+    if (!needAdminKey(licenseStore, request, reply, acc)) return;
     const params = request.params as { id: string };
     const cmd = moverStore.getHeadlessCommand(acc, String(params.id || ""));
     if (!cmd) {
@@ -347,7 +475,7 @@ export async function headlessRoutes(
   // both shapes, and the test suite pins this route to the array.
   // ------------------------------------------------------------------
   app.get("/api/headless/commands", async (request, reply) => {
-    const found = needMachine(request, reply);
+    const found = needLiveMachine(request, reply);
     if (!found) return;
     return await moverStore.takeHeadlessCommands(found.acc, found.machine.machineId);
   });
@@ -364,7 +492,7 @@ export async function headlessRoutes(
     "/api/headless/commands/:id/result",
     { bodyLimit: HEADLESS_BODY_LIMIT },
     async (request, reply) => {
-      const found = needMachine(request, reply);
+      const found = needLiveMachine(request, reply);
       if (!found) return;
       const params = request.params as { id: string };
       const body = request.body as Record<string, unknown> | null;
@@ -421,7 +549,11 @@ export async function headlessRoutes(
           "This account's license for that product is revoked, so its builds cannot be downloaded. Restore the license in the console to allow downloads again."
       });
     }
-    const built = await buildRoleExe(role as MoverRole, found.acc);
+    const built = await buildRoleExe(
+      role as MoverRole,
+      found.acc,
+      licenseStore ? licenseStore.boundAdminKey(found.acc) : ""
+    );
     if (!built.ok) {
       return reply
         .code(built.status)

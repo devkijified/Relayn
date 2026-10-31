@@ -134,7 +134,8 @@ await app.register(partitionRoutes, {
   catalog: partitionCatalog,
   seeder: partitionSeeder,
   driver: partitionSeederDriver,
-  sessionStore: partitionSessionStore
+  sessionStore: partitionSessionStore,
+  licenseStore
 });
 
 // Relayn Mover headless track: machines with no signed-in user

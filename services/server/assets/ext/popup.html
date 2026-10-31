@@ -162,6 +162,19 @@
     </div>
   </div>
 
+  <!-- WAITING SIGN-INS: a machine's staged session, takeable here.
+       Admin builds only, and the section stays quiet (hidden)
+       while nothing waits. One press takes the sign-ins and
+       imports them into this Chrome. -->
+  <div id="stagedSection" class="hidden">
+    <div class="divider">waiting sign-ins</div>
+    <div class="card">
+      <div class="hint" style="margin-top:0">Sign-ins a machine sent for its Access Computer can land in this Chrome instead. Taking them here uses them up: the other door then finds nothing waiting.</div>
+      <div class="site-list" id="stagedList"></div>
+      <div class="error hidden" id="stagedError"></div>
+    </div>
+  </div>
+
   <!-- Server address — hidden from users by default. Enable with
        "features": { "serverCard": true } in config.json. -->
   <div class="card hidden" id="serverCard" style="margin-top:12px">

@@ -2225,6 +2225,100 @@ async function main() {
       r.status === 200,
       `got ${r.status}`
     );
+    // The Admin Viewer's own door for the same deed:
+    // POST /api/headless/anchor-update with the account and
+    // machine headers the Viewer already carries. The rules are
+    // the console door's because both call queueAnchorUpdate;
+    // these checks pin this door so the two cannot drift.
+    const viewerAnchor = async (
+      stamp,
+      machineId = AMID,
+      accountId = ANCHOR_ACC
+    ) => {
+      const res = await fetch(`${d}/api/headless/anchor-update`, {
+        method: "POST",
+        headers: {
+          "x-account-id": accountId,
+          "x-machine-id": machineId,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ stamp })
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    const op1 = await viewerAnchor(SERVED_STAMP);
+    check(
+      "viewer anchor-update with the served stamp queues and names the command",
+      op1.status === 200 &&
+        typeof op1.data.commandId === "string" &&
+        op1.data.commandId.length > 0,
+      JSON.stringify(op1)
+    );
+    // The machine's own poll is the wire proof: the command
+    // arrives signed, for the served stamp. (The poll clears
+    // the queue, which the next check relies on.)
+    r = await fetch(`${d}/api/headless/commands`, { headers: AAUTH });
+    const opWire = await r.json().catch(() => []);
+    const op1Cmd = (Array.isArray(opWire) ? opWire : []).find(
+      (c) => c.id === op1.data.commandId
+    );
+    check(
+      "the viewer-queued command reaches the machine as a signed anchor-update for the served stamp",
+      !!op1Cmd &&
+        op1Cmd.type === "anchor-update" &&
+        op1Cmd.payload?.stamp === SERVED_STAMP &&
+        /^[0-9a-f]{64}$/.test(op1Cmd.signature ?? ""),
+      JSON.stringify(opWire).slice(0, 300)
+    );
+    // A wrong stamp queues nothing: with the queue just
+    // drained, the machine's next poll carries no anchor-update
+    // at all.
+    const opBad = await viewerAnchor("202601010000");
+    check(
+      "viewer anchor-update with a wrong stamp -> 400 STAMP_MISMATCH naming the served build",
+      opBad.status === 400 &&
+        opBad.data.error === "STAMP_MISMATCH" &&
+        String(opBad.data.message ?? "").includes(SERVED_STAMP),
+      JSON.stringify(opBad)
+    );
+    r = await fetch(`${d}/api/headless/commands`, { headers: AAUTH });
+    const opPending = await r.json().catch(() => []);
+    const opUpdates = (Array.isArray(opPending) ? opPending : []).filter(
+      (c) => c.type === "anchor-update"
+    );
+    check(
+      "the wrong-stamp attempt queued nothing (no anchor-update pending after it)",
+      opUpdates.length === 0,
+      JSON.stringify(opPending).slice(0, 300)
+    );
+    check(
+      "viewer anchor-update for an unknown machine -> 404",
+      (await viewerAnchor(SERVED_STAMP, "anchor-ghost-01")).status === 404
+    );
+    r = await fetch(`${d}/api/headless/anchor-update`, {
+      method: "POST",
+      headers: { "x-machine-id": AMID, "content-type": "application/json" },
+      body: JSON.stringify({ stamp: SERVED_STAMP })
+    });
+    check("viewer anchor-update without an account header -> 401", r.status === 401);
+    check(
+      "viewer door gate setup: admin license revoked",
+      (await licD("revoke", "admin")) === 200
+    );
+    const opRevoked = await viewerAnchor(SERVED_STAMP);
+    check(
+      "viewer anchor-update with a revoked license -> 403 LICENSE_REVOKED",
+      opRevoked.status === 403 && opRevoked.data.error === "LICENSE_REVOKED",
+      JSON.stringify(opRevoked)
+    );
+    check(
+      "viewer door gate teardown: admin license restored",
+      (await licD("restore", "admin")) === 200
+    );
+    check(
+      "viewer anchor-update queues again after the restore",
+      (await viewerAnchor(SERVED_STAMP)).status === 200
+    );
 
     // ---- Licenses, unified console, host + viewer builds ---------
     console.log("licenses + unified console");
@@ -2291,26 +2385,50 @@ async function main() {
         extOnly.data.licenses.every((l) => l.product === "ext")
     );
 
-    const issuedFresh = await licApi("POST", "", {
+    // A licence is issued FOR a named account, always. A blank
+    // account (missing, empty, or spaces) used to mint a fresh
+    // random account here, silently creating licences for empty
+    // accounts nobody holds (owner incident, 2026-10-31). It
+    // must refuse with 400 and issue nothing.
+    const extBefore = await licApi("GET", "?product=ext");
+    const extAccountsBefore = (extBefore.data.licenses ?? [])
+      .map((l) => l.accountId)
+      .sort();
+    const blankMissing = await licApi("POST", "", {
       product: "ext",
       label: "Fresh shop",
       note: "issued by the test"
     });
+    const blankEmpty = await licApi("POST", "", {
+      product: "ext",
+      accountId: ""
+    });
+    const blankSpaces = await licApi("POST", "", {
+      product: "ext",
+      accountId: "   "
+    });
     check(
-      "issuing without an account mints an mv account and returns the license",
-      issuedFresh.status === 200 &&
-        /^mv[0-9a-f]{20}$/.test(issuedFresh.data.accountId ?? "") &&
-        issuedFresh.data.product === "ext" &&
-        issuedFresh.data.status === "active" &&
-        issuedFresh.data.label === "Fresh shop",
-      JSON.stringify(issuedFresh.data)
+      "issuing a license without an account refuses 400 ACCOUNT_REQUIRED",
+      blankMissing.status === 400 &&
+        blankMissing.data.error === "ACCOUNT_REQUIRED" &&
+        blankEmpty.status === 400 &&
+        blankEmpty.data.error === "ACCOUNT_REQUIRED" &&
+        blankSpaces.status === 400 &&
+        blankSpaces.data.error === "ACCOUNT_REQUIRED",
+      JSON.stringify([
+        blankMissing.data,
+        blankEmpty.data,
+        blankSpaces.data
+      ])
     );
     const afterIssue = await licApi("GET", "?product=ext");
+    const extAccountsAfter = (afterIssue.data.licenses ?? [])
+      .map((l) => l.accountId)
+      .sort();
     check(
-      "the freshly issued license shows in the list",
-      afterIssue.data.licenses?.some(
-        (l) => l.accountId === issuedFresh.data.accountId
-      )
+      "the refused issues minted no license for any new account",
+      JSON.stringify(extAccountsAfter) === JSON.stringify(extAccountsBefore),
+      JSON.stringify(extAccountsAfter)
     );
     const issuedNamed = await licApi("POST", "", {
       product: "mover",
@@ -4245,6 +4363,509 @@ async function main() {
       totalBytes: size,
       totalFiles: 1
     });
+
+    // ---- licence admin-key binding --------------------------------
+    // The estate fence: a bound account's admin-side routes
+    // require the key baked into its issued builds; unbound
+    // accounts behave exactly as before; the key itself never
+    // appears in any licence read.
+    console.log("licence admin-key binding");
+    const BK_ACC = "bindtest0001";
+    const BK_MID = "bind-pc-01";
+    const enrollA = async (acc, mid) => {
+      const res = await fetch(`${a}/api/headless/enroll`, {
+        method: "POST",
+        headers: { "x-account-id": acc, "content-type": "application/json" },
+        body: JSON.stringify({
+          machineId: mid,
+          name: mid,
+          os: "Windows",
+          profiles: [],
+          capabilities: {}
+        })
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    r = await fetch(`${a}/mover/console/api/licenses`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ product: "admin", accountId: BK_ACC, label: "Bind test" })
+    });
+    check("binding: admin licence issued for the test estate", r.status === 200, `got ${r.status}`);
+    const bkEnroll = await enrollA(BK_ACC, BK_MID);
+    check("binding: machine enrolls on the unbound estate", bkEnroll.status === 200, `got ${bkEnroll.status}`);
+    const BK_SECRET = bkEnroll.data.machineSecret;
+    const bkMachines = (headers) =>
+      fetch(`${a}/api/headless/machines`, { headers: { "x-account-id": BK_ACC, ...headers } });
+    r = await bkMachines({});
+    check("binding: unbound estate machines read needs no key", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/licenses?product=admin`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const bkLicText1 = await r.text();
+    const bkLic1 = JSON.parse(bkLicText1).licenses.find(
+      (l) => l.accountId === BK_ACC && l.product === "admin"
+    );
+    check(
+      "binding: licence read shows adminKeyBound false and carries no key field",
+      !!bkLic1 && bkLic1.adminKeyBound === false && !("adminKey" in bkLic1)
+    );
+    r = await fetch(`${a}/mover/console/api/licenses/rotate-admin-key`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC })
+    });
+    check("binding: rotate before bind refuses 409", r.status === 409, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/licenses/bind-admin-key`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC })
+    });
+    const bkBindBody = await r.json().catch(() => ({}));
+    check(
+      "binding: bind answers bound state only, no key material",
+      r.status === 200 &&
+        bkBindBody.adminKeyBound === true &&
+        !/[0-9a-f]{64}/.test(JSON.stringify(bkBindBody)),
+      JSON.stringify(bkBindBody)
+    );
+    r = await fetch(`${a}/mover/console/api/licenses/bind-admin-key`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC })
+    });
+    check("binding: second bind refuses 409", r.status === 409, `got ${r.status}`);
+    r = await bkMachines({});
+    let bkErr = await r.json().catch(() => ({}));
+    check(
+      "binding: bound estate machines read without key -> 401 ADMIN_KEY_REQUIRED",
+      r.status === 401 && bkErr.error === "ADMIN_KEY_REQUIRED",
+      `got ${r.status} ${JSON.stringify(bkErr)}`
+    );
+    r = await fetch(`${a}/api/headless/commands`, {
+      method: "POST",
+      headers: { "x-account-id": BK_ACC, "x-machine-id": BK_MID, "content-type": "application/json" },
+      body: JSON.stringify({ type: "scan", payload: {} })
+    });
+    bkErr = await r.json().catch(() => ({}));
+    check(
+      "binding: bound estate command queue without key -> 401 ADMIN_KEY_REQUIRED",
+      r.status === 401 && bkErr.error === "ADMIN_KEY_REQUIRED",
+      `got ${r.status}`
+    );
+    r = await bkMachines({ "x-admin-key": "0".repeat(64) });
+    bkErr = await r.json().catch(() => ({}));
+    check(
+      "binding: wrong key -> 401 ADMIN_KEY_MISMATCH",
+      r.status === 401 && bkErr.error === "ADMIN_KEY_MISMATCH",
+      `got ${r.status} ${JSON.stringify(bkErr)}`
+    );
+    // Round trip: the package issued for the bound account
+    // carries a key in its overlay, and that key passes the guard.
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC, role: "viewer" })
+    });
+    const bkPkg = parseOverlay(Buffer.from(await r.arrayBuffer()));
+    const BK_KEY = bkPkg?.cfg?.account?.adminKey ?? "";
+    check(
+      "binding: issued package overlay carries a 64 hex admin key",
+      r.status === 200 && /^[0-9a-f]{64}$/.test(BK_KEY),
+      `key shape ${String(BK_KEY).length}`
+    );
+    r = await bkMachines({ "x-admin-key": BK_KEY });
+    check("binding: the baked key passes the machines guard", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/api/headless/commands`, {
+      method: "POST",
+      headers: {
+        "x-account-id": BK_ACC,
+        "x-machine-id": BK_MID,
+        "x-admin-key": BK_KEY,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ type: "scan", payload: {} })
+    });
+    check("binding: the baked key passes the command queue guard", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/api/partition/session-requests`, {
+      headers: { "x-account-id": BK_ACC }
+    });
+    bkErr = await r.json().catch(() => ({}));
+    check(
+      "binding: EXT session poll without key -> 401 ADMIN_KEY_REQUIRED",
+      r.status === 401 && bkErr.error === "ADMIN_KEY_REQUIRED",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/api/partition/session-requests`, {
+      headers: { "x-account-id": BK_ACC, "x-admin-key": BK_KEY }
+    });
+    check("binding: EXT session poll with the key passes", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/ext/config`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC, role: "admin" })
+    });
+    const bkExtCfg = await r.json().catch(() => ({}));
+    check(
+      "binding: EXT pair config for the bound estate carries the key",
+      r.status === 200 && bkExtCfg.account?.adminKey === BK_KEY,
+      `got ${r.status}`
+    );
+    // Rotation: the old key dies at once, the new key works.
+    r = await fetch(`${a}/mover/console/api/licenses/rotate-admin-key`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC })
+    });
+    check("binding: rotate answers 200", r.status === 200, `got ${r.status}`);
+    r = await bkMachines({ "x-admin-key": BK_KEY });
+    bkErr = await r.json().catch(() => ({}));
+    check(
+      "binding: the old key stops working at once after rotation",
+      r.status === 401 && bkErr.error === "ADMIN_KEY_MISMATCH",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: BK_ACC, role: "viewer" })
+    });
+    const bkPkg2 = parseOverlay(Buffer.from(await r.arrayBuffer()));
+    const BK_KEY2 = bkPkg2?.cfg?.account?.adminKey ?? "";
+    check(
+      "binding: a fresh issue after rotation carries a different key",
+      /^[0-9a-f]{64}$/.test(BK_KEY2) && BK_KEY2 !== BK_KEY
+    );
+    r = await bkMachines({ "x-admin-key": BK_KEY2 });
+    check("binding: the rotated key passes the guard", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/licenses`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const bkLicText2 = await r.text();
+    check(
+      "binding: no licence read ever contains key material",
+      !bkLicText2.includes(BK_KEY) && !bkLicText2.includes(BK_KEY2)
+    );
+    r = await fetch(`${a}/mover/console/api/overview`, {
+      headers: { "x-console-key": CONSOLE_KEY }
+    });
+    const bkOverviewText = await r.text();
+    check(
+      "binding: the overview carries no key material either",
+      !bkOverviewText.includes(BK_KEY) && !bkOverviewText.includes(BK_KEY2)
+    );
+    // Machine channel is never key gated: heartbeat with the
+    // machine secret alone still lands on a bound estate.
+    r = await fetch(`${a}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: {
+        "x-account-id": BK_ACC,
+        "x-machine-id": BK_MID,
+        "x-machine-secret": BK_SECRET,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ state: "idle" })
+    });
+    check("binding: machine heartbeat needs no admin key", r.status === 200, `got ${r.status}`);
+
+    // ---- Dump a Host: the retire deed ------------------------------
+    console.log("dump a host (retire)");
+    const RT_ACC = "retiretest01";
+    const RT_MID = "retire-pc-01";
+    const RT_MID2 = "retire-pc-02";
+    const rt1 = await enrollA(RT_ACC, RT_MID);
+    const rt2 = await enrollA(RT_ACC, RT_MID2);
+    check("retire: both machines enroll", rt1.status === 200 && rt2.status === 200);
+    const RT_SECRET = rt1.data.machineSecret;
+    const rtAuth = {
+      "x-account-id": RT_ACC,
+      "x-machine-id": RT_MID,
+      "x-machine-secret": RT_SECRET,
+      "content-type": "application/json"
+    };
+    r = await fetch(`${a}/api/headless/commands`, {
+      method: "POST",
+      headers: { "x-account-id": RT_ACC, "x-machine-id": RT_MID, "content-type": "application/json" },
+      body: JSON.stringify({ type: "scan", payload: {} })
+    });
+    const rtQueued = await r.json().catch(() => ({}));
+    check("retire: a command queues before the dump", r.status === 200 && !!rtQueued.commandId, `got ${r.status}`);
+    r = await fetch(`${a}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: rtAuth,
+      body: JSON.stringify({ state: "idle" })
+    });
+    check("retire: heartbeat lands before the dump", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/api/headless/machines/${RT_MID}/retire`, {
+      method: "POST",
+      headers: { "x-account-id": RT_ACC, "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const rtDeed = await r.json().catch(() => ({}));
+    check(
+      "retire: the deed stamps retiredAt",
+      r.status === 200 && typeof rtDeed.retiredAt === "string" && rtDeed.retiredAt !== "",
+      JSON.stringify(rtDeed)
+    );
+    r = await fetch(`${a}/api/headless/machines/${RT_MID}/retire`, {
+      method: "POST",
+      headers: { "x-account-id": RT_ACC, "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const rtDeed2 = await r.json().catch(() => ({}));
+    check(
+      "retire: a repeat dump keeps the first stamp",
+      r.status === 200 && rtDeed2.retiredAt === rtDeed.retiredAt,
+      `${rtDeed2.retiredAt} vs ${rtDeed.retiredAt}`
+    );
+    r = await fetch(`${a}/api/headless/machines`, { headers: { "x-account-id": RT_ACC } });
+    const rtList = (await r.json().catch(() => ({}))).machines ?? [];
+    check(
+      "retire: admin lists exclude the dumped machine and keep the other",
+      !rtList.some((m) => m.machineId === RT_MID) && rtList.some((m) => m.machineId === RT_MID2),
+      JSON.stringify(rtList.map((m) => m.machineId))
+    );
+    r = await fetch(`${a}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: rtAuth,
+      body: JSON.stringify({ state: "idle" })
+    });
+    let rtErr = await r.json().catch(() => ({}));
+    check(
+      "retire: the dumped machine's heartbeat answers 403 MACHINE_RETIRED",
+      r.status === 403 && rtErr.error === "MACHINE_RETIRED",
+      `got ${r.status} ${JSON.stringify(rtErr)}`
+    );
+    r = await fetch(`${a}/api/headless/commands`, { headers: rtAuth });
+    rtErr = await r.json().catch(() => ({}));
+    check(
+      "retire: the dumped machine's poll answers 403 MACHINE_RETIRED",
+      r.status === 403 && rtErr.error === "MACHINE_RETIRED",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/api/headless/commands/${rtQueued.commandId}/result`, {
+      method: "POST",
+      headers: rtAuth,
+      body: JSON.stringify({ result: { ok: true } })
+    });
+    rtErr = await r.json().catch(() => ({}));
+    check(
+      "retire: the dumped machine's result post answers 403 MACHINE_RETIRED",
+      r.status === 403 && rtErr.error === "MACHINE_RETIRED",
+      `got ${r.status}`
+    );
+    const rtReEnroll = await enrollA(RT_ACC, RT_MID);
+    check(
+      "retire: enrollment with the burned identity is refused 403 MACHINE_RETIRED",
+      rtReEnroll.status === 403 && rtReEnroll.data.error === "MACHINE_RETIRED",
+      `got ${rtReEnroll.status} ${JSON.stringify(rtReEnroll.data)}`
+    );
+    r = await fetch(`${a}/api/headless/heartbeat`, {
+      method: "POST",
+      headers: {
+        "x-account-id": RT_ACC,
+        "x-machine-id": RT_MID2,
+        "x-machine-secret": rt2.data.machineSecret,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({ state: "idle" })
+    });
+    check("retire: the unretired machine is unaffected", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/machines/${RT_MID2}/retire`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: RT_ACC })
+    });
+    check("retire: the console door dumps too (operator master)", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/machines/machine-nope-99/retire`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: RT_ACC })
+    });
+    check("retire: an unknown machine answers 404", r.status === 404, `got ${r.status}`);
+    // A bound estate's deed passes the admin-key guard too.
+    const RT_MID3 = "retire-pc-03";
+    r = await fetch(`${a}/mover/console/api/licenses`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ product: "admin", accountId: RT_ACC, label: "Retire test" })
+    });
+    r = await fetch(`${a}/mover/console/api/licenses/bind-admin-key`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: RT_ACC })
+    });
+    check("retire: the retire estate binds (setup)", r.status === 200, `got ${r.status}`);
+    r = await fetch(`${a}/mover/console/api/package`, {
+      method: "POST",
+      headers: KH,
+      body: JSON.stringify({ accountId: RT_ACC, role: "viewer" })
+    });
+    const rtPkg = parseOverlay(Buffer.from(await r.arrayBuffer()));
+    const RT_KEY = rtPkg?.cfg?.account?.adminKey ?? "";
+    const rt3 = await enrollA(RT_ACC, RT_MID3);
+    check("retire: a third machine enrolls on the bound estate", rt3.status === 200, `got ${rt3.status}`);
+    r = await fetch(`${a}/api/headless/machines/${RT_MID3}/retire`, {
+      method: "POST",
+      headers: { "x-account-id": RT_ACC, "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    rtErr = await r.json().catch(() => ({}));
+    check(
+      "retire: the deed on a bound estate without the key -> 401 ADMIN_KEY_REQUIRED",
+      r.status === 401 && rtErr.error === "ADMIN_KEY_REQUIRED",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/api/headless/machines/${RT_MID3}/retire`, {
+      method: "POST",
+      headers: { "x-account-id": RT_ACC, "x-admin-key": RT_KEY, "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    check("retire: the deed with the key lands", r.status === 200, `got ${r.status}`);
+
+    // ---- session envelope portability -------------------------------
+    // One staged envelope, two take doors: whichever takes first
+    // wins, the audit names the door, the seal format is the
+    // standing v2 envelope throughout.
+    console.log("session envelope portability");
+    const PT_ACC = "porttest0001";
+    const PT_MID = "port-pc-01";
+    const ptPost = (sub, body, headers = {}) =>
+      fetch(`${a}${sub}`, {
+        method: "POST",
+        headers: { "x-account-id": PT_ACC, "content-type": "application/json", ...headers },
+        body: JSON.stringify(body ?? {})
+      });
+    const ptGet = (sub, headers = {}) =>
+      fetch(`${a}${sub}`, { headers: { "x-account-id": PT_ACC, ...headers } });
+    const mkEnvelope = (idHex) => ({
+      v: 2,
+      server: "https://relayn-server.onrender.com",
+      id: idHex,
+      key: randomBytes(32).toString("base64")
+    });
+    const stageFor = async (env) => {
+      await ptPost(`/api/partition/${PT_MID}/session-request`, {});
+      const reqs = await (await ptGet(`/api/partition/session-requests`)).json();
+      const req = (reqs.requests ?? []).find((x) => x.machineId === PT_MID);
+      const res = await ptPost(`/api/partition/${PT_MID}/session-envelope`, {
+        requestId: req.requestId,
+        envelope: env
+      });
+      return res.status;
+    };
+    r = await ptPost(`/api/partition/${PT_MID}/session-arm`, { armed: true });
+    check("portability: the machine arms (setup)", r.status === 200, `got ${r.status}`);
+    const ptEnv1 = mkEnvelope("a".repeat(32));
+    check("portability: first envelope stages", (await stageFor(ptEnv1)) === 200);
+    r = await ptGet(`/api/partition/session-envelopes`);
+    const ptWaiting = (await r.json().catch(() => ({}))).envelopes ?? [];
+    check(
+      "portability: the EXT waiting list names the machine",
+      r.status === 200 && ptWaiting.some((w) => w.machineId === PT_MID),
+      JSON.stringify(ptWaiting)
+    );
+    r = await ptPost(`/api/partition/${PT_MID}/session-envelope/ext-take`, {});
+    const ptTaken = await r.json().catch(() => ({}));
+    check(
+      "portability: the EXT take returns the staged envelope",
+      r.status === 200 && sameJson(ptTaken.envelope, ptEnv1),
+      `got ${r.status} ${JSON.stringify(ptTaken.envelope ?? {})}`
+    );
+    r = await ptGet(`/api/partition/${PT_MID}/session-envelope`);
+    check(
+      "portability: after the EXT take the Viewer door finds nothing",
+      r.status === 404,
+      `got ${r.status}`
+    );
+    const ptEnv2 = mkEnvelope("b".repeat(32));
+    check("portability: second envelope stages", (await stageFor(ptEnv2)) === 200);
+    r = await ptGet(`/api/partition/${PT_MID}/session-envelope`);
+    const ptTaken2 = await r.json().catch(() => ({}));
+    check(
+      "portability: the Viewer take returns the second envelope",
+      r.status === 200 && sameJson(ptTaken2.envelope, ptEnv2),
+      `got ${r.status}`
+    );
+    r = await ptPost(`/api/partition/${PT_MID}/session-envelope/ext-take`, {});
+    check(
+      "portability: after the Viewer take the EXT door finds nothing",
+      r.status === 404,
+      `got ${r.status}`
+    );
+    const ptDoc = JSON.parse(
+      readFileSync(path.join(dataDir, PT_ACC, "_partition", "session-auto.json"), "utf8")
+    );
+    const ptTakes = ptDoc.machines?.[PT_MID]?.takes ?? [];
+    check(
+      "portability: the audit records which door took each envelope",
+      ptTakes.length === 2 && ptTakes[0].door === "ext" && ptTakes[1].door === "viewer",
+      JSON.stringify(ptTakes)
+    );
+    // Bound behaviour on the new doors matches the session routes.
+    r = await fetch(`${a}/api/partition/session-envelopes`, {
+      headers: { "x-account-id": BK_ACC }
+    });
+    bkErr = await r.json().catch(() => ({}));
+    check(
+      "portability: the waiting list on a bound estate without the key -> 401",
+      r.status === 401 && bkErr.error === "ADMIN_KEY_REQUIRED",
+      `got ${r.status}`
+    );
+    r = await fetch(`${a}/api/partition/session-envelopes`, {
+      headers: { "x-account-id": BK_ACC, "x-admin-key": BK_KEY2 }
+    });
+    check("portability: the waiting list with the key passes", r.status === 200, `got ${r.status}`);
+
+    // ---- Host harvest arm + the signed browser-session order --------
+    console.log("host harvest arm and order");
+    const HV_ACC = "harvtest0001";
+    const HV_MID = "harv-pc-01";
+    r = await fetch(`${a}/api/partition/${HV_MID}/session-arm`, {
+      method: "POST",
+      headers: { "x-account-id": HV_ACC, "content-type": "application/json" },
+      body: JSON.stringify({ armed: true, hostHarvest: true })
+    });
+    const hvArm = await r.json().catch(() => ({}));
+    check(
+      "harvest: the arm state carries the hostHarvest road",
+      r.status === 200 && hvArm.armed === true && hvArm.hostHarvest === true,
+      JSON.stringify(hvArm)
+    );
+    r = await fetch(`${a}/api/partition/${HV_MID}/session-arm`, {
+      headers: { "x-account-id": HV_ACC }
+    });
+    const hvArmRead = await r.json().catch(() => ({}));
+    check(
+      "harvest: the arm read shows the Host road on",
+      hvArmRead.hostHarvest === true,
+      JSON.stringify(hvArmRead)
+    );
+    const hvEnroll = await enrollA(HV_ACC, HV_MID);
+    const HV_SECRET = hvEnroll.data.machineSecret;
+    r = await fetch(`${a}/api/headless/commands`, {
+      method: "POST",
+      headers: { "x-account-id": HV_ACC, "x-machine-id": HV_MID, "content-type": "application/json" },
+      body: JSON.stringify({ type: "browser-session", payload: { requestId: "sr-hv-1" } })
+    });
+    const hvQueued = await r.json().catch(() => ({}));
+    check("harvest: the browser-session order queues", r.status === 200 && !!hvQueued.commandId, `got ${r.status}`);
+    r = await fetch(`${a}/api/headless/commands`, {
+      headers: { "x-account-id": HV_ACC, "x-machine-id": HV_MID, "x-machine-secret": HV_SECRET }
+    });
+    const hvCmd = (((await r.json().catch(() => [])) ?? [])).find(
+      (c) => c.type === "browser-session"
+    );
+    const hvExpectedSig = hvCmd
+      ? createHmac("sha256", HV_SECRET)
+          .update(JSON.stringify(canon({ id: hvCmd.id, type: "browser-session", payload: { requestId: "sr-hv-1" } })))
+          .digest("hex")
+      : "";
+    check(
+      "harvest: the browser-session order reaches the machine signed",
+      !!hvCmd && hvCmd.signature === hvExpectedSig,
+      JSON.stringify(hvCmd ?? {})
+    );
 
     // ---- S1: write one of each kind against the stub. ----
     const S1 = 4426;

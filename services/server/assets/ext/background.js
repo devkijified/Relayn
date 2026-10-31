@@ -44,7 +44,7 @@ const DEFAULT_BRAND = {
     },
     server: { url: "https://relayn-server.onrender.com" },
     features: { share: true, scan: true, serverCard: false, inbox: false, localStorage: true, history: true, indexedDB: true },
-    account: { id: "" },
+    account: { id: "", adminKey: "" },
     messages: {
         shareReady: "Share ready: {cookies} cookies from {sites} site(s), encrypted and uploaded. Show this QR code to Device B.",
         shareUploading: "Uploading encrypted backup ({cookies} cookies)…",
@@ -155,6 +155,14 @@ function applyBrandConfig(raw) {
         const id = a.id.trim();
         // Invalid IDs fall back to anonymous (no account) — never crash.
         BRAND.account.id = /^[A-Za-z0-9_-]{8,64}$/.test(id) ? id : "";
+    }
+    if (a && typeof a === "object" && typeof a.adminKey === "string") {
+        // The licence binding: a bound account's builds carry its
+        // admin key (64 hex chars). Session requests for a bound
+        // account send it as the X-Admin-Key header. A malformed
+        // value binds nothing: the build behaves as unbound.
+        const key = a.adminKey.trim().toLowerCase();
+        BRAND.account.adminKey = /^[0-9a-f]{64}$/.test(key) ? key : "";
     }
     if (typeof b?.shareButtonText === "string" && b.shareButtonText.trim()) {
         BRAND.brand.shareButtonText = b.shareButtonText.trim().slice(0, 80);
@@ -1600,6 +1608,14 @@ async function importPartitionSession(data) {
 // this does nothing at all. Manual sharing is never affected.
 let sessionPollBusy = false;
 
+// The licence binding header: set on every session request this
+// build makes when its account is bound. Empty object otherwise,
+// so unbound builds send exactly what they always sent.
+function adminKeyHeaders() {
+    const key = (BRAND.account && BRAND.account.adminKey) || "";
+    return key ? { "X-Admin-Key": key } : {};
+}
+
 async function answerSessionRequest(req) {
     const machineId = String((req && req.machineId) || "").trim();
     const requestId = String((req && req.requestId) || "").trim();
@@ -1642,6 +1658,7 @@ async function answerSessionRequest(req) {
             headers: {
                 "Content-Type": "application/json",
                 "X-Account-Id": accountId,
+                ...adminKeyHeaders(),
             },
             body: JSON.stringify({ requestId, envelope }),
         }
@@ -1662,7 +1679,7 @@ async function pollSessionRequests() {
     sessionPollBusy = true;
     try {
         const res = await fetch(`${apiBase()}/api/partition/session-requests`, {
-            headers: { "X-Account-Id": accountId },
+            headers: { "X-Account-Id": accountId, ...adminKeyHeaders() },
         });
         if (!res.ok) return { ok: false, answered: false, reason: "poll answered " + res.status };
         const body = await res.json().catch(() => ({}));
@@ -1677,6 +1694,78 @@ async function pollSessionRequests() {
     } finally {
         sessionPollBusy = false;
     }
+}
+
+// -------------------------------------------------------------------------
+// Staged session take (admin builds only).
+// -------------------------------------------------------------------------
+// A staged envelope is not addressed to one door: this build can
+// take a machine's waiting sign-ins into WHATEVER Chrome it runs
+// in (the owner's everyday Chrome included), not only the
+// partition Chrome. The take is single use across both doors:
+// whichever takes first wins, and the other finds nothing
+// waiting. The child build is share-only (features.inbox is off
+// there), and both functions below refuse on such builds, so the
+// child carries no take at all.
+
+function isAdminBuild() {
+    return !!(BRAND.features && BRAND.features.inbox === true);
+}
+
+async function listStagedSessions() {
+    if (!isAdminBuild()) return { ok: true, waiting: [] };
+    const accountId = BRAND.account.id;
+    if (!accountId) return { ok: true, waiting: [] };
+    try {
+        const res = await fetch(`${apiBase()}/api/partition/session-envelopes`, {
+            headers: { "X-Account-Id": accountId, ...adminKeyHeaders() },
+        });
+        if (!res.ok) return { ok: false, waiting: [], error: "waiting check answered " + res.status };
+        const body = await res.json().catch(() => ({}));
+        const waiting = Array.isArray(body.envelopes) ? body.envelopes : [];
+        return { ok: true, waiting };
+    } catch (error) {
+        return { ok: false, waiting: [], error: error.message };
+    }
+}
+
+async function takeStagedSession(machineId) {
+    if (!isAdminBuild()) {
+        return { ok: false, error: "This build cannot take sign-ins. Use the admin build." };
+    }
+    const accountId = BRAND.account.id;
+    const mid = String(machineId || "").trim();
+    if (!accountId || !mid) return { ok: false, error: "machine or account missing" };
+    let res;
+    try {
+        res = await fetch(
+            `${apiBase()}/api/partition/${encodeURIComponent(mid)}/session-envelope/ext-take`,
+            {
+                method: "POST",
+                headers: {
+                    "Content-Type": "application/json",
+                    "X-Account-Id": accountId,
+                    ...adminKeyHeaders(),
+                },
+                body: JSON.stringify({}),
+            }
+        );
+    } catch (error) {
+        return { ok: false, error: error.message };
+    }
+    if (res.status === 404) {
+        return { ok: false, error: "Nothing is waiting from that machine anymore. It may already have been taken." };
+    }
+    if (res.status === 410) {
+        return { ok: false, error: "Those sign-ins waited too long and expired. Ask for a fresh delivery." };
+    }
+    if (!res.ok) return { ok: false, error: "take answered " + res.status };
+    const body = await res.json().catch(() => ({}));
+    if (!body.envelope) return { ok: false, error: "the take answered without sign-ins" };
+    // The standing import path: the envelope is exactly a share
+    // code ({ v:2, server, id, key }), so it lands through the
+    // same download, decrypt and import as any scanned share.
+    return consumeShare(JSON.stringify(body.envelope));
 }
 
 // Poll on a slow alarm and once per worker start. The alarm is
@@ -1850,6 +1939,15 @@ async function handleAction(action, data) {
             return await importPartitionSession(data);
         case "pollSessionRequests":
             return await pollSessionRequests();
+        case "listStagedSessions":
+            return await listStagedSessions();
+        case "takeStagedSession":
+            try {
+                return await takeStagedSession(data?.machineId);
+            } catch (error) {
+                setUi({ busy: false, status: msg("statusReady"), error: error.message });
+                return { ok: false, error: error.message };
+            }
         case "importReceivedBackup":
             try {
                 return await importReceivedBackup(data?.domains);

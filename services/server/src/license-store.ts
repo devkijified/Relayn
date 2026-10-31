@@ -23,6 +23,8 @@
 // memory-only (the shape unit-style callers used before).
 // =========================================================================
 
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+
 import type { StateDocs } from "./storage.js";
 
 export type LicenseProduct = "ext" | "mover" | "admin";
@@ -35,6 +37,34 @@ export interface License {
   status: LicenseStatus;
   issuedAt: string; // RFC3339 / ISO
   note: string;
+  /**
+   * The account's bound admin key (64 hex chars, from 32 random
+   * bytes). Only ever set on the "admin" product record. Builds
+   * issued for the account bake this key in, and admin-side
+   * routes for the account require it (see admin-key.ts). It
+   * lives in the durable licence document on the same trust
+   * footing as the machine secrets the mover store holds. It is
+   * NEVER returned by any list or read API and never logged:
+   * read models go through publicLicense(), which exposes only
+   * adminKeyBound.
+   */
+  adminKey?: string;
+}
+
+/** The read shape every API answers with: no key material, ever. */
+export interface PublicLicense extends Omit<License, "adminKey"> {
+  adminKeyBound: boolean;
+}
+
+const ADMIN_KEY_RE = /^[0-9a-f]{64}$/;
+
+/** Strip the raw key from a record for any outward answer. */
+export function publicLicense(lic: License): PublicLicense {
+  const { adminKey, ...rest } = lic;
+  return {
+    ...rest,
+    adminKeyBound: typeof adminKey === "string" && adminKey !== ""
+  };
 }
 
 export const LICENSE_PRODUCTS: readonly LicenseProduct[] = [
@@ -108,7 +138,10 @@ export class LicenseStore {
             label: typeof lic.label === "string" ? lic.label : "",
             status: lic.status,
             issuedAt: typeof lic.issuedAt === "string" ? lic.issuedAt : issuedAt,
-            note: typeof lic.note === "string" ? lic.note : ""
+            note: typeof lic.note === "string" ? lic.note : "",
+            ...(typeof lic.adminKey === "string" && ADMIN_KEY_RE.test(lic.adminKey)
+              ? { adminKey: lic.adminKey }
+              : {})
           });
         } else {
           dropped++;
@@ -164,7 +197,10 @@ export class LicenseStore {
       label: label !== "" ? label : (existing?.label ?? ""),
       status: "active",
       issuedAt: new Date().toISOString(),
-      note: note !== "" ? note : (existing?.note ?? "")
+      note: note !== "" ? note : (existing?.note ?? ""),
+      // Re-issuing a license must never silently unbind the
+      // account: the bound admin key rides through untouched.
+      ...(existing?.adminKey ? { adminKey: existing.adminKey } : {})
     };
     this.licenses.set(this.key(product, accountId), lic);
     await this.persist();
@@ -214,5 +250,65 @@ export class LicenseStore {
     const out = new Set<string>();
     for (const lic of this.licenses.values()) out.add(lic.accountId);
     return [...out];
+  }
+
+  // ---------------------------------------------------------------
+  // The bound admin key. The key lives on the account's "admin"
+  // product record: one key bounds every admin-side build and
+  // caller for the account (Admin, Host, Admin Viewer, EXT pair
+  // config) to that account's own estate, so one licence's admin
+  // surface can never reach another licence's machines.
+  // ---------------------------------------------------------------
+
+  /** True when the account's admin license carries a bound key. */
+  adminKeyBound(accountId: string): boolean {
+    const key = this.get("admin", accountId)?.adminKey;
+    return typeof key === "string" && key !== "";
+  }
+
+  /**
+   * The raw bound key, for build baking only (the package and
+   * config issuers inside this server). Never returned by any
+   * route, never logged. "" when the account is not bound.
+   */
+  boundAdminKey(accountId: string): string {
+    const key = this.get("admin", accountId)?.adminKey;
+    return typeof key === "string" ? key : "";
+  }
+
+  /**
+   * Bind a fresh admin key to the account, or rotate the bound
+   * one: a new key is generated from crypto randomness and
+   * replaces any old one in the same write, so the old key stops
+   * working the moment this returns. Returns false when the
+   * account holds no admin license to bind to.
+   */
+  async setAdminKey(accountId: string): Promise<boolean> {
+    const lic = this.get("admin", accountId);
+    if (!lic) return false;
+    lic.adminKey = randomBytes(32).toString("hex");
+    await this.persist();
+    return true;
+  }
+
+  /**
+   * Check a presented admin key for an account. "open" means the
+   * account is not bound, so no key is required (the standing
+   * account-id-only model). The comparison runs over SHA-256
+   * digests of both sides, so it is constant-time whatever
+   * length the presented value has.
+   */
+  verifyAdminKey(
+    accountId: string,
+    presented: string
+  ): "open" | "ok" | "missing" | "mismatch" {
+    const held = this.get("admin", accountId)?.adminKey;
+    if (typeof held !== "string" || held === "") return "open";
+    if (typeof presented !== "string" || presented === "") {
+      return "missing";
+    }
+    const given = createHash("sha256").update(presented, "utf8").digest();
+    const kept = createHash("sha256").update(held, "utf8").digest();
+    return timingSafeEqual(given, kept) ? "ok" : "mismatch";
   }
 }

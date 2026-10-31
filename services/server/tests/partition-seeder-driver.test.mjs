@@ -194,7 +194,7 @@ function finishBrowse(S, cmdId, result) {
     "probe starts with root browses in flight (capped at 2)",
     browses1.length === 2 &&
       browses1[0].payload.prefix === "files/Desktop" &&
-      browses1[1].payload.prefix === "files/Documents",
+      browses1[1].payload.prefix === "files/PublicDesktop",
     browses1.map((b) => b.payload)
   );
   finishBrowse(S, browses1[0].id, {
@@ -211,7 +211,7 @@ function finishBrowse(S, cmdId, result) {
       { kind: "folder", path: "files/Desktop/Sub" }
     ]
   });
-  finishBrowse(S, browses1[1].id, { prefix: "files/Documents", total: 0, offset: 0, children: [] });
+  finishBrowse(S, browses1[1].id, { prefix: "files/PublicDesktop", total: 0, offset: 0, children: [] });
   await driver.tick(T0 + 1000);
   // Drain the walk: keep finishing whatever is queued until it ends.
   for (let i = 0; i < 30 && S.merged.length === 0; i++) {
@@ -334,12 +334,15 @@ function finishBrowse(S, cmdId, result) {
 }
 
 // 7: the probe covers AppData last, and its page budget caps the
-// AppData part of a walk without starving the files/* roots.
+// AppData part of a walk without starving the files/* roots. The
+// Chrome User Data root rides just ahead of the general appData
+// root with its own page budget, so the Chrome subtree
+// catalogues even when Roaming is enormous (the 173 gap).
 {
   check(
-    "probe roots end with the AppData root, files roots first",
+    "probe roots: files first, the Chrome root ahead of the AppData root",
     SEEDER_PROBE_ROOTS.join() ===
-      "files/Desktop,files/Documents,files/Downloads,files/Pictures,files/Music,files/Videos,appData",
+      "files/Desktop,files/PublicDesktop,files/Documents,files/Downloads,files/Pictures,files/Music,files/Videos,appData/Local/Google/Chrome/User Data,appData",
     SEEDER_PROBE_ROOTS
   );
 
@@ -401,6 +404,78 @@ function finishBrowse(S, cmdId, result) {
         entries[0].size === 123 &&
         entries[0].modTime === Date.parse("2026-10-31T01:02:03.000Z"),
       entries
+    );
+  }
+
+  // The Chrome subtree catalogues off its own early root and
+  // budget even while the general AppData walk is still buried
+  // in an endless Roaming chain (the live 173 shape).
+  {
+    const { S, driver } = makeWorld();
+    onlineMachine(S, "m6c");
+    const T0 = 1_000_000_000_000;
+    await driver.tick(T0);
+    const CHROME = "appData/Local/Google/Chrome/User Data";
+    const responder = (c) => {
+      const { prefix, offset } = c.payload;
+      if (prefix === CHROME) {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [{ kind: "folder", path: CHROME + "/Default" }]
+        };
+      }
+      if (prefix === CHROME + "/Default") {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [
+            {
+              kind: "file",
+              path: CHROME + "/Default/History",
+              size: 42,
+              modTime: "2026-10-31T01:02:03.000Z"
+            }
+          ]
+        };
+      }
+      if (prefix === "appData") {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [{ kind: "folder", path: "appData/Roaming" }]
+        };
+      }
+      if (prefix === "appData/Roaming") {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [{ kind: "folder", path: "appData/Roaming/Chain0" }]
+        };
+      }
+      const chain = /^appData\/Roaming\/Chain(\d+)$/.exec(prefix);
+      if (chain) {
+        return {
+          prefix,
+          total: 1,
+          offset,
+          children: [
+            { kind: "folder", path: `appData/Roaming/Chain${Number(chain[1]) + 1}` }
+          ]
+        };
+      }
+      return emptyPage(c);
+    };
+    await drainWith(S, driver, "m6c", T0 + 1000, responder, 400);
+    const entries = S.merged.flat();
+    check(
+      "the Chrome History catalogues from the Local path despite the endless Roaming chain",
+      entries.some((e) => e.packPath === CHROME + "/Default/History" && e.size === 42),
+      entries.slice(0, 5)
     );
   }
 
@@ -488,7 +563,13 @@ function finishBrowse(S, cmdId, result) {
       (c) =>
         c.type === "files-browse" &&
         (c.payload.prefix === "appData" ||
-          c.payload.prefix.startsWith("appData/"))
+          c.payload.prefix.startsWith("appData/")) &&
+        // The Chrome probe root pages charge to their own
+        // budget, not this one (see the m6c checks above).
+        !(
+          c.payload.prefix === "appData/Local/Google/Chrome/User Data" ||
+          c.payload.prefix.startsWith("appData/Local/Google/Chrome/User Data/")
+        )
     );
     const entries = S.merged.flat();
     check(

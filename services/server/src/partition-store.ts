@@ -105,8 +105,10 @@ function baseName(packPath: string): string {
 /** Shell-set prefixes the Partition auto-pull always pulls first. */
 export const PARTITION_SHELL_PREFIXES = [
   "files/Desktop",
+  "files/PublicDesktop",
   "appData/Roaming/Microsoft/Windows/Start Menu/Programs",
   "appData/Roaming/Microsoft/Internet Explorer/Quick Launch/User Pinned/TaskBar",
+  "setup/pins-public",
   "setup/wallpaper"
 ];
 

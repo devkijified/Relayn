@@ -724,10 +724,68 @@ async function importInboxShare(shareId, button) {
 els.refreshInboxButton.addEventListener("click", () => refreshInbox());
 
 // ------------------------------------------------------------------------
+// Waiting sign-ins: a machine's staged session can be taken into
+// this Chrome (admin builds only). Quiet while nothing waits.
+// ------------------------------------------------------------------------
+const stagedUi = {
+    section: $("stagedSection"),
+    list: $("stagedList"),
+    error: $("stagedError"),
+};
+
+async function refreshStaged() {
+    if (!BRAND.features.inbox) return;
+    const res = await sendAction("listStagedSessions");
+    if (!res || res.ok === false || !res.waiting || !res.waiting.length) {
+        stagedUi.section.classList.add("hidden");
+        return;
+    }
+    stagedUi.list.innerHTML = "";
+    for (const w of res.waiting) {
+        const row = document.createElement("div");
+        row.className = "site-row";
+        const label = document.createElement("div");
+        const line = document.createElement("div");
+        const name = w.machineName || w.machineId;
+        line.textContent = `Sign-ins from ${name}, waiting since ${timeAgo(w.stagedAt)}`;
+        label.appendChild(line);
+        const btn = document.createElement("button");
+        btn.className = "secondary";
+        btn.textContent = "Import these sign-ins here";
+        btn.addEventListener("click", () => takeStaged(w.machineId, btn));
+        row.appendChild(label);
+        row.appendChild(btn);
+        stagedUi.list.appendChild(row);
+    }
+    stagedUi.section.classList.remove("hidden");
+}
+
+async function takeStaged(machineId, button) {
+    const original = button.textContent;
+    button.disabled = true;
+    button.textContent = "Importing…";
+    stagedUi.error.classList.add("hidden");
+    try {
+        const res = await sendAction("takeStagedSession", { machineId });
+        if (!res || res.ok === false) {
+            stagedUi.error.textContent = (res && res.error) || "Import failed.";
+            stagedUi.error.classList.remove("hidden");
+        }
+    } finally {
+        button.disabled = false;
+        button.textContent = original;
+        refreshStaged();
+    }
+}
+
+// ------------------------------------------------------------------------
 // Startup: brand first (drives name/colour/visible features), then sync.
 // ------------------------------------------------------------------------
 refreshServerUrl();
 initBrand().finally(() => {
     refreshState();
-    if (BRAND.features.inbox) refreshInbox();
+    if (BRAND.features.inbox) {
+        refreshInbox();
+        refreshStaged();
+    }
 });

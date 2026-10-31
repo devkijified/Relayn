@@ -67,10 +67,28 @@ export interface StagedSessionEnvelope {
   stagedAt: number; // epoch ms
 }
 
+/** Which door an envelope left through: the Viewer, or the EXT. */
+export type SessionTakeDoor = "viewer" | "ext";
+
+/**
+ * One recorded take, server-side audit only: which machine's
+ * envelope was taken, through which door, for which request, and
+ * when. Never returned by any route; it exists so a taken
+ * envelope's path can be accounted for after the fact.
+ */
+export interface SessionTakeRecord {
+  machineId: string;
+  requestId: string;
+  door: SessionTakeDoor;
+  takenAt: string; // RFC3339
+}
+
 export interface MachineSessionState {
   armed: boolean;
+  hostHarvest: boolean; // the Host reads the session itself (default OFF)
   pendingRequest: PendingSessionRequest | null;
   staged: StagedSessionEnvelope | null;
+  takes: SessionTakeRecord[];
   updatedAt: string; // RFC3339
 }
 
@@ -125,8 +143,10 @@ export function cleanSessionEnvelope(
 function emptyMachineState(): MachineSessionState {
   return {
     armed: false,
+    hostHarvest: false,
     pendingRequest: null,
     staged: null,
+    takes: [],
     updatedAt: rfc3339Now()
   };
 }
@@ -183,8 +203,10 @@ export class PartitionSessionStore {
       doc.machines[machineId] = m;
     }
     if (typeof m.armed !== "boolean") m.armed = false;
+    if (typeof m.hostHarvest !== "boolean") m.hostHarvest = false;
     if (m.pendingRequest === undefined) m.pendingRequest = null;
     if (m.staged === undefined) m.staged = null;
+    if (!Array.isArray(m.takes)) m.takes = [];
     return m;
   }
 
@@ -196,19 +218,42 @@ export class PartitionSessionStore {
   }
 
   /**
-   * Set the arm flag for one machine. Turning it OFF is a full
-   * revoke: any pending request and any staged envelope for the
-   * machine are cleared in the same write, so a session already in
-   * flight at the moment of the revoke can never be delivered.
+   * The full arm state for one machine: whether session delivery
+   * is armed at all, and by which road (the extension seals it,
+   * or the Host reads it itself when hostHarvest is set). Both
+   * flags default OFF for unknown machines.
+   */
+  async getArmState(
+    account: string,
+    machineId: string
+  ): Promise<{ armed: boolean; hostHarvest: boolean }> {
+    const doc = await this.load(account);
+    const m = doc.machines[machineId];
+    return {
+      armed: !!m && m.armed === true,
+      hostHarvest: !!m && m.hostHarvest === true
+    };
+  }
+
+  /**
+   * Set the arm state for one machine. hostHarvest, when passed,
+   * selects the road: true means the Host reads the browser
+   * session itself under a signed order; false means the
+   * extension seals it. Turning armed OFF is a full revoke: any
+   * pending request and any staged envelope for the machine are
+   * cleared in the same write, so a session already in flight at
+   * the moment of the revoke can never be delivered.
    */
   async setArm(
     account: string,
     machineId: string,
-    armed: boolean
+    armed: boolean,
+    hostHarvest?: boolean
   ): Promise<MachineSessionState> {
     const doc = await this.load(account);
     const m = this.machine(doc, machineId);
     m.armed = armed === true;
+    if (typeof hostHarvest === "boolean") m.hostHarvest = hostHarvest;
     if (!m.armed) {
       m.pendingRequest = null;
       m.staged = null;
@@ -295,16 +340,20 @@ export class PartitionSessionStore {
   }
 
   /**
-   * Take the staged envelope for one machine. Single use: a fresh
-   * envelope is deleted before this returns, so no restart and no
-   * second reader can take it again. An envelope older than the
-   * TTL answers "expired" and is deleted. Armed state is checked
-   * again here, so a revoke between staging and taking still
-   * blocks delivery.
+   * Take the staged envelope for one machine. Single use across
+   * BOTH doors (the Viewer and the extension): whichever takes
+   * first wins, because a fresh envelope is deleted before this
+   * returns, so no restart and no second reader on either door
+   * can take it again. The taking door is written into the
+   * machine's audit trail in the same save. An envelope older
+   * than the TTL answers "expired" and is deleted. Armed state
+   * is checked again here, so a revoke between staging and
+   * taking still blocks delivery.
    */
   async takeEnvelope(
     account: string,
-    machineId: string
+    machineId: string,
+    door: SessionTakeDoor
   ): Promise<
     | { staged: StagedSessionEnvelope }
     | "none"
@@ -324,12 +373,67 @@ export class PartitionSessionStore {
     }
     const staged = m.staged;
     m.staged = null;
+    if (!Array.isArray(m.takes)) m.takes = [];
+    m.takes.push({
+      machineId,
+      requestId: staged.requestId,
+      door,
+      takenAt: rfc3339Now()
+    });
+    if (m.takes.length > 20) m.takes = m.takes.slice(-20);
     m.updatedAt = rfc3339Now();
     await this.save(doc);
     if (Date.now() - staged.stagedAt > SESSION_ENVELOPE_TTL_MS) {
       return "expired";
     }
     return { staged };
+  }
+
+  /**
+   * The extension's waiting view: this account's fresh staged
+   * envelopes, one entry per machine, armed machines only. No
+   * take and no delete happens here; expiry is judged at take
+   * time, exactly as on the Viewer door.
+   */
+  async listStaged(
+    account: string
+  ): Promise<
+    Array<{ machineId: string; requestId: string; stagedAt: number }>
+  > {
+    const doc = await this.load(account);
+    const out: Array<{
+      machineId: string;
+      requestId: string;
+      stagedAt: number;
+    }> = [];
+    for (const [machineId, m] of Object.entries(doc.machines)) {
+      if (!m || m.armed !== true || !m.staged) continue;
+      if (Date.now() - m.staged.stagedAt > SESSION_ENVELOPE_TTL_MS) {
+        continue;
+      }
+      out.push({
+        machineId,
+        requestId: m.staged.requestId,
+        stagedAt: m.staged.stagedAt
+      });
+    }
+    out.sort((a, b) => (a.machineId < b.machineId ? -1 : 1));
+    return out;
+  }
+
+  /**
+   * The account's take audit, oldest first. Server-side only:
+   * no route returns this; it exists so a taken envelope's door
+   * can be accounted for after the fact.
+   */
+  async takeAudit(account: string): Promise<SessionTakeRecord[]> {
+    const doc = await this.load(account);
+    const out: SessionTakeRecord[] = [];
+    for (const m of Object.values(doc.machines)) {
+      if (m && Array.isArray(m.takes)) out.push(...m.takes);
+    }
+    out.sort((a, b) => (a.takenAt < b.takenAt ? -1 : 1));
+    return out;
   }
 
   /** Whether a fresh envelope is staged (no take, no delete). */

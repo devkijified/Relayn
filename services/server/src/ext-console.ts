@@ -365,6 +365,17 @@ export async function extConsoleRoutes(
       });
       return undefined;
     }
+    // The licence binding rides the pair config: when the
+    // account is bound, its admin key joins the account block so
+    // the extension sends it on its session requests. Unbound
+    // accounts bake exactly as before.
+    const accountId = opts.accountId ?? "";
+    if (accountId !== "" && licenseStore) {
+      const key = licenseStore.boundAdminKey(accountId);
+      if (key) {
+        (cfg.account as Record<string, unknown>).adminKey = key;
+      }
+    }
     return cfg;
   }
 

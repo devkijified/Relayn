@@ -55,6 +55,17 @@ export const SEEDER_PROBE_PAGE = 200;
 // cycle and still merges everything it gathered.
 export const SEEDER_PROBE_APPDATA_PAGE_BUDGET = 200;
 
+// The Chrome profile subtree gets its own early probe root and
+// its own page budget (owner order 2026-10-31: the AppData walk
+// catalogued Roaming and starved before ever reaching
+// AppData\Local, so Chrome's profile, the browserPrep heart of
+// Access Computer, was invisible to every door). The Chrome
+// pages are charged to this budget, NOT to the AppData budget,
+// and the root sits ahead of the general appData root so the
+// subtree catalogues on the first walk.
+export const SEEDER_PROBE_CHROME_ROOT = "appData/Local/Google/Chrome/User Data";
+export const SEEDER_PROBE_CHROME_PAGE_BUDGET = 60;
+
 // The inventory roots the probe walks, in packPath form. A root
 // the machine does not have answers with an error result and is
 // skipped; that is a normal shape (not every profile carries
@@ -63,16 +74,25 @@ export const SEEDER_PROBE_APPDATA_PAGE_BUDGET = 200;
 // every files/* root.
 export const SEEDER_PROBE_ROOTS = [
   "files/Desktop",
+  "files/PublicDesktop",
   "files/Documents",
   "files/Downloads",
   "files/Pictures",
   "files/Music",
   "files/Videos",
+  SEEDER_PROBE_CHROME_ROOT,
   "appData"
 ];
 
 function isAppDataPath(prefix: string): boolean {
   return prefix === "appData" || prefix.startsWith("appData/");
+}
+
+function isChromeProbePath(prefix: string): boolean {
+  return (
+    prefix === SEEDER_PROBE_CHROME_ROOT ||
+    prefix.startsWith(SEEDER_PROBE_CHROME_ROOT + "/")
+  );
 }
 
 // Reorder one plan for the driver pass: every express path in the
@@ -120,6 +140,7 @@ interface ProbeWalk {
   entries: Array<{ packPath: string; size: number; modTime: number }>;
   commands: number;
   appDataPages: number; // files-browse pages dispatched under appData
+  chromePages: number; // pages dispatched under the Chrome probe root
 }
 
 export interface SeederDriverDeps {
@@ -270,7 +291,8 @@ export class PartitionSeederDriver {
         out: new Map(),
         entries: [],
         commands: 0,
-        appDataPages: 0
+        appDataPages: 0,
+        chromePages: 0
       };
       this.walks.set(key, walk);
     }
@@ -294,7 +316,15 @@ export class PartitionSeederDriver {
     ) {
       const head = walk.queue[0] as ProbePage;
       if (
+        isChromeProbePath(head.prefix) &&
+        walk.chromePages >= SEEDER_PROBE_CHROME_PAGE_BUDGET
+      ) {
+        walk.queue.shift();
+        continue;
+      }
+      if (
         isAppDataPath(head.prefix) &&
+        !isChromeProbePath(head.prefix) &&
         walk.appDataPages >= SEEDER_PROBE_APPDATA_PAGE_BUDGET
       ) {
         walk.queue.shift();
@@ -314,7 +344,8 @@ export class PartitionSeederDriver {
       if (!cmd) break;
       walk.out.set(cmd.id, pageReq);
       walk.commands++;
-      if (isAppDataPath(pageReq.prefix)) walk.appDataPages++;
+      if (isChromeProbePath(pageReq.prefix)) walk.chromePages++;
+      else if (isAppDataPath(pageReq.prefix)) walk.appDataPages++;
     }
 
     // Walk over: merge what was found and stamp the cadence.

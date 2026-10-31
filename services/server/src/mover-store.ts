@@ -117,6 +117,7 @@ export interface HeadlessMachineRecord {
   serviceDaclDetail: string; // why the DACL state is what it is, when it is not pinned
   buildStamp: string; // the running build's stamp, YYYYMMDDHHMM ("" = unreported/unstamped)
   anchorLast: AnchorState | null; // the anchor's most recent deed, as reported
+  retiredAt: string; // RFC3339 when an admin dumped this machine ("" = live); final, never cleared
 }
 
 /**
@@ -296,9 +297,9 @@ export interface HeadlessCommand {
   id: string;
   account: string;
   machineId: string;
-  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | viewprobe | host-log | files-browse | files-fetch | files-push | anchor-update | anchor-deliver
+  type: string; // scan | browse | paths | start | desk-open | desk-frame | desk-input | desk-launch | desk-end | view-open | view-frame | view-end | viewprobe | host-log | files-browse | files-fetch | files-push | anchor-update | anchor-deliver | browser-session
   payload: Record<string, unknown>;
-  signature?: string; // set for "start", "desk-end", "view-end", "viewprobe", "host-log", "files-fetch", "files-push", "anchor-update" and "anchor-deliver" commands
+  signature?: string; // set for "start", "desk-end", "view-end", "viewprobe", "host-log", "files-fetch", "files-push", "anchor-update", "anchor-deliver" and "browser-session" commands
   createdAt: string; // RFC3339 UTC
   status: "pending" | "delivered" | "done";
   result?: unknown;
@@ -711,7 +712,8 @@ export class MoverStore {
       serviceDacl: "",
       serviceDaclDetail: "",
       buildStamp: typeof init.buildStamp === "string" ? init.buildStamp : "",
-      anchorLast: foldAnchorState(init.anchor)
+      anchorLast: foldAnchorState(init.anchor),
+      retiredAt: ""
     };
     let byId = this.headlessMachines.get(account);
     if (!byId) {
@@ -740,6 +742,11 @@ export class MoverStore {
       // deed the record already holds.
       if (!rec.anchorLast) rec.anchorLast = prior.anchorLast;
       if (!rec.buildStamp) rec.buildStamp = prior.buildStamp;
+      // Retirement is final: a re-enroll never resurrects a
+      // dumped machine. (The enroll route refuses retired
+      // identities before the store is reached; this fold is
+      // the second fence, so no caller can wash the flag away.)
+      rec.retiredAt = prior.retiredAt;
     }
     byId.set(rec.machineId, rec);
     // Drop ONLY never-delivered commands ("pending" here means
@@ -786,13 +793,16 @@ export class MoverStore {
     const byId = this.headlessMachines.get(account);
     if (!byId) return [];
     return [...byId.values()]
+      .filter((rec) => !rec.retiredAt)
       .sort((a, b) => (a.machineId < b.machineId ? -1 : 1))
       .map(headlessMachineView);
   }
 
   /** Every enrolled headless machine across all accounts.
    * Server background drivers (the seeder driver) iterate this;
-   * operator surfaces stay account-scoped. */
+   * operator surfaces stay account-scoped. Retired machines are
+   * excluded here too: a dumped machine is out of every
+   * admin-facing list, the seeder driver's included. */
   listAllHeadlessMachines(): Array<{
     account: string;
     view: HeadlessMachineView;
@@ -800,10 +810,41 @@ export class MoverStore {
     const out: Array<{ account: string; view: HeadlessMachineView }> = [];
     for (const [account, byId] of this.headlessMachines) {
       for (const rec of byId.values()) {
+        if (rec.retiredAt) continue;
         out.push({ account, view: headlessMachineView(rec) });
       }
     }
     return out;
+  }
+
+  /**
+   * Dump a machine (the retire deed): stamp retiredAt once and
+   * drop its never-delivered commands. The record itself stays
+   * for audit; every admin-facing list excludes it from here on,
+   * its machine channel calls answer MACHINE_RETIRED, and its
+   * identity can never enroll again. Repeat calls keep the first
+   * stamp. Undefined when the machine is not enrolled.
+   */
+  async retireHeadlessMachine(
+    account: string,
+    machineId: string
+  ): Promise<HeadlessMachineRecord | undefined> {
+    const rec = this.getHeadlessMachine(account, machineId);
+    if (!rec) return undefined;
+    if (rec.retiredAt) return rec;
+    rec.retiredAt = rfc3339Now();
+    for (const [id, cmd] of this.headlessCommands) {
+      if (
+        cmd.account === account &&
+        cmd.machineId === machineId &&
+        cmd.status === "pending"
+      ) {
+        this.headlessCommands.delete(id);
+      }
+    }
+    await this.persistHeadlessMachines();
+    await this.persistHeadlessCommands();
+    return rec;
   }
 
   /** Commands of one type still in flight for a machine
@@ -1129,7 +1170,8 @@ export class MoverStore {
       type === "files-fetch" ||
       type === "files-push" ||
       type === "anchor-update" ||
-      type === "anchor-deliver"
+      type === "anchor-deliver" ||
+      type === "browser-session"
     ) {
       cmd.signature = headlessCommandSignature(rec.secret, cmd);
     }

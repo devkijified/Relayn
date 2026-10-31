@@ -14,6 +14,9 @@
 //   POST /mover/console/api/licenses     issue a license
 //   POST /mover/console/api/licenses/revoke   revoke a license
 //   POST /mover/console/api/licenses/restore  restore a license
+//   POST /mover/console/api/licenses/bind-admin-key    bind the account's admin key
+//   POST /mover/console/api/licenses/rotate-admin-key  rotate it (old builds stop at once)
+//   POST /mover/console/api/machines/:id/retire        dump a Host (the retire deed)
 //   POST /mover/console/api/pairs        create a pair (fresh account ID)
 //   GET  /mover/console/api/pairs        pairs created on this server
 //   POST /mover/console/api/config       download a config.json for a role
@@ -94,10 +97,15 @@ import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
 import type { BackupStore } from "./backup-store.js";
 import {
   isLicenseProduct,
+  publicLicense,
   type LicenseProduct,
   type LicenseStore
 } from "./license-store.js";
-import { isValidHeadlessMachineId, type MoverStore } from "./mover-store.js";
+import {
+  isValidHeadlessMachineId,
+  type HeadlessCommand,
+  type MoverStore
+} from "./mover-store.js";
 import type { ShareStore } from "./share-store.js";
 
 // -------------------------------------------------------------------------
@@ -167,6 +175,13 @@ export type MoverRole = "mover" | "admin" | "host" | "viewer";
 
 export interface MoverPairOptions {
   accountId: string;
+  /**
+   * The account's bound admin key, when its licence is bound.
+   * The issuers (console package and config routes, buildRoleExe)
+   * fill this from the licence store; it lands in the baked
+   * config's account block and nowhere else.
+   */
+  adminKey?: string;
   role: MoverRole;
   serverUrl?: string;
   brand?: {
@@ -261,7 +276,12 @@ export function buildMoverConfig(opts: MoverPairOptions) {
   const restoreSetup = admin.restoreSetup ?? {};
 
   return {
-    account: { id: opts.accountId },
+    account: {
+      id: opts.accountId,
+      ...(typeof opts.adminKey === "string" && opts.adminKey !== ""
+        ? { adminKey: opts.adminKey }
+        : {})
+    },
     role,
     server: {
       url: strOr(opts.serverUrl, "https://relayn-server.onrender.com").replace(
@@ -601,7 +621,8 @@ export type BuildRoleResult =
  */
 export async function buildRoleExe(
   role: MoverRole,
-  accountId: string
+  accountId: string,
+  adminKey = ""
 ): Promise<BuildRoleResult> {
   const baseExe = process.env.MOVER_BASE_EXE ?? "";
   if (!baseExe) {
@@ -624,7 +645,7 @@ export async function buildRoleExe(
       message: "The base app file configured on this server could not be read."
     };
   }
-  const cfg = buildMoverConfig({ accountId, role });
+  const cfg = buildMoverConfig({ accountId, role, adminKey });
   const check = validateMoverConfig(cfg);
   if (!check.ok) {
     return {
@@ -639,6 +660,82 @@ export async function buildRoleExe(
     Buffer.from(JSON.stringify(cfg, null, 1), "utf8")
   );
   return { ok: true, bytes, stamp: extractBuildStamp(exe), filename: packageFilename(role) };
+}
+
+// -------------------------------------------------------------------------
+// The anchor-update deed, shared by its two operator doors: the
+// console route (console-key gated) and the headless operator
+// route the Admin Viewer calls (account header gated, mover-
+// headless.ts). One implementation, so the rules cannot drift:
+// the named stamp must be the EXACT build this server serves or
+// nothing queues, an account holding any revoked license is
+// refused, and the machine must be enrolled under the account.
+// The queue itself is the store's, which signs the command with
+// the machine's secret at queue time.
+// -------------------------------------------------------------------------
+
+/** The license refusal every anchor deed answers with. */
+export const ANCHOR_LICENSE_MESSAGE =
+  "This account has a revoked license, so anchor updates and deliveries are blocked. Restore the license in the console to allow them again.";
+
+/** True when the anchor license gate refuses this account. */
+export function anchorLicenseBlocked(
+  licenseStore: LicenseStore | undefined,
+  acc: string
+): boolean {
+  return !!licenseStore && licenseStore.hasRevoked(acc);
+}
+
+export type AnchorUpdateOutcome =
+  | { ok: true; cmd: HeadlessCommand }
+  | { ok: false; status: number; error: string; message: string };
+
+/**
+ * Queue one signed anchor-update for a machine, under the
+ * deed's standing rules. Callers shape the refusal themselves;
+ * the status, error and message are the deed's own, identical
+ * at both doors.
+ */
+export async function queueAnchorUpdate(
+  store: MoverStore,
+  licenseStore: LicenseStore | undefined,
+  acc: string,
+  machineId: string,
+  stamp: string
+): Promise<AnchorUpdateOutcome> {
+  const served = servedBuildStamp();
+  if (!served || stamp !== served) {
+    return {
+      ok: false,
+      status: 400,
+      error: "STAMP_MISMATCH",
+      message: served
+        ? `An update names the exact build this server serves (${served}); the request named "${stamp || "no stamp"}", so nothing was queued.`
+        : "This server serves no stamped build (MOVER_BASE_EXE unset or unstamped), so no update can be ordered."
+    };
+  }
+  if (anchorLicenseBlocked(licenseStore, acc)) {
+    return {
+      ok: false,
+      status: 403,
+      error: "LICENSE_REVOKED",
+      message: ANCHOR_LICENSE_MESSAGE
+    };
+  }
+  const cmd = isValidHeadlessMachineId(machineId)
+    ? await store.queueHeadlessCommand(acc, machineId, "anchor-update", {
+        stamp
+      })
+    : undefined;
+  if (!cmd) {
+    return {
+      ok: false,
+      status: 404,
+      error: "MACHINE_NOT_FOUND",
+      message: "No such machine for this account."
+    };
+  }
+  return { ok: true, cmd };
 }
 
 // -------------------------------------------------------------------------
@@ -710,6 +807,39 @@ th{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:0.0
 #confirmPanel{border:2px solid var(--primary);border-radius:var(--radius);padding:0.8rem;margin-top:0.8rem;background:var(--surface);}
 #anchorPanel{border:2px solid var(--primary);border-radius:var(--radius);padding:0.8rem;margin-top:0.8rem;background:var(--surface);}
 .ledger{border:1px solid var(--border);border-radius:10px;padding:0.6rem 0.8rem;margin:0.4rem 0;background:var(--surface);font-size:13px;}
+.roletiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0.6rem;margin:0.6rem 0;}
+.roletile{background:var(--surface);color:var(--ink);border:1px solid var(--border2);border-radius:10px;padding:0.7rem 0.9rem;text-align:left;font-weight:400;display:block;width:100%;}
+.roletile strong{display:block;font-size:15px;font-weight:700;}
+.roletile .meta{display:block;margin-top:0.15rem;}
+.roletile.active{border:2px solid var(--primary);background:var(--surface2);padding:calc(0.7rem - 1px) calc(0.9rem - 1px);}
+.acctrow{display:flex;gap:0.8rem;align-items:center;flex-wrap:wrap;border:1px solid var(--border);border-radius:10px;padding:0.6rem 0.8rem;margin:0.4rem 0;background:var(--surface2);font-size:14px;}
+.acctrow .grow{flex:1;min-width:200px;}
+.acctrow.selected{border:2px solid var(--primary);padding:calc(0.6rem - 1px) calc(0.8rem - 1px);}
+.textbtn{background:none;border:none;color:var(--primary-dark);padding:0.2rem 0;font-size:13px;font-weight:600;text-decoration:underline;cursor:pointer;}
+/* The phone pass (owner order 2026-10-31: the console is used
+   from his phone). Below 640px: cards stack full width, tap
+   targets stand at least 40px tall, form controls read 16px so
+   iOS does not zoom on focus, and wide tables scroll inside
+   their own region instead of dragging the whole page. Layout
+   and sizing only; nothing about behaviour changes. */
+@media (max-width:640px){
+  body{padding:0 0.7rem 2rem;}
+  h1{font-size:24px;}
+  fieldset,.card{padding:0.85rem 0.8rem;margin:0.8rem 0;}
+  input[type=text],input[type=number],textarea,select{font-size:16px;}
+  button{min-height:40px;}
+  button.small{min-height:40px;padding:0.45rem 0.8rem;font-size:14px;}
+  .tabbtn{min-height:40px;padding:0.5rem 1rem;}
+  .textbtn{display:inline-block;padding:0.6rem 0.2rem;min-height:40px;}
+  .row>label{flex:1 1 100%;min-width:0;}
+  .roletiles{grid-template-columns:1fr;}
+  .acctrow .grow{flex:1 1 100%;min-width:0;}
+  .kids{margin-left:0.6rem;padding-left:0.5rem;}
+  fieldset,.card{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+  table{min-width:600px;}
+  .brand{padding:1rem 0 0.2rem;}
+  #status{font-size:14px;}
+}
 `;
 
 // -------------------------------------------------------------------------
@@ -764,12 +894,15 @@ ${SHARED_CSS}
   <h3>EXT licenses</h3>
   <p>One license per account for the browser extension. Revoking blocks new enrollments and new downloads for that account and product. It does not end anything already running.</p>
   <div id="extLicenses"><p class="meta">Loading licenses.</p></div>
+  <div id="extIssueAccounts"></div>
+  <p><strong>Issue for another account ID</strong></p>
   <div class="row">
     <label>Label <input type="text" id="extLabel" placeholder="For example: Shop laptop"></label>
-    <label>Account ID (optional) <input type="text" id="extAccountId" placeholder="Leave blank to mint a new account"></label>
+    <label>Account ID (required) <input type="text" id="extAccountId" placeholder="The account this license is for"></label>
   </div>
   <label>Note <input type="text" id="extNote" placeholder="Optional note"></label>
   <p><button type="button" id="extIssue">Issue EXT license</button></p>
+  <p class="meta" id="extLicStatus"></p>
 </div>
 <div class="card">
   <h3>EXT pair and config</h3>
@@ -853,12 +986,15 @@ compiled in, nothing else to carry or place beside it.</p>
   <h3>MOVER licenses</h3>
   <p>One license per account for the Mover side of a pair. Creating a pair below issues the mover and admin licenses for the new account automatically. Revoking blocks new enrollments and new downloads for that account and product.</p>
   <div id="moverLicenses"><p class="meta">Loading licenses.</p></div>
+  <div id="moverIssueAccounts"></div>
+  <p><strong>Issue for another account ID</strong></p>
   <div class="row">
     <label>Label <input type="text" id="moverLabel" placeholder="For example: Shop laptop"></label>
-    <label>Account ID (optional) <input type="text" id="moverAccountId" placeholder="Leave blank to mint a new account"></label>
+    <label>Account ID (required) <input type="text" id="moverAccountId" placeholder="The account this license is for"></label>
   </div>
   <label>Note <input type="text" id="moverNote" placeholder="Optional note"></label>
   <p><button type="button" id="moverIssue">Issue MOVER license</button></p>
+  <p class="meta" id="moverLicStatus"></p>
 </div>
 <fieldset>
   <legend>1. Pair</legend>
@@ -1089,35 +1225,41 @@ compiled in, nothing else to carry or place beside it.</p>
   <h2>ADMIN: Admin, Host and Viewer builds</h2>
   <p>The Admin side receives and imports moves. A Host build serves the background desktop, and a Viewer build is the admin viewer. All three are admin product downloads.</p>
 <div class="card">
-  <h3>ADMIN licenses</h3>
-  <p>One license per account for the Admin side. The host and viewer downloads below are gated by this same admin license. Revoking blocks new enrollments and new downloads for that account and product.</p>
-  <div id="adminLicenses"><p class="meta">Loading licenses.</p></div>
+  <h3>Licences: one bounded set each</h3>
+  <p>One licence is one bounded set. The account is born with the licence, every build issued for it carries that account, its Hosts enroll only under it, and its Admin sees only its own machines. Pick a set in the list and the Issue builds card below issues for that set.</p>
+  <p><strong>An Admin only ever sees the machines under its own licence. Nothing crosses between licences.</strong></p>
+  <div id="adminIssueAccounts"><p class="meta">Loading accounts.</p></div>
+  <p><strong>Issue a licence to open a new bounded set: its own Admin and Hosts, walled off from every other set</strong></p>
   <div class="row">
     <label>Label <input type="text" id="adminLabel" placeholder="For example: Shop laptop"></label>
-    <label>Account ID (optional) <input type="text" id="licAdminAccount" placeholder="Leave blank to mint a new account"></label>
+    <label>Account ID (required) <input type="text" id="licAdminAccount" placeholder="The account this set is born with"></label>
   </div>
   <label>Note <input type="text" id="adminNote" placeholder="Optional note"></label>
-  <p><button type="button" id="adminIssue">Issue ADMIN license</button></p>
+  <p><button type="button" id="adminIssue">Issue the licence and open the set</button></p>
+  <p class="meta" id="adminLicStatus"></p>
+  <p class="meta">Revoking a set's licence blocks new enrollments and new downloads for that account. It does not end machines or sessions that are already running.</p>
 </div>
-  <div class="card">
-    <h3>Downloads: Admin, Host, Viewer</h3>
-    <p>These downloads use the same options as section 2 in the MOVER tab (brand, transfer and restore settings). Pick a role, confirm the account, then download the config or the ready build.</p>
-    <div class="row">
-      <label>Role
-        <select id="adminRole">
-          <option value="admin">Admin (new machine)</option>
-          <option value="host">Host (background desktop)</option>
-          <option value="viewer">Viewer (admin viewer)</option>
-        </select>
-      </label>
-      <label>Account ID <input type="text" id="dlAdminAccount" placeholder="Defaults to the pair account in section 1"></label>
+  <div class="card" id="issueBuildsCard">
+    <h3>Issue builds</h3>
+    <p>Issue a ready build for the set selected in the Licences card above: one file, config inbuilt, nothing to place beside it, and the build carries that set's account. Builds carry the options set in section 2 of the MOVER tab (brand, transfer and restore settings).</p>
+    <p>Builds for <code id="issueForAccount"></code> <span class="meta" id="issueForNote"></span></p>
+    <p class="meta" id="issueLicLine" style="display:none"></p>
+    <div class="roletiles" id="issueRoleTiles">
+      <button type="button" class="roletile" data-role="mover"><strong>Mover</strong><span class="meta">For the machine being moved from</span></button>
+      <button type="button" class="roletile" data-role="admin"><strong>Admin</strong><span class="meta">For the desk that receives a move</span></button>
+      <button type="button" class="roletile" data-role="host"><strong>Host</strong><span class="meta">For a machine that will be administered: plants once, then keeps itself current</span></button>
+      <button type="button" class="roletile" data-role="viewer"><strong>Admin Viewer</strong><span class="meta">For the admin's own computer: files, Access Computer, Backup, Host updates</span></button>
     </div>
     <p>
-      <button type="button" id="adminDlConfig">Download config.json</button>
-      <button type="button" id="adminDlExe" class="ghost">Download ready build (single exe, config inbuilt)</button>
+      <button type="button" id="issueBuildBtn">Issue the Admin Viewer build</button>
+      <button type="button" id="issueConfigBtn" class="textbtn">Build config (for operators)</button>
     </p>
     <p class="meta" id="adminDlStatus"></p>
-    <p class="meta">Host and viewer downloads are gated by the admin license for the account, same as the admin build.</p>
+    <div id="issueSession" style="display:none">
+      <p><strong>Issued in this visit</strong></p>
+      <div id="issueSessionList"></div>
+    </div>
+    <p class="meta">A machine that already has a Host does not need a fresh build: update it from the Admin Viewer instead. Issue a Host build only for a machine that has none yet.</p>
   </div>
   <div class="card">
     <h3>Machines oversight</h3>
@@ -1282,6 +1424,7 @@ compiled in, nothing else to carry or place beside it.</p>
     document.getElementById("accountId").textContent = data.accountId;
     document.getElementById("accountIdInput").value = "";
     say("Pair created. Download one side, then switch the side and download the other. Both carry this account ID.");
+    refreshLicenses();
   });
   document.getElementById("dlConfig").addEventListener("click", async function () {
     say("");
@@ -1869,6 +2012,7 @@ compiled in, nothing else to carry or place beside it.</p>
   }
   function renderLicenseTable(containerId, licenses, product) {
     var el = document.getElementById(containerId);
+    if (!el) return;
     var rows = licenses.filter(function (lic) { return lic.product === product; });
     if (rows.length === 0) {
       el.innerHTML = '<p class="meta">No ' + esc(product) + " licenses yet. Issue the first one below.</p>";
@@ -1899,41 +2043,247 @@ compiled in, nothing else to carry or place beside it.</p>
   async function refreshLicenses() {
     try {
       var licenses = await fetchLicenses();
+      knownLicenses = licenses;
       renderLicenseTable("extLicenses", licenses, "ext");
       renderLicenseTable("moverLicenses", licenses, "mover");
       renderLicenseTable("adminLicenses", licenses, "admin");
+      renderAllIssueAccounts();
+      updateBuildsCard();
     } catch (e) {
       say("Could not load licenses: " + e.message);
     }
   }
+
+  // ---------------- License issuing: known accounts first ----------------
+  // Issuing works with accounts that exist: the pair account in
+  // section 1 (the default subject) and every account the loaded
+  // data already names (a license, a cloud move). Each account
+  // row states its license state for the card's product in plain
+  // words and issues with one press. Typing an account ID is the
+  // secondary path, and there the ID is required: a blank press
+  // used to mint licenses for random empty accounts (owner
+  // incident, 2026-10-31), so blank now refuses, here and on the
+  // server.
+  var knownLicenses = null;
+  var moveAccountsSeen = {};
+  var LIC_STATUS_IDS = { ext: "extLicStatus", mover: "moverLicStatus", admin: "adminLicStatus" };
+  var LIC_ACCOUNTS_IDS = { ext: "extIssueAccounts", mover: "moverIssueAccounts", admin: "adminIssueAccounts" };
+  function licSay(product, msg) {
+    var el = document.getElementById(LIC_STATUS_IDS[product]);
+    if (el) el.textContent = msg || "";
+  }
+  function productCovers(product) {
+    if (product === "admin") return "Covers the Admin app and the Host and Admin Viewer builds for this account.";
+    if (product === "mover") return "Covers the Mover app for this account.";
+    return "Covers the browser extension for this account.";
+  }
+  function productLicenseName(product) {
+    if (product === "admin") return "Admin license";
+    if (product === "mover") return "Mover license";
+    return "EXT license";
+  }
+  var selectedEstate = "";
+  var machineCountByAccount = null;
+  // The account the Issue builds card serves: the set picked in
+  // the Licences card, or the pair account in section 1 until
+  // one is picked (that account is the default subject).
+  function effectiveBuildAccount() {
+    if (selectedEstate) return selectedEstate;
+    try { return accountId(); } catch (e) { return ""; }
+  }
+  function selectEstate(acct) {
+    selectedEstate = acct || "";
+    renderIssueAccounts("admin");
+    updateBuildsCard();
+    var card = document.getElementById("issueBuildsCard");
+    if (card && card.scrollIntoView) card.scrollIntoView({ block: "nearest" });
+  }
+  function knownAccountIds() {
+    var seen = {};
+    var out = [];
+    function add(a) {
+      if (a && !seen[a]) { seen[a] = true; out.push(a); }
+    }
+    try { add(accountId()); } catch (e) { /* section 1 not ready */ }
+    (knownLicenses || []).forEach(function (lic) { add(lic.accountId); });
+    Object.keys(moveAccountsSeen).forEach(add);
+    if (machineCountByAccount) Object.keys(machineCountByAccount).forEach(add);
+    return out;
+  }
+  function renderIssueAccounts(product) {
+    var el = document.getElementById(LIC_ACCOUNTS_IDS[product]);
+    if (!el) return;
+    if (!knownLicenses) {
+      el.innerHTML = '<p class="meta">Loading accounts.</p>';
+      return;
+    }
+    var pairAccount = "";
+    try { pairAccount = accountId(); } catch (e) { /* section 1 not ready */ }
+    var isAdmin = product === "admin";
+    var selected = effectiveBuildAccount();
+    var html = "";
+    knownAccountIds().forEach(function (acct) {
+      var lic = null;
+      knownLicenses.forEach(function (l) {
+        if (l.accountId === acct && l.product === product) lic = l;
+      });
+      var state = !lic ? "No license yet" : (lic.status === "revoked" ? "Revoked" : "Active");
+      var isSelected = isAdmin && acct === selected && acct !== "";
+      html += '<div class="acctrow' + (isSelected ? " selected" : "") + '"><div class="grow"><code>' + esc(acct) + "</code>" +
+        (lic && lic.label ? ' <span class="meta">' + esc(lic.label) + "</span>" : "") +
+        (acct === pairAccount ? ' <span class="meta">the account in section 1</span>' : "") +
+        (isSelected ? ' <span class="meta">selected for builds</span>' : "") +
+        "<br>" + pill(state, state === "Active" ? "ok" : (state === "Revoked" ? "err" : "mut")) +
+        ' <span class="meta">' + esc(productCovers(product)) + "</span>";
+      if (isAdmin && machineCountByAccount && typeof machineCountByAccount[acct] === "number") {
+        var n = machineCountByAccount[acct];
+        html += ' <span class="meta">' + n + (n === 1 ? " machine" : " machines") + " enrolled under it.</span>";
+      }
+      if (isAdmin && lic) {
+        html += '<br><span class="meta">' + (lic.adminKeyBound
+          ? "Admin key: bound. Builds issued for this account carry its key, and only those builds can drive its machines."
+          : "Admin key: not bound yet. Any build carrying this account ID can drive its machines.") + "</span>";
+      }
+      html += "</div>";
+      if (!lic) {
+        html += '<button type="button" class="small" data-issue-acct="' + esc(acct) + '">Issue the license for this account</button>';
+      } else if (lic.status === "revoked") {
+        html += '<button type="button" class="small ghost" data-restore-acct="' + esc(acct) + '">Restore</button>';
+      } else if (isAdmin) {
+        html += '<button type="button" class="small ghost" data-revoke-acct="' + esc(acct) + '">Revoke</button>';
+      }
+      if (isAdmin && lic) {
+        if (lic.adminKeyBound) {
+          html += '<button type="button" class="small ghost" data-rotate-key="' + esc(acct) + '">Rotate the admin key</button>';
+        } else {
+          html += '<button type="button" class="small" data-bind-key="' + esc(acct) + '">Bind the admin key</button>';
+        }
+      }
+      if (isAdmin) {
+        html += '<button type="button" class="small' + (isSelected ? " ghost" : "") + '" data-builds-acct="' + esc(acct) + '"' +
+          (isSelected ? " disabled" : "") + ">" + (isSelected ? "Builds point here" : "Issue builds") + "</button>";
+      }
+      html += "</div>";
+    });
+    if (!html) {
+      html = isAdmin
+        ? '<p class="meta">No accounts known yet. Create a pair in section 1, or open a new set below.</p>'
+        : '<p class="meta">No accounts known yet. Create a pair in section 1, or issue for an account ID below.</p>';
+    }
+    el.innerHTML = html;
+    el.querySelectorAll("[data-issue-acct]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        issueLicenseFor(product, b.getAttribute("data-issue-acct"), "", "", b);
+      });
+    });
+    el.querySelectorAll("[data-restore-acct]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        licenseChange("restore", product, b.getAttribute("data-restore-acct"));
+      });
+    });
+    el.querySelectorAll("[data-revoke-acct]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        licenseChange("revoke", product, b.getAttribute("data-revoke-acct"));
+      });
+    });
+    el.querySelectorAll("[data-builds-acct]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        selectEstate(b.getAttribute("data-builds-acct"));
+      });
+    });
+    el.querySelectorAll("[data-bind-key]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        bindAdminKey(b.getAttribute("data-bind-key"));
+      });
+    });
+    el.querySelectorAll("[data-rotate-key]").forEach(function (b) {
+      b.addEventListener("click", function () {
+        rotateAdminKey(b.getAttribute("data-rotate-key"));
+      });
+    });
+  }
+  function renderAllIssueAccounts() {
+    renderIssueAccounts("ext");
+    renderIssueAccounts("mover");
+    renderIssueAccounts("admin");
+  }
+  async function issueLicenseFor(product, acct, label, note, btn) {
+    licSay(product, "");
+    if (btn) { btn.disabled = true; }
+    try {
+      var res = await api("/mover/console/api/licenses", {
+        product: product, accountId: acct, label: label || "", note: note || ""
+      });
+      var data = await res.json().catch(function () { return {}; });
+      if (!res.ok) {
+        licSay(product, "Issue failed: " + (data.message || data.error || res.status));
+        return false;
+      }
+      var when = "";
+      if (data.issuedAt) {
+        var d = new Date(data.issuedAt);
+        if (!isNaN(d.getTime())) when = " at " + d.toLocaleString();
+      }
+      licSay(product, productLicenseName(product) + " issued for " + (data.accountId || acct) +
+        ": Active" + when + ". " + productCovers(product));
+      if (product === "admin") {
+        // A fresh licence opens its set: point the builds card
+        // at it straight away, ready for its first builds.
+        selectedEstate = data.accountId || acct;
+        updateBuildsCard();
+      }
+      refreshLicenses();
+      loadOverview();
+      return true;
+    } finally {
+      if (btn) { btn.disabled = false; }
+    }
+  }
+  async function bindAdminKey(acct) {
+    licSay("admin", "");
+    var res = await api("/mover/console/api/licenses/bind-admin-key", { accountId: acct });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) { licSay("admin", "Bind failed: " + (data.message || data.error || res.status)); return; }
+    licSay("admin", "Admin key bound for " + acct + ". Builds issued from now on carry the key; builds already out there keep working only until you rotate. Issue fresh builds for this account from the builds card.");
+    refreshLicenses();
+  }
+  async function rotateAdminKey(acct) {
+    if (!window.confirm("Rotate the admin key for " + acct + "? Viewers and other builds issued before the rotation stop working at once and must be re-issued from this console. Builds you issue after the rotation carry the new key.")) return;
+    licSay("admin", "");
+    var res = await api("/mover/console/api/licenses/rotate-admin-key", { accountId: acct });
+    var data = await res.json().catch(function () { return {}; });
+    if (!res.ok) { licSay("admin", "Rotate failed: " + (data.message || data.error || res.status)); return; }
+    licSay("admin", "Admin key rotated for " + acct + ". Every build issued before now has stopped working. Issue fresh builds for this account from the builds card.");
+    refreshLicenses();
+  }
   async function licenseChange(action, product, acct) {
-    say("");
+    licSay(product, "");
     var res = await api("/mover/console/api/licenses/" + action, { product: product, accountId: acct });
     var data = await res.json().catch(function () { return {}; });
-    if (!res.ok) { say("License " + action + " failed: " + (data.message || data.error || res.status)); return; }
-    say("License " + (action === "revoke" ? "revoked" : "restored") + " for " + acct + " (" + product + ").");
+    if (!res.ok) { licSay(product, "License " + action + " failed: " + (data.message || data.error || res.status)); return; }
+    licSay(product, action === "revoke"
+      ? productLicenseName(product) + " revoked for " + acct + ". New downloads and enrollments for this account are blocked until it is restored. Anything already running keeps running."
+      : productLicenseName(product) + " restored for " + acct + ": Active again.");
     refreshLicenses();
     loadOverview();
   }
   function wireIssue(product, labelId, accountFieldId, noteId, issueId) {
     document.getElementById(issueId).addEventListener("click", async function () {
-      say("");
-      var body = {
-        product: product,
-        label: document.getElementById(labelId).value,
-        note: document.getElementById(noteId).value
-      };
       var acct = document.getElementById(accountFieldId).value.trim();
-      if (acct) body.accountId = acct;
-      var res = await api("/mover/console/api/licenses", body);
-      var data = await res.json().catch(function () { return {}; });
-      if (!res.ok) { say("Issue failed: " + (data.message || data.error || res.status)); return; }
-      say("License issued for " + data.accountId + " (" + product + ").");
+      if (!acct) {
+        // The account ID is required on this path: issuing
+        // without one used to mint a license for a random empty
+        // account. Refuse here; the server refuses too.
+        licSay(product, "Type the account ID first: a license is issued for one named account. Nothing was issued.");
+        return;
+      }
+      var done = await issueLicenseFor(product, acct,
+        document.getElementById(labelId).value,
+        document.getElementById(noteId).value, null);
+      if (!done) return;
       document.getElementById(labelId).value = "";
       document.getElementById(accountFieldId).value = "";
       document.getElementById(noteId).value = "";
-      refreshLicenses();
-      loadOverview();
     });
   }
   wireIssue("ext", "extLabel", "extAccountId", "extNote", "extIssue");
@@ -2075,6 +2425,12 @@ compiled in, nothing else to carry or place beside it.</p>
       document.getElementById("ovLicActive").textContent = active;
       document.getElementById("ovLicRevoked").textContent = revoked;
       var machines = data.machines || [];
+      var countsByAccount = {};
+      machines.forEach(function (m) {
+        if (m.account) countsByAccount[m.account] = (countsByAccount[m.account] || 0) + 1;
+      });
+      machineCountByAccount = countsByAccount;
+      if (knownLicenses) renderIssueAccounts("admin");
       var online = machines.filter(function (m) { return m.online; }).length;
       document.getElementById("ovMachines").textContent = online + " / " + machines.length;
       document.getElementById("ovMoves").textContent = (data.moves || []).length;
@@ -2117,6 +2473,8 @@ compiled in, nothing else to carry or place beside it.</p>
       var data = await res.json().catch(function () { return {}; });
       if (!res.ok) throw new Error(data.message || data.error || ("HTTP " + res.status));
       var moves = data.moves || [];
+      moves.forEach(function (mv) { if (mv.account) moveAccountsSeen[mv.account] = true; });
+      if (knownLicenses) renderAllIssueAccounts();
       if (moves.length === 0) {
         el.innerHTML = '<p class="meta">No cloud moves held for any known account.</p>';
         return;
@@ -2136,38 +2494,164 @@ compiled in, nothing else to carry or place beside it.</p>
   }
   document.getElementById("loadMoves").addEventListener("click", function () { loadCloudMoves(); });
 
-  // ---------------- Admin downloads ----------------
+  // ---------------- Issue builds ----------------
+  // Builds bind to the set selected in the Licences card: the
+  // build carries that set's account, shown on the card, never
+  // typed here. Outcomes are reported on the status line inside
+  // the card (adminDlStatus), not the shared page status: that
+  // one sits in the MOVER section, where an admin working here
+  // never sees the message and the click looks dead.
+  var issueRole = "viewer";
+  var issuedThisVisit = [];
+  var ISSUE_ROLES = {
+    mover: { title: "Mover", file: "RelaynMover.exe", product: "mover" },
+    admin: { title: "Admin", file: "RelaynAdmin.exe", product: "admin" },
+    host: { title: "Host", file: "RelaynHost.exe", product: "admin" },
+    viewer: { title: "Admin Viewer", file: "RelaynAdminViewer.exe", product: "admin" }
+  };
   function adminOptions() {
     var opts = options();
-    opts.role = document.getElementById("adminRole").value;
-    var typed = document.getElementById("dlAdminAccount").value.trim();
-    if (typed) opts.accountId = typed;
+    opts.role = issueRole;
+    var acct = effectiveBuildAccount();
+    if (acct) opts.accountId = acct;
     return opts;
   }
-  function adminExeName(role) {
-    if (role === "host") return "relayn-host.exe";
-    if (role === "viewer") return "relayn-admin-viewer.exe";
-    return "relayn-mover-admin.exe";
-  }
-  // Download outcomes are reported on the status line inside the
-  // Downloads card itself (adminDlStatus), not the shared page status:
-  // that one sits in the MOVER section, where an admin working here
-  // never sees the message and the click looks dead.
   function adminDlSay(msg) {
     var el = document.getElementById("adminDlStatus");
     if (el) el.textContent = msg || "";
   }
-  // The Downloads card carries its own account, visibly: prefill the
-  // account field with the pair account from section 1, so the admin
-  // sees exactly which account a download will carry and can change
-  // it here in the card instead of hunting through another tab.
-  (function () {
-    var f = document.getElementById("dlAdminAccount");
-    if (f && !f.value.trim()) {
-      try { f.value = accountId(); } catch (e) { /* section 1 not ready */ }
+  function issueLicenseRecord() {
+    // The selected set's licence record for the chosen role's
+    // product, or null when it has none. Also null when the
+    // licence list has not loaded, so the card never guesses.
+    if (!knownLicenses) return null;
+    var acct = effectiveBuildAccount();
+    var product = ISSUE_ROLES[issueRole].product;
+    var found = null;
+    knownLicenses.forEach(function (l) {
+      if (l.accountId === acct && l.product === product) found = l;
+    });
+    return found;
+  }
+  function updateBuildsCard() {
+    var acct = effectiveBuildAccount();
+    var forEl = document.getElementById("issueForAccount");
+    if (forEl) forEl.textContent = acct || "(no account yet)";
+    var noteEl = document.getElementById("issueForNote");
+    if (noteEl) {
+      noteEl.textContent = selectedEstate
+        ? "the set selected in the Licences card above"
+        : "the account in section 1, until a set is picked above";
     }
-  })();
-  document.getElementById("adminDlConfig").addEventListener("click", async function () {
+    var licEl = document.getElementById("issueLicLine");
+    var btn = document.getElementById("issueBuildBtn");
+    if (!licEl) return;
+    if (!knownLicenses || !acct) {
+      licEl.style.display = "none";
+      if (btn) btn.disabled = false;
+      return;
+    }
+    licEl.style.display = "";
+    var lic = issueLicenseRecord();
+    if (!lic) {
+      licEl.textContent = "License: none on record for this account and product yet. The build will still issue; issuing the licence above is what opens and bounds this set.";
+      if (btn) btn.disabled = false;
+    } else if (lic.status === "revoked") {
+      licEl.textContent = "License: Revoked. Builds for this set are refused until the licence is restored in the Licences card above.";
+      if (btn) btn.disabled = true;
+    } else {
+      licEl.textContent = "License: Active.";
+      if (btn) btn.disabled = false;
+    }
+  }
+  function selectIssueRole(role) {
+    issueRole = role;
+    document.querySelectorAll("#issueRoleTiles .roletile").forEach(function (t) {
+      t.classList.toggle("active", t.getAttribute("data-role") === role);
+    });
+    var btn = document.getElementById("issueBuildBtn");
+    if (btn) btn.textContent = "Issue the " + ISSUE_ROLES[role].title + " build";
+    updateBuildsCard();
+  }
+  document.querySelectorAll("#issueRoleTiles .roletile").forEach(function (t) {
+    t.addEventListener("click", function () { selectIssueRole(t.getAttribute("data-role")); });
+  });
+  // The stamp a build carries sits inside its own bytes (the
+  // server reads it the same way when it lists machines): scan
+  // for the largest plausible 20 + 10 digit run, bounded by
+  // non-digits.
+  function stampFromExeBytes(buf) {
+    var bytes = new Uint8Array(buf);
+    var best = "";
+    for (var i = 0; i + 12 <= bytes.length; i++) {
+      if (bytes[i] !== 0x32 || bytes[i + 1] !== 0x30) continue;
+      var ok = true;
+      for (var j = 2; j < 12; j++) {
+        var b = bytes[i + j];
+        if (b < 0x30 || b > 0x39) { ok = false; break; }
+      }
+      if (!ok) continue;
+      if (i > 0 && bytes[i - 1] >= 0x30 && bytes[i - 1] <= 0x39) continue;
+      if (i + 12 < bytes.length && bytes[i + 12] >= 0x30 && bytes[i + 12] <= 0x39) continue;
+      var cand = "";
+      for (var k = 0; k < 12; k++) cand += String.fromCharCode(bytes[i + k]);
+      var month = Number(cand.slice(4, 6)), day = Number(cand.slice(6, 8));
+      var hour = Number(cand.slice(8, 10)), minute = Number(cand.slice(10, 12));
+      if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) continue;
+      if (cand > best) best = cand;
+    }
+    return best;
+  }
+  function renderIssuedThisVisit() {
+    var wrap = document.getElementById("issueSession");
+    var list = document.getElementById("issueSessionList");
+    if (!wrap || !list) return;
+    if (issuedThisVisit.length === 0) { wrap.style.display = "none"; return; }
+    wrap.style.display = "";
+    list.innerHTML = issuedThisVisit.map(function (it) {
+      var time = it.at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+      return '<div class="trow">' + esc(it.role) + ' build <span class="meta">account ...' + esc(it.tail) +
+        (it.stamp ? ", build " + esc(it.stamp) : "") + ", " + esc(time) + "</span></div>";
+    }).join("");
+  }
+  document.getElementById("issueBuildBtn").addEventListener("click", async function () {
+    var btn = document.getElementById("issueBuildBtn");
+    var lic = issueLicenseRecord();
+    if (lic && lic.status === "revoked") {
+      // Refused in the card with the reason, the same refusal
+      // the server would give: nothing is built for a revoked set.
+      adminDlSay("Refused: this set's licence is Revoked, so no build can be issued for it. Restore the licence in the Licences card above first.");
+      return;
+    }
+    var role = ISSUE_ROLES[issueRole];
+    adminDlSay("");
+    btn.disabled = true;
+    var label = btn.textContent;
+    btn.textContent = "Issuing the " + role.title + " build...";
+    try {
+      var opts = adminOptions();
+      var res = await api("/mover/console/api/package", opts);
+      if (!res.ok) {
+        var err = await res.json().catch(function () { return {}; });
+        adminDlSay("Issue failed: " + (err.message || err.error || res.status));
+        return;
+      }
+      var blob = await res.blob();
+      var stamp = "";
+      try { stamp = stampFromExeBytes(await blob.arrayBuffer()); } catch (e) { /* the stamp stays unreported */ }
+      saveBlob(blob, role.file);
+      var acct = opts.accountId || "";
+      var tail = acct ? acct.slice(-6) : "";
+      adminDlSay("Issued " + role.file + " for account ..." + tail +
+        (stamp ? ", build " + stamp : "") + ", " + fmtBytes(blob.size) + ". The download has started.");
+      issuedThisVisit.unshift({ role: role.title, tail: tail, stamp: stamp, at: new Date() });
+      renderIssuedThisVisit();
+    } finally {
+      btn.textContent = label;
+      updateBuildsCard();
+    }
+  });
+  document.getElementById("issueConfigBtn").addEventListener("click", async function () {
     adminDlSay("");
     var res = await api("/mover/console/api/config", adminOptions());
     if (!res.ok) {
@@ -2178,27 +2662,13 @@ compiled in, nothing else to carry or place beside it.</p>
     saveBlob(await res.blob(), "config.json");
     adminDlSay("Download started: config.json");
   });
-  document.getElementById("adminDlExe").addEventListener("click", async function () {
-    var btn = document.getElementById("adminDlExe");
-    adminDlSay("");
-    btn.disabled = true;
-    var label = btn.textContent;
-    btn.textContent = "Building...";
-    try {
-      var opts = adminOptions();
-      var res = await api("/mover/console/api/package", opts);
-      if (!res.ok) {
-        var err = await res.json().catch(function () { return {}; });
-        adminDlSay("Ready build failed: " + (err.message || err.error || res.status));
-        return;
-      }
-      var name = adminExeName(opts.role);
-      saveBlob(await res.blob(), name);
-      adminDlSay("Download started: " + name);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = label;
-    }
+  selectIssueRole("viewer");
+  document.getElementById("accountIdInput").addEventListener("input", function () {
+    // The section 1 account is the default subject everywhere:
+    // when it changes, the estate rows and the builds card
+    // follow it (a set picked above still wins for builds).
+    renderAllIssueAccounts();
+    updateBuildsCard();
   });
 
   // ---------------- Admin machines oversight ----------------
@@ -2909,6 +3379,20 @@ export async function moverConsoleRoutes(
     return false;
   }
 
+  /**
+   * Issuing bakes the binding: when the account's licence is
+   * bound, its admin key rides into the issued config so the
+   * build answers the admin-key guard on the account's routes.
+   * Unbound accounts bake exactly as before.
+   */
+  function withBoundKey(opts: MoverPairOptions): MoverPairOptions {
+    if (licenseStore) {
+      const key = licenseStore.boundAdminKey(opts.accountId);
+      if (key) opts.adminKey = key;
+    }
+    return opts;
+  }
+
   function needLicenseStore(
     reply: FastifyReply
   ): LicenseStore | undefined {
@@ -2965,7 +3449,7 @@ export async function moverConsoleRoutes(
     const opts = parseOptions(request, reply);
     if (!opts) return;
     if (!licenseGate(reply, opts)) return;
-    const cfg = buildMoverConfig(opts);
+    const cfg = buildMoverConfig(withBoundKey(opts));
     const check = validateMoverConfig(cfg);
     if (!check.ok) {
       return reply.code(400).send({
@@ -3003,7 +3487,7 @@ export async function moverConsoleRoutes(
       });
     }
 
-    const cfg = buildMoverConfig(opts);
+    const cfg = buildMoverConfig(withBoundKey(opts));
     const check = validateMoverConfig(cfg);
     if (!check.ok) {
       return reply.code(400).send({
@@ -3048,9 +3532,9 @@ export async function moverConsoleRoutes(
           message: "product must be one of: ext, mover, admin."
         });
       }
-      return { licenses: ls.list(raw) };
+      return { licenses: ls.list(raw).map(publicLicense) };
     }
-    return { licenses: ls.list() };
+    return { licenses: ls.list().map(publicLicense) };
   });
 
   app.post("/mover/console/api/licenses", async (request, reply) => {
@@ -3064,11 +3548,21 @@ export async function moverConsoleRoutes(
         message: "product must be one of: ext, mover, admin."
       });
     }
-    let accountId = typeof body.accountId === "string" ? body.accountId : "";
+    const accountId = typeof body.accountId === "string" ? body.accountId.trim() : "";
     if (accountId === "") {
-      // No account named: mint a fresh one, same shape as a pair.
-      accountId = `mv${randomBytes(10).toString("hex")}`;
-    } else if (!ACCOUNT_ID_RE.test(accountId)) {
+      // A licence is always issued FOR a named account. A blank
+      // account used to mint a fresh random one here, which
+      // silently created licences for empty accounts nobody
+      // holds (owner incident, 2026-10-31: two presses with the
+      // field blank). Refuse instead and issue nothing. New
+      // accounts are born through pair creation, never here.
+      return reply.code(400).send({
+        error: "ACCOUNT_REQUIRED",
+        message:
+          "Name the account first: a licence is issued for one account, and no account was named. Nothing was issued."
+      });
+    }
+    if (!ACCOUNT_ID_RE.test(accountId)) {
       return reply.code(400).send({
         error: "INVALID_ACCOUNT",
         message: "accountId must be 8-64 URL-safe characters."
@@ -3080,7 +3574,7 @@ export async function moverConsoleRoutes(
       typeof body.label === "string" ? body.label : "",
       typeof body.note === "string" ? body.note : ""
     );
-    return lic;
+    return publicLicense(lic);
   });
 
   function licenseChange(kind: "revoke" | "restore") {
@@ -3112,7 +3606,7 @@ export async function moverConsoleRoutes(
           message: "No license exists for that product and account."
         });
       }
-      return lic;
+      return publicLicense(lic);
     };
   }
 
@@ -3126,6 +3620,65 @@ export async function moverConsoleRoutes(
   );
 
   // ----------------------------------------------------------------
+  // The admin key deeds: bind and rotate. The key itself never
+  // crosses this API in either direction: the deeds answer with
+  // the bound state only. Builds pick the key up at issue time
+  // from the licence store itself (withBoundKey, buildRoleExe).
+  // Rotating replaces the key in one write, so every build
+  // issued before the rotation stops passing the guard at once
+  // and must be re-issued.
+  // ----------------------------------------------------------------
+
+  function adminKeyDeed(kind: "bind" | "rotate") {
+    return async (request: FastifyRequest, reply: FastifyReply) => {
+      if (!gate(request, reply)) return;
+      const ls = needLicenseStore(reply);
+      if (!ls) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const accountId =
+        typeof body.accountId === "string" ? body.accountId : "";
+      if (!ACCOUNT_ID_RE.test(accountId)) {
+        return reply.code(400).send({
+          error: "INVALID_ACCOUNT",
+          message: "accountId must be 8-64 URL-safe characters."
+        });
+      }
+      if (!ls.get("admin", accountId)) {
+        return reply.code(404).send({
+          error: "LICENSE_NOT_FOUND",
+          message:
+            "No admin license exists for that account yet. Issue the license first, then bind its admin key."
+        });
+      }
+      const bound = ls.adminKeyBound(accountId);
+      if (kind === "bind" && bound) {
+        return reply.code(409).send({
+          error: "ADMIN_KEY_ALREADY_BOUND",
+          message:
+            "This account already has an admin key bound. Rotate it instead if the old key may be out in the wild."
+        });
+      }
+      if (kind === "rotate" && !bound) {
+        return reply.code(409).send({
+          error: "ADMIN_KEY_NOT_BOUND",
+          message: "No admin key is bound to this account yet. Bind one first."
+        });
+      }
+      await ls.setAdminKey(accountId);
+      return { accountId, adminKeyBound: true };
+    };
+  }
+
+  app.post(
+    "/mover/console/api/licenses/bind-admin-key",
+    adminKeyDeed("bind")
+  );
+  app.post(
+    "/mover/console/api/licenses/rotate-admin-key",
+    adminKeyDeed("rotate")
+  );
+
+  // ----------------------------------------------------------------
   // Overview + cloud moves: one read across every known account
   // (license accounts union console pairs) for the Overview, EXT
   // and MOVER tabs.
@@ -3134,7 +3687,7 @@ export async function moverConsoleRoutes(
   app.get("/mover/console/api/overview", async (request, reply) => {
     if (!gate(request, reply)) return;
     const accounts = knownAccounts();
-    const licenses = licenseStore ? licenseStore.list() : [];
+    const licenses = licenseStore ? licenseStore.list().map(publicLicense) : [];
     const licenseCounts: Record<
       LicenseProduct,
       { active: number; revoked: number }
@@ -3759,12 +4312,10 @@ export async function moverConsoleRoutes(
 
   /** True when an anchor queue may proceed for this account. */
   function anchorLicenseGate(reply: FastifyReply, acc: string): boolean {
-    if (!licenseStore) return true;
-    if (!licenseStore.hasRevoked(acc)) return true;
+    if (!anchorLicenseBlocked(licenseStore, acc)) return true;
     reply.code(403).send({
       error: "LICENSE_REVOKED",
-      message:
-        "This account has a revoked license, so anchor updates and deliveries are blocked. Restore the license in the console to allow them again."
+      message: ANCHOR_LICENSE_MESSAGE
     });
     return false;
   }
@@ -3778,25 +4329,46 @@ export async function moverConsoleRoutes(
       const body = (request.body ?? {}) as Record<string, unknown>;
       const acc = consoleAccountId(reply, body, null);
       if (!acc) return;
-      const served = servedBuildStamp();
       const stamp = typeof body.stamp === "string" ? body.stamp : "";
-      if (!served || stamp !== served) {
-        return reply.code(400).send({
-          error: "STAMP_MISMATCH",
-          message: served
-            ? `An update names the exact build this server serves (${served}); the request named "${stamp || "no stamp"}", so nothing was queued.`
-            : "This server serves no stamped build (MOVER_BASE_EXE unset or unstamped), so no update can be ordered."
-        });
-      }
-      if (!anchorLicenseGate(reply, acc)) return;
       const params = request.params as { machineId: string };
-      const cmd = isValidHeadlessMachineId(params.machineId)
-        ? await st.queueHeadlessCommand(acc, params.machineId, "anchor-update", {
-            stamp
-          })
+      // The deed itself is shared with the headless operator
+      // route the Admin Viewer calls (queueAnchorUpdate): one
+      // rule set, two doors.
+      const out = await queueAnchorUpdate(
+        st,
+        licenseStore,
+        acc,
+        params.machineId,
+        stamp
+      );
+      if (!out.ok) {
+        return reply
+          .code(out.status)
+          .send({ error: out.error, message: out.message });
+      }
+      return { commandId: out.cmd.id, signature: out.cmd.signature };
+    }
+  );
+
+  // Dump a Host from the console: the same retire deed the Admin
+  // Viewer holds (mover-headless.ts), behind the console key as
+  // the operator master. One store call, so the two doors can
+  // never drift apart.
+  app.post(
+    "/mover/console/api/machines/:machineId/retire",
+    async (request, reply) => {
+      if (!gate(request, reply)) return;
+      const st = needStore(reply);
+      if (!st) return;
+      const body = (request.body ?? {}) as Record<string, unknown>;
+      const acc = consoleAccountId(reply, body, null);
+      if (!acc) return;
+      const params = request.params as { machineId: string };
+      const rec = isValidHeadlessMachineId(params.machineId)
+        ? await st.retireHeadlessMachine(acc, params.machineId)
         : undefined;
-      if (!cmd) return machineNotFound(reply);
-      return { commandId: cmd.id, signature: cmd.signature };
+      if (!rec) return machineNotFound(reply);
+      return { machineId: rec.machineId, retiredAt: rec.retiredAt };
     }
   );
 
