@@ -160,7 +160,7 @@ export async function partitionRoutes(
       packPath,
       machineNameHint(acc, machineId)
     );
-    if (!meta) return reply.code(404).send({ error: "not found in Partition" });
+    if (!meta) return reply.code(404).send({ error: "not found in Access Computer" });
     // Refs only: sealed bytes stay in the move store.
     return {
       packPath: meta.packPath,
