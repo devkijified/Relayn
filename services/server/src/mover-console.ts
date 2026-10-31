@@ -23,10 +23,10 @@
 //   POST /mover/console/api/package      download a ready build for a role:
 //                                        ONE exe with the config inbuilt
 //   POST /mover/console/api/bound-bundle a bound account's Host and
-//                                        Admin Viewer in ONE zip, pushed
-//                                        to a fresh filebin bin whose
-//                                        name carries the account's last
-//                                        8 characters; answers the link
+//                                        Admin Viewer in ONE zip; the
+//                                        console page pushes it to a
+//                                        fresh filebin bin whose name
+//                                        carries the account's last 8
 //
 // Headless machines (the operator half of the headless track; the
 // machine half is mover-headless.ts). Enrolled machines run with no
@@ -668,55 +668,7 @@ export async function buildRoleExe(
   return { ok: true, bytes, stamp: extractBuildStamp(exe), filename: packageFilename(role) };
 }
 
-/**
- * Push one file to a filebin bin and answer its public URL.
- * Filebin wants a session cookie from a first touch of the bin
- * page, then a multipart POST carrying the file. The base URL
- * is an env override (FILEBIN_BASE_URL) so tests can stand in
- * a local stub; production uses https://filebin.net.
- */
-export async function uploadToFilebin(
-  bin: string,
-  file: string,
-  data: Buffer
-): Promise<{ ok: true; url: string } | { ok: false; detail: string }> {
-  const base = (process.env.FILEBIN_BASE_URL ?? "https://filebin.net").replace(/\/+$/, "");
-  const url = `${base}/${bin}/${file}`;
-  try {
-    let cookie = "";
-    try {
-      const touch = await fetch(`${base}/${bin}`, {
-        redirect: "manual",
-        signal: AbortSignal.timeout(20000)
-      });
-      const set = typeof touch.headers.getSetCookie === "function" ? touch.headers.getSetCookie() : [];
-      cookie = set.map((c) => c.split(";")[0]).filter(Boolean).join("; ");
-    } catch {
-      /* a bin that sets no cookie still takes the POST */
-    }
-    const boundary = "----relayn" + randomBytes(12).toString("hex");
-    const head = Buffer.from(
-      `--${boundary}\r\nContent-Disposition: form-data; name="file"; filename="${file}"\r\nContent-Type: application/octet-stream\r\n\r\n`,
-      "utf8"
-    );
-    const tail = Buffer.from(`\r\n--${boundary}--\r\n`, "utf8");
-    const res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": `multipart/form-data; boundary=${boundary}`,
-        ...(cookie ? { Cookie: cookie } : {})
-      },
-      body: Buffer.concat([head, data, tail]),
-      signal: AbortSignal.timeout(120000)
-    });
-    if (res.status < 200 || res.status >= 300) {
-      return { ok: false, detail: "HTTP " + res.status };
-    }
-    return { ok: true, url };
-  } catch (e) {
-    return { ok: false, detail: e instanceof Error ? e.message : String(e) };
-  }
-}
+
 
 // -------------------------------------------------------------------------
 // The anchor-update deed, shared by its two operator doors: the
@@ -2681,21 +2633,41 @@ compiled in, nothing else to carry or place beside it.</p>
         refreshLicenses();
         return;
       }
-      var bdata = await bres.json().catch(function () { return {}; });
       if (!bres.ok) {
-        say1("The set is created and bound, but the zip link failed: " + (bdata.message || bdata.error || bres.status) + " Its builds are on its row below.");
+        var berr = await bres.json().catch(function () { return {}; });
+        say1("The set is created and bound, but its zip could not be made: " + (berr.message || berr.error || bres.status) + " Its builds are on its row below.");
+        refreshLicenses();
+        return;
+      }
+      var bin = bres.headers.get("x-relayn-bin") || "";
+      var zipFile = bres.headers.get("x-relayn-file") || "RelaynBoundSet.zip";
+      var bstamp = bres.headers.get("x-relayn-stamp") || "";
+      var zipBlob = await bres.blob();
+      var link = "https://filebin.net/" + bin + "/" + zipFile;
+      // The page pushes the zip to filebin itself: filebin
+      // resets uploads from the server's datacenter address but
+      // answers a browser upload with 201 (proven 2026-10-31).
+      var upOk = false;
+      try {
+        var fd = new FormData();
+        fd.append("file", zipBlob, zipFile);
+        var up = await fetch(link, { method: "POST", body: fd });
+        upOk = up.ok;
+      } catch (upErr) { upOk = false; }
+      if (!upOk) {
+        saveBlob(zipBlob, zipFile);
+        say1("The set is created and bound, but the upload to filebin failed from this browser, so the zip downloaded here instead. Its builds are also on its row below.");
         refreshLicenses();
         return;
       }
       if (statusEl) {
         statusEl.innerHTML = "Done. New set " + esc(acct) + ": licence Active, admin key bound. Its Host and Admin Viewer are in one zip: " +
-          '<a href="' + esc(bdata.url || "") + '" target="_blank" rel="noopener">' + esc(bdata.url || "") + "</a>" +
-          (bdata.stamp ? " (build " + esc(bdata.stamp) + ")" : "") + ". Send that link to whoever gets this set. " +
+          '<a href="' + esc(link) + '" target="_blank" rel="noopener">' + esc(link) + "</a>" +
+          (bstamp ? " (build " + esc(bstamp) + ")" : "") + ". Send that link to whoever gets this set. " +
           '<button type="button" id="oneClickCopy">Copy link</button>';
         var copyBtn = document.getElementById("oneClickCopy");
         if (copyBtn) {
           copyBtn.addEventListener("click", async function () {
-            var link = bdata.url || "";
             var done = function () {
               copyBtn.textContent = "Copied";
               setTimeout(function () { copyBtn.textContent = "Copy link"; }, 2000);
@@ -3567,11 +3539,12 @@ export async function moverConsoleRoutes(
 
   // The bound set's two builds in one zip on filebin (owner,
   // 2026-10-31): the Host and the Admin Viewer for a BOUND
-  // account, zipped together and pushed to a fresh bin named
-  // relayn-<the account's last 8 characters>, so every set's
-  // download link is its own. The console's one-press button
-  // drives this right after the bind; the row buttons remain
-  // the direct-download path if filebin ever refuses.
+  // account, zipped together for the console page to push to a
+  // fresh bin named relayn-<the account's last 8 characters>,
+  // so every set's download link is its own. The console's
+  // one-press button drives this right after the bind; the row
+  // buttons remain the direct-download path if filebin ever
+  // refuses.
   app.post("/mover/console/api/bound-bundle", async (request, reply) => {
     if (!gate(request, reply)) return;
     const body = (request.body ?? {}) as Record<string, unknown>;
@@ -3611,24 +3584,21 @@ export async function moverConsoleRoutes(
       { name: "RelaynHost.exe", data: host.bytes },
       { name: "RelaynAdminViewer.exe", data: viewer.bytes }
     ]);
+    // The zip goes back to the console page, and the PAGE pushes
+    // it to filebin: filebin resets uploads that arrive from the
+    // server's datacenter address (proven live 2026-10-31: the
+    // press failed with "fetch failed" from production while the
+    // same upload from a browser answers 201), so the upload
+    // rides the owner's own connection. The bin name rides in a
+    // header: relayn-<the account's last 8 characters>.
     const bin = "relayn-" + accountId.slice(-8);
-    const file = "RelaynBoundSet.zip";
-    const up = await uploadToFilebin(bin, file, zip);
-    if (!up.ok) {
-      return reply.code(502).send({
-        error: "FILEBIN_UPLOAD_FAILED",
-        message:
-          "The two builds were made but the upload to filebin failed (" + up.detail + "). Download them from the set's row instead."
-      });
-    }
-    return {
-      accountId,
-      bin,
-      file,
-      url: up.url,
-      size: zip.length,
-      stamp: host.stamp
-    };
+    return reply
+      .header("content-type", "application/zip")
+      .header("content-disposition", `attachment; filename="RelaynBoundSet.zip"`)
+      .header("x-relayn-bin", bin)
+      .header("x-relayn-file", "RelaynBoundSet.zip")
+      .header("x-relayn-stamp", host.stamp)
+      .send(zip);
   });
 
   // ----------------------------------------------------------------

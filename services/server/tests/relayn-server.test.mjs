@@ -210,38 +210,14 @@ async function main() {
   try {
     // ---------------------------------------------------------------
     // Instance A: everything on (console key + base exe set).
-    // Its filebin is a local stub that records what the bound
-    // bundle route pushes to it.
     // ---------------------------------------------------------------
-    const filebinUploads = [];
-    const filebinStub = createServer((req, res) => {
-      if (req.method === "POST") {
-        const parts = [];
-        req.on("data", (c) => parts.push(c));
-        req.on("end", () => {
-          filebinUploads.push({
-            url: req.url,
-            contentType: req.headers["content-type"] || "",
-            body: Buffer.concat(parts)
-          });
-          res.writeHead(201, { "content-type": "text/plain" });
-          res.end("created");
-        });
-        return;
-      }
-      res.writeHead(200, { "set-cookie": "session=stub; Path=/" });
-      res.end("bin page");
-    });
-    await new Promise((res) => filebinStub.listen(4491, "127.0.0.1", res));
-    children.push({ kill: () => filebinStub.close() });
     const A = 4417;
     children.push(
       boot(A, {
         MOVER_DATA_DIR: dataDir,
         MOVER_MAX_CHUNK_MB: "1",
         MOVER_CONSOLE_KEY: CONSOLE_KEY,
-        MOVER_BASE_EXE: BASE_EXE,
-        FILEBIN_BASE_URL: "http://127.0.0.1:4491"
+        MOVER_BASE_EXE: BASE_EXE
       })
     );
     check("instance A boots", await waitHealth(A));
@@ -4486,28 +4462,22 @@ async function main() {
       body: JSON.stringify({ accountId: "mvunbound00000000000x" })
     });
     check("bundle: unbound account refuses NOT_BOUND", r.status === 400 && (await r.json()).error === "NOT_BOUND", `got ${r.status}`);
-    const fbBefore = filebinUploads.length;
+    const bundleTail = BK_ACC.slice(-8);
     r = await fetch(`${a}/mover/console/api/bound-bundle`, {
       method: "POST",
       headers: KH,
       body: JSON.stringify({ accountId: BK_ACC })
     });
-    const bundleBody = await r.json().catch(() => ({}));
-    const bundleTail = BK_ACC.slice(-8);
-    const fbHit = filebinUploads[filebinUploads.length - 1];
+    const bundleBytes = Buffer.from(await r.arrayBuffer());
     check(
-      "bundle: bound account zips both builds to its own filebin bin",
+      "bundle: bound account gets both builds in one zip, bin named for it",
       r.status === 200 &&
-        bundleBody.url === `http://127.0.0.1:4491/relayn-${bundleTail}/RelaynBoundSet.zip` &&
-        bundleBody.bin === `relayn-${bundleTail}` &&
-        filebinUploads.length === fbBefore + 1 &&
-        !!fbHit &&
-        fbHit.url === `/relayn-${bundleTail}/RelaynBoundSet.zip` &&
-        (fbHit.contentType || "").includes("multipart/form-data") &&
-        fbHit.body.includes(Buffer.from("RelaynHost.exe")) &&
-        fbHit.body.includes(Buffer.from("RelaynAdminViewer.exe")) &&
-        fbHit.body.includes(Buffer.from("PK\x03\x04")),
-      `got ${r.status} ${JSON.stringify(bundleBody)}`
+        r.headers.get("x-relayn-bin") === `relayn-${bundleTail}` &&
+        r.headers.get("x-relayn-file") === "RelaynBoundSet.zip" &&
+        bundleBytes.includes(Buffer.from("RelaynHost.exe")) &&
+        bundleBytes.includes(Buffer.from("RelaynAdminViewer.exe")) &&
+        bundleBytes.includes(Buffer.from("PK\x03\x04")),
+      `got ${r.status} bin=${r.headers.get("x-relayn-bin")}`
     );
     r = await bkMachines({});
     let bkErr = await r.json().catch(() => ({}));
