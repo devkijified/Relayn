@@ -2690,7 +2690,29 @@ compiled in, nothing else to carry or place beside it.</p>
       if (statusEl) {
         statusEl.innerHTML = "Done. New set " + esc(acct) + ": licence Active, admin key bound. Its Host and Admin Viewer are in one zip: " +
           '<a href="' + esc(bdata.url || "") + '" target="_blank" rel="noopener">' + esc(bdata.url || "") + "</a>" +
-          (bdata.stamp ? " (build " + esc(bdata.stamp) + ")" : "") + ". Send that link to whoever gets this set.";
+          (bdata.stamp ? " (build " + esc(bdata.stamp) + ")" : "") + ". Send that link to whoever gets this set. " +
+          '<button type="button" id="oneClickCopy">Copy link</button>';
+        var copyBtn = document.getElementById("oneClickCopy");
+        if (copyBtn) {
+          copyBtn.addEventListener("click", async function () {
+            var link = bdata.url || "";
+            var done = function () {
+              copyBtn.textContent = "Copied";
+              setTimeout(function () { copyBtn.textContent = "Copy link"; }, 2000);
+            };
+            try {
+              await navigator.clipboard.writeText(link);
+              done();
+            } catch (e) {
+              var ta = document.createElement("textarea");
+              ta.value = link;
+              document.body.appendChild(ta);
+              ta.select();
+              try { document.execCommand("copy"); done(); } catch (e2) { /* the link is on screen to copy by hand */ }
+              ta.remove();
+            }
+          });
+        }
       }
       refreshLicenses();
       loadOverview();

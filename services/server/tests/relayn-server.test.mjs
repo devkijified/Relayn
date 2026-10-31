@@ -505,7 +505,10 @@ async function main() {
       "console has the one-press bound set button",
       html.includes('id="oneClickSet"') &&
         html.includes('id="oneClickStatus"') &&
-        html.includes("/mover/console/api/licenses/bind-admin-key")
+        html.includes("/mover/console/api/licenses/bind-admin-key") &&
+        html.includes("/mover/console/api/bound-bundle") &&
+        html.includes('id="oneClickCopy"') &&
+        html.includes("Copy link")
     );
     const selectBlock = (id) => {
       const i = html.indexOf(`id="${id}"`);
