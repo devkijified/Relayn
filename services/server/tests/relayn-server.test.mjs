@@ -2076,6 +2076,17 @@ async function main() {
         dRow?.anchorLast === null,
       JSON.stringify({ served: dMachines.buildStamp, row: dRow?.buildStamp })
     );
+    r = await fetch(`${d}/api/headless/machines`, {
+      headers: { "x-account-id": ANCHOR_ACC }
+    });
+    const dOpMachines = await r.json();
+    check(
+      "operator machines list carries the served stamp for the Viewer version mark",
+      r.status === 200 &&
+        dOpMachines.buildStamp === SERVED_STAMP &&
+        (dOpMachines.machines ?? []).some((m) => m.machineId === AMID),
+      JSON.stringify({ served: dOpMachines.buildStamp })
+    );
     const queueAnchor = async (action, body) => {
       const res = await fetch(
         `${d}/mover/console/api/machines/${AMID}/${action}`,

@@ -112,6 +112,7 @@ import {
   buildRoleExe,
   productForRole,
   queueAnchorUpdate,
+  servedBuildStamp,
   type MoverRole
 } from "./mover-console.js";
 import {
@@ -339,7 +340,14 @@ export async function headlessRoutes(
     const acc = needAccount(request, reply);
     if (!acc) return;
     if (!needAdminKey(licenseStore, request, reply, acc)) return;
-    return { machines: moverStore.listHeadlessMachines(acc) };
+    // The current build rides beside the list, like the console
+    // machines route: the Admin Viewer marks each machine's own
+    // build stamp Latest or Old version against it, and names
+    // it as the Update Host deed's target.
+    return {
+      machines: moverStore.listHeadlessMachines(acc),
+      buildStamp: servedBuildStamp()
+    };
   });
 
   app.post(
