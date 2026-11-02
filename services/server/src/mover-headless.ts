@@ -577,4 +577,52 @@ export async function headlessRoutes(
       .header("x-build-size", String(built.bytes.length))
       .send(built.bytes);
   });
+
+  // ------------------------------------------------------------------
+  // Viewer self-update download: the operator channel's own build
+  // door. The Admin Viewer holds no machine secret by design, so
+  // it cannot use the anchor's machine door above; this door
+  // serves the SAME bound viewer build the console package route
+  // issues (buildRoleExe with the account's bound admin key
+  // baked in), behind the standing operator credentials: the
+  // account header plus the binding key. The license gate is the
+  // pair download's own: the viewer product's license revoked for
+  // this account refuses with LICENSE_REVOKED. X-Build-Stamp and
+  // X-Build-Size ride along so the Viewer can verify the
+  // download against the served build before any swap.
+  // ------------------------------------------------------------------
+  app.get("/api/headless/viewer-build", async (request, reply) => {
+    const acc = needAccount(request, reply);
+    if (!acc) return;
+    if (!needAdminKey(licenseStore, request, reply, acc)) return;
+    if (
+      licenseStore &&
+      licenseStore.isRevoked(productForRole("viewer"), acc)
+    ) {
+      return reply.code(403).send({
+        error: "LICENSE_REVOKED",
+        message:
+          "This account's license for that product is revoked, so its builds cannot be downloaded. Restore the license in the console to allow downloads again."
+      });
+    }
+    const built = await buildRoleExe(
+      "viewer",
+      acc,
+      licenseStore ? licenseStore.boundAdminKey(acc) : ""
+    );
+    if (!built.ok) {
+      return reply
+        .code(built.status)
+        .send({ error: built.error, message: built.message });
+    }
+    return reply
+      .header("content-type", "application/octet-stream")
+      .header(
+        "content-disposition",
+        `attachment; filename="${built.filename}"`
+      )
+      .header("x-build-stamp", built.stamp)
+      .header("x-build-size", String(built.bytes.length))
+      .send(built.bytes);
+  });
 }

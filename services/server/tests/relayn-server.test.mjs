@@ -2087,6 +2087,35 @@ async function main() {
         (dOpMachines.machines ?? []).some((m) => m.machineId === AMID),
       JSON.stringify({ served: dOpMachines.buildStamp })
     );
+    r = await fetch(`${d}/api/headless/viewer-build`);
+    check(
+      "viewer-build download without an account header -> 401",
+      r.status === 401,
+      `got ${r.status}`
+    );
+    r = await fetch(`${d}/api/headless/viewer-build`, {
+      headers: { "x-account-id": ANCHOR_ACC }
+    });
+    const viewerBuiltBody = Buffer.from(await r.arrayBuffer());
+    const viewerOverlayAt = viewerBuiltBody.lastIndexOf("RLNMCFG1");
+    const viewerOverlayLen =
+      viewerOverlayAt >= 4 ? viewerBuiltBody.readUInt32LE(viewerOverlayAt - 4) : 0;
+    const viewerOverlayCfg = JSON.parse(
+      viewerBuiltBody.toString(
+        "utf8",
+        viewerOverlayAt - 4 - viewerOverlayLen,
+        viewerOverlayAt - 4
+      )
+    );
+    check(
+      "viewer-build serves the bound viewer build to the operator channel (Viewer self-update)",
+      r.status === 200 &&
+        r.headers.get("x-build-stamp") === SERVED_STAMP &&
+        Number(r.headers.get("x-build-size")) === viewerBuiltBody.length &&
+        viewerOverlayCfg.account?.id === ANCHOR_ACC &&
+        viewerOverlayCfg.role === "viewer",
+      `stamp ${r.headers.get("x-build-stamp")} overlay ${JSON.stringify(viewerOverlayCfg.account ?? {})}/${viewerOverlayCfg.role ?? ""}`
+    );
     const queueAnchor = async (action, body) => {
       const res = await fetch(
         `${d}/mover/console/api/machines/${AMID}/${action}`,
@@ -2240,6 +2269,15 @@ async function main() {
       "host build download for a revoked account -> 403 LICENSE_REVOKED",
       r.status === 403 && revokedBody.error === "LICENSE_REVOKED",
       `got ${r.status} ${JSON.stringify(revokedBody)}`
+    );
+    r = await fetch(`${d}/api/headless/viewer-build`, {
+      headers: { "x-account-id": ANCHOR_ACC }
+    });
+    const revokedViewerBody = await r.json().catch(() => ({}));
+    check(
+      "viewer-build download for a revoked account -> 403 LICENSE_REVOKED",
+      r.status === 403 && revokedViewerBody.error === "LICENSE_REVOKED",
+      `got ${r.status} ${JSON.stringify(revokedViewerBody)}`
     );
     r = await fetch(`${d}/api/headless/build?role=mover`, { headers: AAUTH });
     check(
