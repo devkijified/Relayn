@@ -106,6 +106,32 @@ export function isShellPath(packPath: string): boolean {
   return false;
 }
 
+/** The Chrome profile root inside the Partition tree: the
+ * browserPrep heart of Access Computer. Relayn Browser opens
+ * from this payload, so the pull plan treats it as wave zero
+ * (owner order 2026-11-05: the browser is pulled first, ahead
+ * of the desktop shell and everything else). */
+export const PARTITION_BROWSER_ROOT =
+  "appData/Local/Google/Chrome/User Data";
+
+/** True when a pack path is the Chrome profile root or under it. */
+export function isBrowserPath(packPath: string): boolean {
+  return (
+    packPath === PARTITION_BROWSER_ROOT ||
+    packPath.startsWith(PARTITION_BROWSER_ROOT + "/")
+  );
+}
+
+/** True when a catalog entry is browser payload: a path under
+ * the Chrome profile root, or any entry the inventory classed
+ * as browserPrep (the mover-side category for the same payload). */
+export function isBrowserEntry(e: {
+  packPath: string;
+  category?: string;
+}): boolean {
+  return e.category === "browserPrep" || isBrowserPath(e.packPath);
+}
+
 /**
  * The standing per-account, per-machine catalog. Source of truth for
  * Partition listings across Viewer restarts and multiple operators.

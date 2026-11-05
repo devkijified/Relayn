@@ -9,9 +9,13 @@
 // does not stop background seeding while the Host stays awake.
 //
 // SCHEDULE (same priority spine as auto-pull):
-//   1. SHELL SET first  -- PARTITION_SHELL_PREFIXES from partition-store
+//   1. BROWSER first -- the Chrome profile payload (browserPrep):
+//      Relayn Browser is the priority surface of Access Computer
+//      and opens from this payload, so it is wave zero, ahead of
+//      everything (owner order 2026-11-05).
+//   2. SHELL SET next  -- PARTITION_SHELL_PREFIXES from partition-store
 //      (files/Desktop, Start Menu Programs, TaskBar pins, setup/wallpaper).
-//   2. then SIZE-ASCENDING over the remaining not-yet-available entries
+//   3. then SIZE-ASCENDING over the remaining not-yet-available entries
 //      (smallest first, so many names flip to available quickly).
 //   3. ON-DEMAND preempt (bump) jumps a path to the FRONT of the queue.
 //   4. EXPRESS preempt: a bump flagged express (one file a person is
@@ -37,7 +41,7 @@ import type {
   PartitionCatalog,
   PartitionCatalogEntry
 } from "./partition-catalog.js";
-import { isShellPath } from "./partition-catalog.js";
+import { isBrowserEntry, isShellPath } from "./partition-catalog.js";
 import type { PartitionMutateRecord } from "./partition-store.js";
 
 export const SEEDER_BATCH_MAX_PATHS = 48;
@@ -73,24 +77,41 @@ export interface SeederPlan {
 }
 
 /**
- * Order the not-yet-available entries: shell set first (in their listed
- * order), then everything else size-ascending. Stable, deterministic, no
- * timers: a pure projection over the catalog so it is trivially testable
- * and safe to recompute on demand.
+ * Order the not-yet-available entries: the browser payload first
+ * (wave zero, owner order 2026-11-05), then the shell set, then
+ * everything else; each tier size-ascending. Only missing pieces
+ * ever queue: an entry whose bytes already stand (available) is
+ * not in the projection, so a plan built over a standing catalog
+ * resumes what is missing and never re-queues what has landed.
+ * Stable, deterministic, no timers: a pure projection over the
+ * catalog so it is trivially testable and safe to recompute on
+ * demand.
  */
 function orderEntries(entries: PartitionCatalogEntry[]): PartitionCatalogEntry[] {
   const pending = entries.filter((e) => e.availability !== "available");
-  const shell = pending.filter((e) => isShellPath(e.packPath));
-  const rest = pending.filter((e) => !isShellPath(e.packPath));
-  shell.sort((a, b) => {
+  const browser = pending.filter((e) => isBrowserEntry(e));
+  const shell = pending.filter(
+    (e) => !isBrowserEntry(e) && isShellPath(e.packPath)
+  );
+  const rest = pending.filter(
+    (e) => !isBrowserEntry(e) && !isShellPath(e.packPath)
+  );
+  const bySize = (a: PartitionCatalogEntry, b: PartitionCatalogEntry) => {
     if (a.size !== b.size) return a.size - b.size;
     return a.packPath.localeCompare(b.packPath);
+  };
+  // Inside the browser tier, a piece whose last seeding failed
+  // (a named gap on its entry) leads the tier: the priority
+  // payload's retry goes first, ahead of its unlanded fellows.
+  browser.sort((a, b) => {
+    const ga = a.gap ? 0 : 1;
+    const gb = b.gap ? 0 : 1;
+    if (ga !== gb) return ga - gb;
+    return bySize(a, b);
   });
-  rest.sort((a, b) => {
-    if (a.size !== b.size) return a.size - b.size;
-    return a.packPath.localeCompare(b.packPath);
-  });
-  return [...shell, ...rest];
+  shell.sort(bySize);
+  rest.sort(bySize);
+  return [...browser, ...shell, ...rest];
 }
 
 function batchify(
@@ -193,7 +214,8 @@ export class PartitionSeeder {
   /**
    * Build the current plan: express paths first (request order, each
    * in its own single-file batch), then on-demand bumps, then the
-   * shell-first size-ascending rest, batched at the ruled throttle.
+   * browser-first, shell-next size-ascending rest, batched at
+   * the ruled throttle.
    * Pure over the catalog + awake gate; no side effects on the
    * catalog here (bump() and the catalog own state changes).
    */
