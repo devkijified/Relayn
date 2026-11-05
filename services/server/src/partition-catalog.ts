@@ -62,6 +62,16 @@ export interface PartitionCatalogEntry {
   moveId?: string; // set only when bytes live in a sealed move AND verified
   category: string; // files | appData | setup | browser | ...
   gap?: string; // named per-file failure; the rest of the catalog continues
+  // Never-fail accounting (2026-11-05): every seed attempt that does
+  // not land is counted here, with the time it happened. The seeder
+  // plan spaces retries with a backoff off these two fields, and
+  // when the attempt budget is spent gapFinal turns true: the piece
+  // stays in the catalog as a NAMED gap and leaves the queue, so
+  // the rest of its tier completes without it. A landed seed (or
+  // fresh content under the same path) clears all three fields.
+  attempts?: number; // seed attempts that did not land
+  lastAttemptAt?: string; // RFC3339 of the last failed attempt
+  gapFinal?: boolean; // attempt budget spent; named gap, out of the queue
 }
 
 export interface PartitionCatalogDocument {
@@ -259,6 +269,11 @@ export class PartitionCatalog {
       existing.hash = "";
       existing.availability = "waiting";
       existing.moveId = undefined;
+      // Fresh content earns a fresh attempt budget.
+      existing.attempts = undefined;
+      existing.lastAttemptAt = undefined;
+      existing.gapFinal = undefined;
+      existing.gap = undefined;
     }
     doc.hostCatalogAt = rfc3339Now();
     await this.commit(doc, m);
@@ -298,6 +313,9 @@ export class PartitionCatalog {
         if (ref.sha256) existing.hash = ref.sha256;
         existing.category = ref.category || existing.category;
         existing.gap = undefined;
+        existing.attempts = undefined;
+        existing.lastAttemptAt = undefined;
+        existing.gapFinal = undefined;
       } else {
         m.set(packPath, {
           packPath,
@@ -367,6 +385,83 @@ export class PartitionCatalog {
     if (result.moveId) e.moveId = result.moveId;
     e.lastUsedAt = rfc3339Now();
     e.gap = undefined;
+    e.attempts = undefined;
+    e.lastAttemptAt = undefined;
+    e.gapFinal = undefined;
+    await this.commit(doc, m);
+    return true;
+  }
+
+  /**
+   * Never-fail accounting: one seed attempt for this piece did not
+   * land. The entry leaves the `seeding` state at once (a piece
+   * must never sit in seeding limbo, unretried and ungapped), its
+   * attempt count rises, and the failure is NAMED on the entry in
+   * the lane's own words. While budget remains, the entry returns
+   * to `waiting` and the seeder plan requeues it after its backoff,
+   * with no press from anyone. When the budget (maxAttempts) is
+   * spent, gapFinal turns true and the gap text says plainly that
+   * the piece could not be read and what the last reason was: the
+   * piece stays visible as a named gap while the rest of its tier
+   * completes. Returns the entry, or undefined when the path is
+   * unknown or already available (a landed piece is never failed
+   * retroactively).
+   */
+  async noteSeedFailure(
+    account: string,
+    machineId: string,
+    packPath: string,
+    reason: string,
+    maxAttempts: number
+  ): Promise<PartitionCatalogEntry | undefined> {
+    const doc = await this.load(account, machineId);
+    const m = this.entryMap(doc);
+    const e = m.get(packPath);
+    if (!e || e.availability === "available") return e;
+    const why = (reason || "").trim() || "the machine did not land this piece";
+    e.attempts = (e.attempts || 0) + 1;
+    e.lastAttemptAt = rfc3339Now();
+    e.availability = "waiting";
+    if (e.attempts >= Math.max(1, maxAttempts)) {
+      e.gapFinal = true;
+      e.gap =
+        "could not be read on the machine after " +
+        e.attempts +
+        " tries: " +
+        why;
+    } else {
+      e.gap =
+        why +
+        " (try " +
+        e.attempts +
+        " of " +
+        Math.max(1, maxAttempts) +
+        "; it will be tried again on its own)";
+    }
+    await this.commit(doc, m);
+    return e;
+  }
+
+  /**
+   * Fresh intent for a final-gapped piece (an operator bump, an
+   * express open): the attempt budget resets and the gap clears,
+   * so the piece queues again like any waiting piece. Returns
+   * true when a final gap was actually standing.
+   */
+  async reviveGap(
+    account: string,
+    machineId: string,
+    packPath: string
+  ): Promise<boolean> {
+    const doc = await this.load(account, machineId);
+    const m = this.entryMap(doc);
+    const e = m.get(packPath);
+    if (!e || !e.gapFinal) return false;
+    e.gapFinal = undefined;
+    e.attempts = undefined;
+    e.lastAttemptAt = undefined;
+    e.gap = undefined;
+    if (e.availability === "seeding") e.availability = "waiting";
     await this.commit(doc, m);
     return true;
   }

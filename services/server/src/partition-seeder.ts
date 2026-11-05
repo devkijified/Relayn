@@ -48,6 +48,46 @@ export const SEEDER_BATCH_MAX_PATHS = 48;
 export const SEEDER_BATCH_MAX_BYTES = 32 * 1024 * 1024; // ~32 MiB
 export const SEEDER_CONCURRENT_BATCHES = 3;
 
+// Never-fail retry budget (owner order 2026-11-05: the browser
+// pull must never fail). A piece whose transfer dies is requeued
+// on its own by the plan, spaced by seedBackoffMs, up to
+// SEEDER_MAX_ATTEMPTS tries in total. When the budget is spent
+// the catalog marks the piece gapFinal: a named gap that leaves
+// the queue so the rest of its tier completes, and the surfaces
+// open on what has landed with the piece named. No press from
+// the owner is ever part of this loop.
+export const SEEDER_MAX_ATTEMPTS = 6;
+
+/** Backoff before a piece with this many failed attempts may be
+ * queued again: 30s, then doubling, capped at 8 minutes. */
+export function seedBackoffMs(attempts: number): number {
+  const n = Math.max(1, Math.floor(attempts) || 1);
+  return Math.min(30_000 * 2 ** (n - 1), 480_000);
+}
+
+/**
+ * May this entry be queued on this pass? A final-gapped piece is
+ * out until a bump revives it (fresh intent earns a fresh
+ * budget). A piece inside its backoff waits, unless a bump or an
+ * express request names it: a person asking now outranks the
+ * spacing rule.
+ */
+export function seedEligible(
+  e: PartitionCatalogEntry,
+  nowMs: number,
+  bumped: (packPath: string) => boolean
+): boolean {
+  if (e.gapFinal) return false;
+  if (bumped(e.packPath)) return true;
+  if (e.attempts && e.lastAttemptAt) {
+    const last = Date.parse(e.lastAttemptAt);
+    if (!Number.isNaN(last) && nowMs - last < seedBackoffMs(e.attempts)) {
+      return false;
+    }
+  }
+  return true;
+}
+
 // The one door the seeder is ever allowed to queue. Guard-pinned: any
 // other door (files-push, desk-*) is a bug, not a config.
 export const SEEDER_FETCH_DOOR = "files-fetch" as const;
@@ -174,6 +214,11 @@ export class PartitionSeeder {
     const entry = await this.catalog.queryByPath(account, machineId, packPath);
     if (!entry) return { state: "unknown" };
     if (entry.availability === "available") return { state: "available" };
+    // A bump is fresh intent: a piece whose retry budget was
+    // spent earns a fresh budget, so the bump can actually queue.
+    if (entry.gapFinal) {
+      await this.catalog.reviveGap(account, machineId, packPath);
+    }
     const key = this.key(account, machineId);
     if (opts && opts.express) {
       let list = this.express.get(key);
@@ -223,14 +268,23 @@ export class PartitionSeeder {
     account: string,
     machineId: string,
     hostAwake: boolean,
-    ledger: PartitionMutateRecord[]
+    ledger: PartitionMutateRecord[],
+    nowMs: number = Date.now()
   ): Promise<SeederPlan> {
     const entries = await this.catalog.liveEntries(account, machineId, ledger);
-    const ordered = orderEntries(entries);
+    const orderedAll = orderEntries(entries);
     const key = this.key(account, machineId);
     const bumps = this.onDemand.get(key) || new Set();
     const expressList = this.express.get(key) || [];
     const expressSet = new Set(expressList);
+    // Never-fail filter: final-gapped pieces and pieces inside
+    // their retry backoff stay out of this pass's queue (bumps
+    // and express requests outrank the backoff). They are still
+    // pending: the plan reports them as outstanding, never as
+    // done and never as a terminal failure.
+    const ordered = orderedAll.filter((e) =>
+      seedEligible(e, nowMs, (p) => bumps.has(p) || expressSet.has(p))
+    );
     const byPath = new Map<string, PartitionCatalogEntry>();
     for (const e of ordered) byPath.set(e.packPath, e);
     // Express entries lead, in the order they were requested. A path
@@ -261,9 +315,13 @@ export class PartitionSeeder {
       })),
       ...batchify([...front, ...back])
     ];
-    const pending = finalOrder.length;
+    // Pending counts every not-yet-available entry, including the
+    // ones this pass cannot queue (backoff, final gap): the plan
+    // never calls an outstanding piece done.
+    const pending = orderedAll.length;
     let state: SeederPlan["state"];
     if (pending === 0) state = "idle";
+    else if (finalOrder.length === 0) state = "waiting";
     else state = hostAwake ? "seeding" : "waiting";
     return {
       machineId,

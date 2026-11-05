@@ -39,7 +39,8 @@ import type { PartitionCatalog } from "./partition-catalog.js";
 import {
   PartitionSeeder,
   SEEDER_CONCURRENT_BATCHES,
-  SEEDER_FETCH_DOOR
+  SEEDER_FETCH_DOOR,
+  SEEDER_MAX_ATTEMPTS
 } from "./partition-seeder.js";
 import type { PartitionStore } from "./partition-store.js";
 
@@ -65,6 +66,15 @@ export const SEEDER_PROBE_APPDATA_PAGE_BUDGET = 200;
 // subtree catalogues on the first walk.
 export const SEEDER_PROBE_CHROME_ROOT = "appData/Local/Google/Chrome/User Data";
 export const SEEDER_PROBE_CHROME_PAGE_BUDGET = 60;
+
+// A seeding fetch that has not finished half an hour after it
+// was queued is settled as failed (never-fail accounting): the
+// machine died mid-send or the command was lost, and its pieces
+// must requeue under the backoff instead of sitting in seeding
+// limbo forever. If the fetch does land later, the rebuild flips
+// the pieces available and clears their attempt counts, so a
+// late landing still wins.
+export const SEEDER_FLIGHT_STALE_MS = 30 * 60_000;
 
 // The inventory roots the probe walks, in packPath form. A root
 // the machine does not have answers with an error result and is
@@ -150,6 +160,11 @@ export interface SeederDriverDeps {
   partitionStore: PartitionStore;
 }
 
+interface SeedFlight {
+  paths: string[];
+  queuedAt: number;
+}
+
 export class PartitionSeederDriver {
   private timer: ReturnType<typeof setInterval> | null = null;
   private ticking = false;
@@ -157,6 +172,12 @@ export class PartitionSeederDriver {
   private lastProbeAt = new Map<string, number>(); // account|machine -> ms
   private walks = new Map<string, ProbeWalk>();
   private forceProbe = new Set<string>(); // account|machine keys a manual Check now armed
+  // Seeding fetches this driver queued and has not yet settled:
+  // account|machineId -> command id -> the paths it carried.
+  // Settlement is the never-fail hinge: every queued fetch ends
+  // as landed pieces or as NAMED failed attempts on the catalog,
+  // never as pieces stuck in `seeding` with nobody watching.
+  private seedFlights = new Map<string, Map<string, SeedFlight>>();
 
   constructor(private readonly deps: SeederDriverDeps) {}
 
@@ -208,7 +229,7 @@ export class PartitionSeederDriver {
         }
         if (!view.online) continue;
         await this.confirmFromMoves(account, view.machineId, view.name, accounts.get(account) ?? 0);
-        await this.seedMachine(account, view.machineId);
+        await this.seedMachine(account, view.machineId, now);
         await this.probeMachine(account, view.machineId, now);
       }
     } catch (err) {
@@ -243,7 +264,12 @@ export class PartitionSeederDriver {
   // each express path is queued as its own single-file fetch
   // before anything else takes the room, even if a plan batch
   // arrived with an express path mixed in among other paths.
-  private async seedMachine(account: string, machineId: string): Promise<void> {
+  private async seedMachine(
+    account: string,
+    machineId: string,
+    now: number
+  ): Promise<void> {
+    await this.settleSeedFlights(account, machineId, now);
     const inFlight = this.deps.moverStore.countActiveHeadlessCommands(
       account,
       machineId,
@@ -252,8 +278,9 @@ export class PartitionSeederDriver {
     let room = SEEDER_CONCURRENT_BATCHES - inFlight;
     if (room <= 0) return;
     const ledger = await this.deps.partitionStore.listLedger(account, machineId);
-    const plan = await this.deps.seeder.plan(account, machineId, true, ledger);
+    const plan = await this.deps.seeder.plan(account, machineId, true, ledger, now);
     const batches = orderBatchesExpressFirst(plan);
+    const key = account + "|" + machineId;
     for (const batch of batches) {
       if (room <= 0) break;
       for (const packPath of batch.paths) {
@@ -265,8 +292,102 @@ export class PartitionSeederDriver {
         SEEDER_FETCH_DOOR,
         { paths: batch.paths }
       );
-      if (cmd) room--;
+      if (cmd) {
+        room--;
+        let flights = this.seedFlights.get(key);
+        if (!flights) {
+          flights = new Map();
+          this.seedFlights.set(key, flights);
+        }
+        flights.set(cmd.id, { paths: [...batch.paths], queuedAt: now });
+      }
     }
+  }
+
+  // Settle every finished seeding fetch for this machine. For
+  // each path the fetch carried, the catalog entry is the truth:
+  // available means it landed (its attempt accounting was
+  // cleared by the landing itself); still seeding means this
+  // attempt did not land, and the failure is recorded on the
+  // entry with the lane's own reason (the per-file outcome the
+  // Host reported, else the fetch's error, else a plain stall
+  // sentence). A fetch that never finishes inside
+  // SEEDER_FLIGHT_STALE_MS settles the same way. Nothing is
+  // settled twice and no piece is left in seeding limbo.
+  private async settleSeedFlights(
+    account: string,
+    machineId: string,
+    now: number
+  ): Promise<void> {
+    const key = account + "|" + machineId;
+    const flights = this.seedFlights.get(key);
+    if (!flights || flights.size === 0) return;
+    const cat = this.deps.catalog as unknown as {
+      queryByPath?: (
+        a: string,
+        m: string,
+        p: string
+      ) => Promise<{ availability: string } | undefined>;
+      noteSeedFailure?: (
+        a: string,
+        m: string,
+        p: string,
+        reason: string,
+        maxAttempts: number
+      ) => Promise<unknown>;
+    };
+    for (const [cmdId, flight] of [...flights]) {
+      const cmd = this.deps.moverStore.getHeadlessCommand(account, cmdId);
+      const done = !!cmd && cmd.status === "done";
+      const stale = !done && now - flight.queuedAt > SEEDER_FLIGHT_STALE_MS;
+      if (!done && !stale) continue;
+      flights.delete(cmdId);
+      const result = (done ? (cmd as { result?: unknown }).result : undefined) as
+        | {
+            status?: string;
+            error?: string;
+            transfers?: Array<{ path?: string; outcome?: string }>;
+          }
+        | undefined;
+      const outcomes = new Map<string, string>();
+      for (const tr of result?.transfers || []) {
+        if (tr && typeof tr.path === "string") {
+          outcomes.set(tr.path, String(tr.outcome || ""));
+        }
+      }
+      for (const packPath of flight.paths) {
+        const entry = cat.queryByPath
+          ? await cat.queryByPath(account, machineId, packPath)
+          : undefined;
+        // Landed (or no longer the catalog's concern): the
+        // landing cleared its own accounting; nothing to record.
+        if (!entry || entry.availability !== "seeding") continue;
+        if (!cat.noteSeedFailure) continue;
+        const outcome = outcomes.get(packPath) || "";
+        let reason: string;
+        if (outcome.startsWith("failed")) {
+          reason =
+            outcome.replace(/^failed:?\s*/, "") ||
+            "the machine could not read this piece";
+        } else if (stale) {
+          reason = "the machine stopped answering partway through";
+        } else if (result?.error) {
+          reason = String(result.error);
+        } else if (result?.status && result.status !== "sent") {
+          reason = "the fetch ended as " + result.status;
+        } else {
+          reason = "the machine did not land this piece";
+        }
+        await cat.noteSeedFailure(
+          account,
+          machineId,
+          packPath,
+          reason,
+          SEEDER_MAX_ATTEMPTS
+        );
+      }
+    }
+    if (flights.size === 0) this.seedFlights.delete(key);
   }
 
   // The probe: a capped breadth-first files-browse walk whose
