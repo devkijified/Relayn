@@ -3504,13 +3504,16 @@ async function main() {
     } catch {
       partFiles = ["<missing>"];
     }
-    // Catalog-first (doc 23): the partition dir now holds the standing
-    // catalog.json (state-class listing source) BESIDE ledger.json. Both
-    // are StateDocs JSON; neither is a bulk BYTE store. The guard still
-    // forbids any second byte store -- anything other than these two.
+    // Catalog-first (doc 23): the partition dir holds the standing
+    // catalog.json (state-class listing source) BESIDE ledger.json.
+    // The persisted Partition index (index.json) sits there too: it
+    // is the rebuilt view's file refs, saved on every rebuild so a
+    // restart serves without re-reading sealed manifests. All are
+    // StateDocs JSON; none is a bulk BYTE store. The guard still
+    // forbids any second byte store -- anything other than these.
     check(
-      "partition disk holds only state JSON (catalog + ledger, no byte store)",
-      partFiles.slice().sort().join(",") === "catalog.json,ledger.json",
+      "partition disk holds only state JSON (catalog + index + ledger, no byte store)",
+      partFiles.slice().sort().join(",") === "catalog.json,index.json,ledger.json",
       JSON.stringify(partFiles)
     );
 

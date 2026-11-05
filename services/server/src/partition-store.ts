@@ -72,6 +72,14 @@ interface MachineIndex {
   updatedAt: string;
 }
 
+/** The persisted shape of a MachineIndex (file refs before the
+ * mutate ledger is applied, exactly as rebuild holds them). */
+interface PersistedMachineIndex {
+  files: PartitionFileRef[];
+  moveIds: string[];
+  updatedAt: string;
+}
+
 function rfc3339Now(): string {
   return new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
 }
@@ -98,9 +106,13 @@ function baseName(packPath: string): string {
  * File bytes are NEVER written here. Ledger writes are atomic
  * (single-object writes, see storage.ts), and a corrupt ledger
  * logs loudly and starts empty instead of crashing the read. The
- * per-machine index stays in memory by design: it is a derived
- * view, rebuilt from the sealed moves whenever it is cold, so a
- * restart loses nothing that cannot be recomputed.
+ * per-machine index is a derived view over the sealed moves; it
+ * is held in memory AND persisted beside the ledger on every
+ * rebuild, so a server restart serves the standing view from the
+ * persisted copy instead of re-reading every sealed manifest.
+ * A rebuild from the sealed moves remains the fallback when no
+ * persisted index exists, and stays the writer that refreshes
+ * the persisted copy.
  */
 /** Shell-set prefixes the Partition auto-pull always pulls first. */
 export const PARTITION_SHELL_PREFIXES = [
@@ -164,6 +176,81 @@ export class PartitionStore {
 
   private ledgerObjectKey(account: string, machineId: string): string {
     return `${account}/_partition/${machineId}/ledger.json`;
+  }
+
+  private indexObjectKey(account: string, machineId: string): string {
+    return `${account}/_partition/${machineId}/index.json`;
+  }
+
+  /** Persist the built index next to the ledger, so a restart can
+   * serve the standing view without re-reading sealed manifests. */
+  private async saveIndex(
+    account: string,
+    machineId: string,
+    idx: MachineIndex
+  ): Promise<void> {
+    const persisted: PersistedMachineIndex = {
+      files: Array.from(idx.files.values()),
+      moveIds: Array.from(idx.moveIds),
+      updatedAt: idx.updatedAt
+    };
+    await this.docs.saveText(
+      this.indexObjectKey(account, machineId),
+      JSON.stringify(persisted, null, 2)
+    );
+  }
+
+  /** Load a persisted index, or undefined when none exists (or it
+   * is corrupt, which logs loudly like a corrupt ledger does). */
+  private async loadPersistedIndex(
+    account: string,
+    machineId: string
+  ): Promise<MachineIndex | undefined> {
+    const raw = await this.docs.loadText(
+      this.indexObjectKey(account, machineId)
+    );
+    if (raw === undefined) return undefined;
+    try {
+      const parsed = JSON.parse(raw) as Partial<PersistedMachineIndex>;
+      if (!parsed || !Array.isArray(parsed.files)) {
+        throw new Error("persisted index has no files array");
+      }
+      const files = new Map<string, PartitionFileRef>();
+      for (const f of parsed.files) {
+        if (!f || typeof f !== "object") continue;
+        const packPath = typeof f.packPath === "string" ? f.packPath : "";
+        if (!packPath || packPath.includes("..")) continue;
+        files.set(packPath, {
+          packPath,
+          moveId: typeof f.moveId === "string" ? f.moveId : "",
+          size: typeof f.size === "number" ? f.size : 0,
+          modTime: typeof f.modTime === "number" ? f.modTime : 0,
+          category:
+            typeof f.category === "string" ? f.category : categoryOf(packPath),
+          sha256: typeof f.sha256 === "string" ? f.sha256 : undefined
+        });
+      }
+      const moveIds = new Set<string>(
+        Array.isArray(parsed.moveIds)
+          ? parsed.moveIds.filter((m): m is string => typeof m === "string")
+          : []
+      );
+      return {
+        files,
+        moveIds,
+        updatedAt:
+          typeof parsed.updatedAt === "string" && parsed.updatedAt
+            ? parsed.updatedAt
+            : rfc3339Now()
+      };
+    } catch (err) {
+      console.error(
+        `[relayn] PARTITION INDEX CORRUPT: ${this.indexObjectKey(account, machineId)} ` +
+          `could not be loaded (${(err as Error).message}). Falling back to ` +
+          `a rebuild from the sealed moves; the sealed moves are untouched.`
+      );
+      return undefined;
+    }
   }
 
   async loadLedger(
@@ -298,6 +385,10 @@ export class PartitionStore {
 
     const updatedAt = rfc3339Now();
     this.accMap(account).set(machineId, { files, moveIds, updatedAt });
+    // Persist the fresh index beside the ledger: after a server
+    // restart the standing view serves from this copy instead of
+    // re-reading every sealed manifest (see ensureIndex).
+    await this.saveIndex(account, machineId, { files, moveIds, updatedAt });
     // Apply ledger on top for serving.
     await this.loadLedger(account, machineId);
 
@@ -335,6 +426,16 @@ export class PartitionStore {
   ): Promise<MachineIndex> {
     const existing = this.accMap(account).get(machineId);
     if (existing) return existing;
+    // Memory is cold (a restart, most likely): the persisted
+    // index from the last rebuild serves the standing view with
+    // zero manifest reads. The mutate ledger still applies on
+    // the serve path (liveFiles), exactly as before. Only when
+    // no persisted index exists do we rebuild from sealed moves.
+    const persisted = await this.loadPersistedIndex(account, machineId);
+    if (persisted) {
+      this.accMap(account).set(machineId, persisted);
+      return persisted;
+    }
     await this.rebuildFromSealedMoves(account, machineId, machineName);
     return (
       this.accMap(account).get(machineId) || {
