@@ -3722,12 +3722,17 @@ async function main() {
     );
 
     // ---- session auto delivery: arm state, requests, envelopes ----
-    // The arm flag is per machine, default OFF, durable state class
-    // storage. Requests are recorded only for armed machines. The
-    // extension poll is account scoped. A staged envelope is taken
-    // exactly once, and disarming clears request and envelope.
+    // The arm flag is per machine, durable state class storage.
+    // Sign-ins are armed by default (owner order, 2026-11-13): a
+    // machine with no stored entry reads armed on both roads and
+    // the session request door accepts it. Turning the tick off
+    // stores the off state, and the stored off wins: requests are
+    // refused for a stored-off machine. The extension poll is
+    // account scoped. A staged envelope is taken exactly once,
+    // and disarming clears request and envelope.
     console.log("partition session auto delivery");
     const SA_MID2 = "second-pc-99";
+    const SA_MID3 = "third-pc-77";
     const sget = (acc, sub) =>
       fetch(`${pd}${sub}`, { headers: { "x-account-id": acc } });
     const spost = (acc, sub, body) =>
@@ -3747,14 +3752,17 @@ async function main() {
     r = await sget(P_ACC, `/api/partition/${P_MID}/session-arm`);
     const arm0 = await r.json().catch(() => ({}));
     check(
-      "session arm defaults OFF",
-      r.status === 200 && arm0.armed === false && arm0.machineId === P_MID,
+      "session arm defaults ON for a machine with no stored entry (armed by default)",
+      r.status === 200 &&
+        arm0.armed === true &&
+        arm0.hostHarvest === true &&
+        arm0.machineId === P_MID,
       JSON.stringify(arm0)
     );
     r = await sget(Q_ACC, `/api/partition/${P_MID}/session-arm`);
     check(
-      "session arm is account scoped (other account also OFF)",
-      r.status === 200 && (await r.json()).armed === false
+      "session arm is account scoped (other account reads its own default ON, no stored state)",
+      r.status === 200 && (await r.json()).armed === true
     );
 
     r = await spost(P_ACC, `/api/partition/${P_MID}/session-arm`, { armed: "yes" });
@@ -3769,28 +3777,64 @@ async function main() {
     r = await sget(P_ACC, `/api/partition/${P_MID}/session-arm`);
     check("session arm reads back ON", (await r.json()).armed === true);
     r = await sget(P_ACC, `/api/partition/${SA_MID2}/session-arm`);
+    const armSecond = await r.json().catch(() => ({}));
     check(
-      "session arm is per machine (second machine still OFF)",
-      r.status === 200 && (await r.json()).armed === false
+      "session arm is per machine (second machine reads the default ON, not stored state)",
+      r.status === 200 && armSecond.armed === true && armSecond.hostHarvest === true,
+      JSON.stringify(armSecond)
     );
     r = await sget(Q_ACC, `/api/partition/${P_MID}/session-arm`);
+    const armQ = await r.json().catch(() => ({}));
     check(
-      "session arm stays account scoped after set (Q still OFF)",
-      (await r.json()).armed === false
+      "session arm stays account scoped after set (Q reads its own default, hostHarvest true)",
+      r.status === 200 && armQ.armed === true && armQ.hostHarvest === true,
+      JSON.stringify(armQ)
     );
 
-    // Requests: unarmed machines are refused and record nothing.
+    // Requests under the new default: a machine with no stored
+    // entry is armed, so the door accepts its request. A machine
+    // whose stored state is off is refused and records nothing.
+    r = await spost(P_ACC, `/api/partition/${SA_MID2}/session-request`, {});
+    const defaultReq = await r.json().catch(() => ({}));
+    check(
+      "session request for a machine with no stored entry is accepted (armed by default)",
+      r.status === 200 &&
+        defaultReq.pending === true &&
+        /^sr-[0-9a-f]{20}$/.test(defaultReq.requestId ?? ""),
+      `got ${r.status} ${JSON.stringify(defaultReq)}`
+    );
+    r = await sget(P_ACC, `/api/partition/session-requests`);
+    const pollDefault = await r.json().catch(() => ({}));
+    check(
+      "extension poll lists the default-armed machine request",
+      r.status === 200 &&
+        pollDefault.requests?.length === 1 &&
+        pollDefault.requests[0].machineId === SA_MID2,
+      JSON.stringify(pollDefault)
+    );
+    r = await spost(P_ACC, `/api/partition/${SA_MID2}/session-arm`, { armed: false });
+    check(
+      "explicit disarm answers armed:false",
+      r.status === 200 && (await r.json()).armed === false
+    );
+    r = await sget(P_ACC, `/api/partition/${SA_MID2}/session-arm`);
+    const armOff = await r.json().catch(() => ({}));
+    check(
+      "the stored OFF wins over the default (reads back false)",
+      r.status === 200 && armOff.armed === false,
+      JSON.stringify(armOff)
+    );
     r = await spost(P_ACC, `/api/partition/${SA_MID2}/session-request`, {});
     const unarmedReq = await r.json().catch(() => ({}));
     check(
-      "session request for an unarmed machine -> 409, nothing recorded",
+      "session request for an explicitly disarmed machine -> 409, nothing recorded",
       r.status === 409 && unarmedReq.armed === false,
       `got ${r.status} ${JSON.stringify(unarmedReq)}`
     );
     r = await sget(P_ACC, `/api/partition/session-requests`);
     const poll0 = await r.json().catch(() => ({}));
     check(
-      "extension poll starts empty (unarmed request never recorded)",
+      "extension poll starts empty (disarm cleared the request, the refusal recorded nothing)",
       r.status === 200 && Array.isArray(poll0.requests) && poll0.requests.length === 0,
       JSON.stringify(poll0)
     );
@@ -3824,6 +3868,42 @@ async function main() {
     check(
       "extension poll is account scoped",
       r.status === 200 && (await r.json()).requests?.length === 0
+    );
+
+    // setArm round-trips exactly, both fields, both directions.
+    r = await spost(P_ACC, `/api/partition/${SA_MID3}/session-arm`, {
+      armed: true,
+      hostHarvest: true
+    });
+    const armRt1 = await r.json().catch(() => ({}));
+    check(
+      "setArm stores ON with hostHarvest exactly",
+      r.status === 200 && armRt1.armed === true && armRt1.hostHarvest === true,
+      JSON.stringify(armRt1)
+    );
+    r = await sget(P_ACC, `/api/partition/${SA_MID3}/session-arm`);
+    const armRt2 = await r.json().catch(() => ({}));
+    check(
+      "stored ON reads back exactly",
+      r.status === 200 && armRt2.armed === true && armRt2.hostHarvest === true,
+      JSON.stringify(armRt2)
+    );
+    r = await spost(P_ACC, `/api/partition/${SA_MID3}/session-arm`, {
+      armed: false,
+      hostHarvest: false
+    });
+    const armRt3 = await r.json().catch(() => ({}));
+    check(
+      "setArm stores OFF with hostHarvest exactly",
+      r.status === 200 && armRt3.armed === false && armRt3.hostHarvest === false,
+      JSON.stringify(armRt3)
+    );
+    r = await sget(P_ACC, `/api/partition/${SA_MID3}/session-arm`);
+    const armRt4 = await r.json().catch(() => ({}));
+    check(
+      "stored OFF reads back exactly",
+      r.status === 200 && armRt4.armed === false && armRt4.hostHarvest === false,
+      JSON.stringify(armRt4)
     );
 
     // Envelope staging: fences first, then the happy path.
@@ -3925,7 +4005,7 @@ async function main() {
       headers: { "x-account-id": P_ACC }
     });
     check(
-      "the untouched machine still reads OFF on the fresh process",
+      "the explicitly disarmed machine still reads OFF on the fresh process",
       r.status === 200 && (await r.json()).armed === false
     );
 

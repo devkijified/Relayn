@@ -36,9 +36,10 @@
 // exactly as before.
 //
 // Session auto delivery: the arm flag, pending requests and staged
-// envelopes live in partition-session.ts (state class storage,
-// default OFF). Requests exist only for armed machines; a staged
-// envelope is single use and expires with its share.
+// envelopes live in partition-session.ts (state class storage).
+// Sign-ins are armed by default (owner order, 2026-11-13): requests
+// exist for every machine except one whose stored state is off; a
+// staged envelope is single use and expires with its share.
 //
 // Catalog-first (doc 23): the Partition lists from the CATALOG ONLY
 // (ruling A). catalog/browse never merges a live Host browse. The legacy
@@ -432,8 +433,10 @@ export async function partitionRoutes(
   // ---- session auto delivery -----------------------------------------
   // Arm state, session requests and staged envelopes. All account
   // scoped through the same guard as every route above. The arm
-  // flag defaults OFF; requests are only recorded for armed
-  // machines; a staged envelope is taken exactly once.
+  // flag is armed by default (owner order, 2026-11-13): turning
+  // the tick off stores the off state and the stored off wins, so
+  // requests are refused only for a stored-off machine; a staged
+  // envelope is taken exactly once.
 
   app.get(
     "/api/partition/:machineId/session-arm",
@@ -482,8 +485,8 @@ export async function partitionRoutes(
   );
 
   // The Viewer records that a pull for this machine needs a
-  // browser session. Unarmed machines are refused by name and
-  // nothing is recorded for them.
+  // browser session. A machine whose stored state is off is
+  // refused by name and nothing is recorded for it.
   app.post(
     "/api/partition/:machineId/session-request",
     async (request, reply) => {

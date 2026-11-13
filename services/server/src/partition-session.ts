@@ -8,7 +8,11 @@
 // This store holds the consent state and the short lived handoff
 // for that flow, per account and per machine:
 //
-//   armed           the per machine arm flag. Default OFF. Arming is
+//   armed           the per machine arm flag. Armed by default
+//                   (owner order, 2026-11-13): a machine with no
+//                   stored entry is armed on both roads. Turning
+//                   the tick off stores the off state, and the
+//                   stored off wins over the default. Arming is
 //                   visible and revocable at any time: turning it off
 //                   clears any pending request and any staged
 //                   envelope for that machine at once, so nothing
@@ -85,7 +89,7 @@ export interface SessionTakeRecord {
 
 export interface MachineSessionState {
   armed: boolean;
-  hostHarvest: boolean; // the Host reads the session itself (default OFF)
+  hostHarvest: boolean; // the Host reads the session itself (default ON when no entry is stored)
   pendingRequest: PendingSessionRequest | null;
   staged: StagedSessionEnvelope | null;
   takes: SessionTakeRecord[];
@@ -210,18 +214,26 @@ export class PartitionSessionStore {
     return m;
   }
 
-  /** The arm flag for one machine. Default OFF for unknown machines. */
+  /**
+   * The arm flag for one machine. A machine with no stored entry
+   * is armed by default (owner order, 2026-11-13); a stored entry
+   * speaks for itself, so an explicit disarm keeps winning.
+   */
   async getArm(account: string, machineId: string): Promise<boolean> {
     const doc = await this.load(account);
     const m = doc.machines[machineId];
-    return !!m && m.armed === true;
+    if (!m || typeof m !== "object") return true;
+    return m.armed === true;
   }
 
   /**
    * The full arm state for one machine: whether session delivery
    * is armed at all, and by which road (the extension seals it,
    * or the Host reads it itself when hostHarvest is set). Both
-   * flags default OFF for unknown machines.
+   * flags read ON for a machine with no stored entry (owner
+   * order, 2026-11-13: sign-ins are armed by default). A stored
+   * entry keeps its stored values exactly, so turning the tick
+   * off stores the off state and the off state wins.
    */
   async getArmState(
     account: string,
@@ -229,9 +241,12 @@ export class PartitionSessionStore {
   ): Promise<{ armed: boolean; hostHarvest: boolean }> {
     const doc = await this.load(account);
     const m = doc.machines[machineId];
+    if (!m || typeof m !== "object") {
+      return { armed: true, hostHarvest: true };
+    }
     return {
-      armed: !!m && m.armed === true,
-      hostHarvest: !!m && m.hostHarvest === true
+      armed: m.armed === true,
+      hostHarvest: m.hostHarvest === true
     };
   }
 
@@ -265,8 +280,11 @@ export class PartitionSessionStore {
 
   /**
    * Record a pending session request for one machine. Only armed
-   * machines can hold a request: for an unarmed machine this
-   * returns { armed: false } and records nothing. A second call
+   * machines can hold a request: for a machine whose stored state
+   * is off this returns { armed: false } and records nothing. A
+   * machine with no stored entry is armed by default (owner
+   * order, 2026-11-13), so the first entry this call writes for
+   * it carries the default and the request is recorded. A second call
    * while a request is already pending returns the same request,
    * so repeated Viewer polls never stack up duplicate requests.
    */
@@ -278,7 +296,18 @@ export class PartitionSessionStore {
     | { armed: true; pending: true; request: PendingSessionRequest }
   > {
     const doc = await this.load(account);
+    const stored = doc.machines[machineId];
+    const hadEntry = !!stored && typeof stored === "object";
     const m = this.machine(doc, machineId);
+    if (!hadEntry) {
+      // Armed by default (owner order, 2026-11-13): the first
+      // entry written for a machine carries the default, so the
+      // door accepts its request instead of refusing it. The
+      // machine() seed above wrote the old off values; the
+      // default replaces them before anything reads them.
+      m.armed = true;
+      m.hostHarvest = true;
+    }
     if (!m.armed) return { armed: false };
     if (m.pendingRequest) {
       return { armed: true, pending: true, request: m.pendingRequest };

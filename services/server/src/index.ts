@@ -75,7 +75,7 @@ const partitionStore = new PartitionStore(
 );
 // Session auto delivery: the per machine arm flag, pending session
 // requests and staged envelopes (state class, under _partition/,
-// never swept). Default OFF; see partition-session.ts.
+// never swept). Armed by default; see partition-session.ts.
 const partitionSessionStore = new PartitionSessionStore(moverStore.docs);
 // The seeder driver executes the seeder plan from the server
 // (seed while the Host is awake, confirm from landed moves,
