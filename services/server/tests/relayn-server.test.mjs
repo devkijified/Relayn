@@ -4819,6 +4819,106 @@ async function main() {
     });
     check("retire: the deed with the key lands", r.status === 200, `got ${r.status}`);
 
+    // ---- Ghost retirement: enrollment retires the old same-name record ----
+    // The uninstaller swap, as the cloud sees it: the fresh Host
+    // enrolls as a NEW record and the old record used to sit in
+    // every list beside it, same hostname, until a human dumped
+    // it. Enrollment now retires the ghost itself.
+    console.log("ghost retirement at enrollment");
+    const GH_ACC = "ghosttest001";
+    const enrollNamed = async (acc, mid, name) => {
+      const res = await fetch(`${a}/api/headless/enroll`, {
+        method: "POST",
+        headers: { "x-account-id": acc, "content-type": "application/json" },
+        body: JSON.stringify({ machineId: mid, name, os: "Windows", profiles: [], capabilities: {} })
+      });
+      return { status: res.status, data: await res.json().catch(() => ({})) };
+    };
+    const ghListIds = async (acc) => {
+      const res = await fetch(`${a}/api/headless/machines`, { headers: { "x-account-id": acc } });
+      const body = await res.json().catch(() => ({}));
+      return (body.machines ?? []).map((m) => m.machineId);
+    };
+    const ghBeat = (mid, secret) =>
+      fetch(`${a}/api/headless/heartbeat`, {
+        method: "POST",
+        headers: {
+          "x-account-id": GH_ACC,
+          "x-machine-id": mid,
+          "x-machine-secret": secret,
+          "content-type": "application/json"
+        },
+        body: JSON.stringify({ state: "idle" })
+      });
+    const ghOld = await enrollNamed(GH_ACC, "ghost-pc-old", "GHOST-PC");
+    check("ghost: the old machine enrolls", ghOld.status === 200, `got ${ghOld.status}`);
+    const ghBy = await enrollNamed(GH_ACC, "ghost-bystander", "OTHER-PC");
+    let ghIds = await ghListIds(GH_ACC);
+    check(
+      "ghost: a different-name enrollment retires nothing",
+      ghBy.status === 200 && ghIds.includes("ghost-pc-old") && ghIds.includes("ghost-bystander"),
+      JSON.stringify(ghIds)
+    );
+    r = await ghBeat("ghost-pc-old", ghOld.data.machineSecret);
+    check("ghost: the old machine heartbeats before the swap", r.status === 200, `got ${r.status}`);
+    // The swap: a fresh identity under the same hostname, in
+    // different case (Windows hostnames are case-insensitive).
+    const ghNew = await enrollNamed(GH_ACC, "ghost-pc-new", "Ghost-PC");
+    check("ghost: the fresh identity enrolls", ghNew.status === 200, `got ${ghNew.status}`);
+    ghIds = await ghListIds(GH_ACC);
+    check(
+      "ghost: the same-name enrollment retires the older record and keeps the new one and the bystander",
+      ghIds.includes("ghost-pc-new") && ghIds.includes("ghost-bystander") && !ghIds.includes("ghost-pc-old"),
+      JSON.stringify(ghIds)
+    );
+    r = await ghBeat("ghost-pc-old", ghOld.data.machineSecret);
+    const ghOldErr = await r.json().catch(() => ({}));
+    check(
+      "ghost: the retired ghost answers 403 MACHINE_RETIRED (a stamp, never a delete)",
+      r.status === 403 && ghOldErr.error === "MACHINE_RETIRED",
+      `got ${r.status} ${JSON.stringify(ghOldErr)}`
+    );
+    r = await ghBeat("ghost-pc-new", ghNew.data.machineSecret);
+    check("ghost: the enrolling record never retires itself", r.status === 200, `got ${r.status}`);
+    // An already-retired record is untouched by later
+    // enrollments: dump the bystander by hand, then run two
+    // more same-name enrollments; its stamp never moves.
+    r = await fetch(`${a}/api/headless/machines/ghost-bystander/retire`, {
+      method: "POST",
+      headers: { "x-account-id": GH_ACC, "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const ghDeed = await r.json().catch(() => ({}));
+    check("ghost: the bystander dumps by hand (setup)", r.status === 200 && !!ghDeed.retiredAt, JSON.stringify(ghDeed));
+    const ghThird = await enrollNamed(GH_ACC, "ghost-pc-third", "GHOST-PC");
+    ghIds = await ghListIds(GH_ACC);
+    check(
+      "ghost: a third same-name enrollment retires the second record too",
+      ghThird.status === 200 && ghIds.includes("ghost-pc-third") && !ghIds.includes("ghost-pc-new"),
+      JSON.stringify(ghIds)
+    );
+    r = await fetch(`${a}/api/headless/machines/ghost-bystander/retire`, {
+      method: "POST",
+      headers: { "x-account-id": GH_ACC, "content-type": "application/json" },
+      body: JSON.stringify({})
+    });
+    const ghDeed2 = await r.json().catch(() => ({}));
+    check(
+      "ghost: the already-retired record keeps its first stamp through later enrollments",
+      r.status === 200 && ghDeed2.retiredAt === ghDeed.retiredAt,
+      `${ghDeed2.retiredAt} vs ${ghDeed.retiredAt}`
+    );
+    // A blank hostname retires no one: two nameless machines
+    // coexist.
+    const ghBlank1 = await enrollNamed(GH_ACC, "ghost-blank-1", "");
+    const ghBlank2 = await enrollNamed(GH_ACC, "ghost-blank-2", "");
+    ghIds = await ghListIds(GH_ACC);
+    check(
+      "ghost: nameless enrollments retire nothing",
+      ghBlank1.status === 200 && ghBlank2.status === 200 && ghIds.includes("ghost-blank-1") && ghIds.includes("ghost-blank-2"),
+      JSON.stringify(ghIds)
+    );
+
     // ---- session envelope portability -------------------------------
     // One staged envelope, two take doors: whichever takes first
     // wins, the audit names the door, the seal format is the

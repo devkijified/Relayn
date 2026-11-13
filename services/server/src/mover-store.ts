@@ -370,6 +370,19 @@ export function headlessCommandSignature(
     .digest("hex");
 }
 
+/**
+ * The hostname key two records are compared by for ghost
+ * retirement: exact after trimming and case-folding. Windows
+ * hostnames are case-insensitive, so two enrollments of one
+ * machine never differ in more than case and padding; two
+ * machines that merely share a prefix are different machines
+ * and never match. A blank name keys to "", which matches
+ * nothing: a nameless enrollment retires no one.
+ */
+function headlessHostnameKey(name: string): string {
+  return typeof name === "string" ? name.trim().toLowerCase() : "";
+}
+
 function headlessMachineView(
   rec: HeadlessMachineRecord
 ): HeadlessMachineView {
@@ -668,6 +681,12 @@ export class MoverStore {
    * engine dedups a start whose id matches its persisted job, so
    * keeping delivered commands server-side is safe. Commands with a
    * stored result (status "done") also survive.
+   *
+   * An enrollment also retires this account's OTHER live records
+   * carrying the same hostname (ghost retirement, below): a
+   * machine that comes back under a fresh identity leaves its
+   * old record behind, and enrollment is where the cloud learns
+   * of the return.
    */
   async enrollHeadlessMachine(
     account: string,
@@ -759,6 +778,35 @@ export class MoverStore {
         cmd.status === "pending"
       ) {
         this.headlessCommands.delete(id);
+      }
+    }
+    // Ghost retirement: this enrollment is the one moment the
+    // cloud learns the machine is back, possibly under a fresh
+    // identity (the uninstaller swap is the standing shape: the
+    // new Host enrolls as a new record, and until now the old
+    // record sat in every list beside it, same hostname, until
+    // a human dumped it by hand). Every OTHER live record under
+    // this account carrying the same hostname is retired with
+    // the very deed a manual Dump writes (retireHeadlessMachine:
+    // retiredAt stamped once, pending commands dropped, record
+    // kept). The enrolling record never retires itself, a
+    // retired enrolling record (refused at the route; folded
+    // here) retires no one, a blank hostname retires no one,
+    // and already-retired records are untouched.
+    if (!rec.retiredAt) {
+      const own = headlessHostnameKey(rec.name);
+      if (own !== "") {
+        const ghosts: string[] = [];
+        for (const other of byId.values()) {
+          if (other.machineId === rec.machineId) continue;
+          if (other.retiredAt) continue;
+          if (headlessHostnameKey(other.name) === own) {
+            ghosts.push(other.machineId);
+          }
+        }
+        for (const ghostId of ghosts) {
+          await this.retireHeadlessMachine(account, ghostId);
+        }
       }
     }
     await this.persistHeadlessMachines();
